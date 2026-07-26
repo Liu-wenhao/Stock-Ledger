@@ -17,6 +17,7 @@ class SummaryCard(BaseModel):
 
 class PortfolioSummary(BaseModel):
     portfolio_value: Decimal
+    holdings_value: Decimal = Decimal("0")
     cash: Decimal
     unrealized_pnl: Decimal
     unrealized_pnl_percent: Decimal
@@ -42,6 +43,7 @@ class HoldingRow(BaseModel):
     last_price: Decimal | None = None
     cost_basis: Decimal
     market_value: Decimal
+    invested: Decimal = Decimal("0")
     allocation: Decimal
     total_pnl: Decimal
     total_pnl_percent: Decimal

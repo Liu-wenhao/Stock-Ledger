@@ -55,8 +55,8 @@ const positionColumns = [
   { title: '目前收盘价', dataIndex: 'last_price', key: 'last_price', align: 'right' },
   { title: '成本值', dataIndex: 'cost_basis', key: 'cost_basis', align: 'right' },
   { title: '值', dataIndex: 'market_value', key: 'market_value', align: 'right' },
-  { title: '总收益', dataIndex: 'total_pnl', key: 'total_pnl', align: 'right' },
-  { title: '总收益 %', dataIndex: 'total_pnl_percent', key: 'total_pnl_percent', align: 'right' },
+  { title: '累计盈亏', dataIndex: 'total_pnl', key: 'total_pnl', align: 'right' },
+  { title: '累计盈亏 %', dataIndex: 'total_pnl_percent', key: 'total_pnl_percent', align: 'right' },
 ]
 
 const priceColumns = [
@@ -71,6 +71,24 @@ const priceColumns = [
 ]
 
 const columns = computed(() => (subTab.value === 'price' ? priceColumns : positionColumns))
+
+const positionsSummary = computed(() => {
+  // Sum currently listed rows. With「显示已清仓」off this matches KPI 持仓盈亏;
+  // with it on, totals equal 累计盈亏 (持仓+清仓).
+  // % = 盈亏合计 / 市值合计（与 KPI 持仓盈亏% 同口径）
+  const items = data.value.items || []
+  const sumKey = (key) => items.reduce((acc, row) => acc + toNumber(row[key]), 0)
+  const pnl = sumKey('total_pnl')
+  const marketValue = sumKey('market_value')
+  return {
+    allocation: sumKey('allocation'),
+    quantity: sumKey('quantity'),
+    cost_basis: sumKey('cost_basis'),
+    market_value: marketValue,
+    total_pnl: pnl,
+    total_pnl_percent: marketValue > 0 ? (pnl / marketValue) * 100 : 0,
+  }
+})
 
 const perfItems = computed(() => {
   let items = [...(data.value.items || [])]
@@ -153,7 +171,7 @@ async function renderPerf() {
           const ticker = row.symbol.split(':').pop()
           return [
             `${ticker}${row.name ? ` · ${row.name}` : ''}`,
-            `收益率：${formatPct(row.total_pnl_percent)}`,
+            `累计盈亏：${formatPct(row.total_pnl_percent)}`,
             `金额：${formatMoney(row.total_pnl)}`,
             row.closed ? '状态：已清仓' : null,
           ]
@@ -319,12 +337,50 @@ onMounted(load)
             </span>
           </template>
         </template>
+        <template v-if="subTab === 'positions'" #summary>
+          <a-table-summary fixed>
+            <a-table-summary-row class="holdings-summary-row">
+              <a-table-summary-cell :index="0">
+                <strong>汇总</strong>
+              </a-table-summary-cell>
+              <a-table-summary-cell :index="1" align="right">
+                {{ formatPct(positionsSummary.allocation).replace('+', '') }}
+              </a-table-summary-cell>
+              <a-table-summary-cell :index="2" align="right">
+                {{ formatQty(positionsSummary.quantity) }}
+              </a-table-summary-cell>
+              <a-table-summary-cell :index="3" align="right">—</a-table-summary-cell>
+              <a-table-summary-cell :index="4" align="right">—</a-table-summary-cell>
+              <a-table-summary-cell :index="5" align="right">
+                {{ formatMoney(positionsSummary.cost_basis) }}
+              </a-table-summary-cell>
+              <a-table-summary-cell :index="6" align="right">
+                {{ formatMoney(positionsSummary.market_value) }}
+              </a-table-summary-cell>
+              <a-table-summary-cell :index="7" align="right">
+                <span :class="pnlClass(positionsSummary.total_pnl)">
+                  {{ formatMoney(positionsSummary.total_pnl) }}
+                </span>
+              </a-table-summary-cell>
+              <a-table-summary-cell :index="8" align="right">
+                <span :class="pnlClass(positionsSummary.total_pnl_percent)">
+                  {{ formatPct(positionsSummary.total_pnl_percent) }}
+                </span>
+              </a-table-summary-cell>
+            </a-table-summary-row>
+          </a-table-summary>
+        </template>
       </a-table>
     </template>
   </div>
 </template>
 
 <style scoped>
+.holdings-summary-row :deep(td) {
+  font-weight: 600;
+  background: #f7f8fa !important;
+}
+
 .perf-layout {
   display: flex;
   align-items: stretch;

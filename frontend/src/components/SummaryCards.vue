@@ -31,14 +31,15 @@ const cards = computed(() => {
   if (!s) {
     return [
       { label: '投资组合金额', parts: null, secondaryLines: null },
-      { label: '未实现收益', parts: null, secondaryLines: null },
-      { label: '已实现收益', parts: null, secondaryLines: null },
-      { label: '总收益', parts: null, secondaryLines: null },
+      { label: '持仓盈亏', parts: null, secondaryLines: null },
+      { label: '清仓盈亏', parts: null, secondaryLines: null },
+      { label: '累计盈亏', parts: null, secondaryLines: null },
       { label: '手续费', parts: null, secondaryLines: null },
     ]
   }
 
-  const portfolio = moneyParts(s.portfolio_value, s.currency)
+  const holdingsValue = s.holdings_value ?? s.portfolio_value
+  const portfolio = moneyParts(holdingsValue, s.currency)
   const cash = moneyParts(s.cash, s.currency)
   const unrealized = moneyParts(s.unrealized_pnl, s.currency)
   const dayChange = signedMoneyParts(s.day_change, s.currency)
@@ -50,7 +51,7 @@ const cards = computed(() => {
   return [
     {
       label: '投资组合金额',
-      valueClass: pnlClass(s.portfolio_value),
+      valueClass: pnlClass(holdingsValue),
       parts: {
         amount: portfolio.amount,
         currency: portfolio.currency,
@@ -64,7 +65,7 @@ const cards = computed(() => {
       ],
     },
     {
-      label: '未实现收益',
+      label: '持仓盈亏',
       valueClass: pnlClass(s.unrealized_pnl),
       parts: {
         amount: unrealized.amount,
@@ -81,7 +82,7 @@ const cards = computed(() => {
       ],
     },
     {
-      label: '已实现收益',
+      label: '清仓盈亏',
       valueClass: pnlClass(s.realized_pnl),
       parts: {
         amount: realized.amount,
@@ -96,7 +97,7 @@ const cards = computed(() => {
       ],
     },
     {
-      label: '总收益',
+      label: '累计盈亏',
       valueClass: pnlClass(s.total_pnl),
       parts: {
         amount: total.amount,

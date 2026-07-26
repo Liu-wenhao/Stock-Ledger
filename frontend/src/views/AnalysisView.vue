@@ -127,7 +127,7 @@ function renderLine() {
         itemWidth: 10,
         itemHeight: 10,
         textStyle: { color: '#131722', fontSize: 12 },
-        data: ['总盈利', '已实现盈亏'],
+        data: ['累计盈亏', '清仓盈亏'],
       },
       grid: { left: 8, right: 72, top: 36, bottom: 28 },
       tooltip: {
@@ -160,7 +160,7 @@ function renderLine() {
       },
       series: [
         {
-          name: '总盈利',
+          name: '累计盈亏',
           type: 'line',
           smooth: 0.25,
           showSymbol: false,
@@ -189,7 +189,7 @@ function renderLine() {
                 },
         },
         {
-          name: '已实现盈亏',
+          name: '清仓盈亏',
           type: 'line',
           smooth: 0.25,
           showSymbol: false,

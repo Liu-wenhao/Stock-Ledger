@@ -178,7 +178,8 @@ def compute_holdings(
             mv = ZERO
             cost = pos.realized_cost
             pnl = pos.realized_pnl
-            pnl_pct = (pnl / cost * Decimal("100")) if cost > ZERO else ZERO
+            invested = cost
+            pnl_pct = (pnl / invested * Decimal("100")) if invested > ZERO else ZERO
 
         day_chg = None
         day_pct = q.get("change_percent")
@@ -195,6 +196,7 @@ def compute_holdings(
             "last_price": last,
             "cost_basis": cost,
             "market_value": mv,
+            "invested": invested,
             "total_pnl": pnl,
             "total_pnl_percent": pnl_pct.quantize(Decimal("0.01")),
             "day_change": day_chg,
@@ -234,27 +236,33 @@ def compute_holdings(
 
 
 def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
-    data = compute_holdings(db, portfolio_id, include_closed=False)
+    data = compute_holdings(db, portfolio_id, include_closed=True)
     state: PortfolioState = data["state"]
+    open_items = [i for i in data["items"] if not i.get("closed")]
+    closed_items = [i for i in data["items"] if i.get("closed")]
     holdings_value = data["total_market_value"]
     cash = state.cash
+    # Total equity (holdings + cash); KPI「投资组合金额」uses holdings_value only
     portfolio_value = holdings_value + cash
 
-    cost_open = sum((i["cost_basis"] for i in data["items"]), ZERO)
-    unrealized = sum((i["total_pnl"] for i in data["items"]), ZERO)
-    unrealized_pct = (unrealized / cost_open * Decimal("100")) if cost_open > 0 else ZERO
+    # 持仓盈亏: Σ(仍持仓标的累计盈亏)，与持股汇总口径一致
+    # 持仓盈亏%: 持仓盈亏 / 持仓市值
+    # 清仓盈亏: 已清仓标的累计盈亏；累计盈亏 = 持仓 + 清仓
+    open_pnl = sum((_dec(i["total_pnl"]) for i in open_items), ZERO)
+    closed_pnl = sum((_dec(i["total_pnl"]) for i in closed_items), ZERO)
+    open_pct = (open_pnl / holdings_value * Decimal("100")) if holdings_value > ZERO else ZERO
 
-    day_change = sum((_dec(i["day_change"]) for i in data["items"] if i["day_change"] is not None), ZERO)
+    day_change = sum((_dec(i["day_change"]) for i in open_items if i["day_change"] is not None), ZERO)
     prev_mv = ZERO
-    for i in data["items"]:
+    for i in open_items:
         prev = _dec(i["prev_close"])
         if prev > 0:
             prev_mv += prev * i["quantity"]
         else:
             prev_mv += i["market_value"]
 
-    realized = state.realized_pnl
-    total_pnl = unrealized + realized
+    realized = closed_pnl
+    total_pnl = open_pnl + closed_pnl
 
     trades = load_trades(db, portfolio_id)
     commissions = sum((_dec(t.commission) for t in trades), ZERO)
@@ -266,6 +274,7 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
         for t in trades:
             if t.side == "Buy":
                 buy_notional += _dec(t.qty) * _dec(t.fill_price) + _dec(t.commission)
+        cost_open = sum((_dec(i["cost_basis"]) for i in open_items), ZERO)
         net_invested = buy_notional if buy_notional > ZERO else (cost_open if cost_open > ZERO else Decimal("1"))
 
     total_pct = (total_pnl / abs(net_invested) * Decimal("100")) if net_invested != ZERO else ZERO
@@ -289,9 +298,10 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
 
     return {
         "portfolio_value": portfolio_value,
+        "holdings_value": holdings_value,
         "cash": cash,
-        "unrealized_pnl": unrealized,
-        "unrealized_pnl_percent": unrealized_pct,
+        "unrealized_pnl": open_pnl,
+        "unrealized_pnl_percent": open_pct,
         "day_change": day_change.quantize(Decimal("0.01")),
         "day_change_percent": day_change_pct.quantize(Decimal("0.01")),
         "realized_pnl": realized,

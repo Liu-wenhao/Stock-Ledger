@@ -12,10 +12,38 @@ import {
   zeroMarkLine,
 } from '@/utils/chart'
 import SymbolCell from '@/components/SymbolCell.vue'
+import { usePortfolioStore } from '@/stores/portfolio'
 
+const store = usePortfolioStore()
 const mode = ref('value')
 const range = ref('3M')
 const includeClosed = ref(false)
+
+function formatPnlByMode(amount, percent) {
+  if (mode.value === 'percent') return formatPct(percent)
+  return formatMoney(amount).replace(' USD', '')
+}
+
+const dayPnlText = computed(() => {
+  const s = store.summary
+  if (!s) return '—'
+  return formatPnlByMode(s.day_change, s.day_change_percent)
+})
+
+const dayPnlClass = computed(() => pnlClass(store.summary?.day_change))
+
+const cumulativeTitle = computed(() => (includeClosed.value ? '累计盈亏' : '持仓盈亏'))
+
+const totalPnlText = computed(() => {
+  const s = store.summary
+  if (!s) return '—'
+  if (includeClosed.value) return formatPnlByMode(s.total_pnl, s.total_pnl_percent)
+  return formatPnlByMode(s.unrealized_pnl, s.unrealized_pnl_percent)
+})
+
+const totalPnlClass = computed(() =>
+  pnlClass(includeClosed.value ? store.summary?.total_pnl : store.summary?.unrealized_pnl),
+)
 const nav = ref({ points: [], ranges: [] })
 const movers = ref({ winners: [], losers: [] })
 const totalMovers = ref({ winners: [], losers: [] })
@@ -219,8 +247,6 @@ onUnmounted(() => {
 <template>
   <div class="overview">
     <section class="change-section">
-      <h2 class="section-title">投资组合更改</h2>
-
       <div class="mode-toggle">
         <button
           type="button"
@@ -259,9 +285,15 @@ onUnmounted(() => {
       </div>
     </section>
 
+    <section class="day-pnl-section">
+      <h2 class="section-title">
+        今日盈亏<span class="section-pnl" :class="dayPnlClass">（{{ dayPnlText }}）</span>
+      </h2>
+    </section>
+
     <div class="movers">
       <section class="mover-panel">
-        <h3 class="mover-title">每日赢家</h3>
+        <h3 class="mover-title">每日盈利</h3>
         <div v-for="item in dailyWinners" :key="item.symbol" class="mover-row">
           <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
           <div class="mover-bar">
@@ -273,7 +305,7 @@ onUnmounted(() => {
       </section>
 
       <section class="mover-panel">
-        <h3 class="mover-title">每日输家</h3>
+        <h3 class="mover-title">每日亏损</h3>
         <div v-for="item in dailyLosers" :key="item.symbol + '-l'" class="mover-row">
           <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
           <div class="mover-bar">
@@ -286,7 +318,9 @@ onUnmounted(() => {
     </div>
 
     <div class="total-movers-header">
-      <h2 class="section-title">汇总</h2>
+      <h2 class="section-title">
+        {{ cumulativeTitle }}<span class="section-pnl" :class="totalPnlClass">（{{ totalPnlText }}）</span>
+      </h2>
       <button
         type="button"
         class="mode-btn"
@@ -405,11 +439,21 @@ onUnmounted(() => {
   font-weight: 700;
 }
 
+.day-pnl-section {
+  margin-top: 28px;
+  padding-top: 8px;
+}
+
+.section-pnl {
+  margin-left: 4px;
+  font-weight: 700;
+}
+
 .movers {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 24px;
-  margin-top: 28px;
+  margin-top: 20px;
   padding-top: 8px;
 }
 
