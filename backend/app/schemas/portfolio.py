@@ -24,6 +24,7 @@ class PortfolioSummary(BaseModel):
     day_change: Decimal
     day_change_percent: Decimal
     realized_pnl: Decimal
+    realized_pnl_percent: Decimal = Decimal("0")
     dividends: Decimal
     commissions: Decimal = Decimal("0")
     total_pnl: Decimal
@@ -56,12 +57,55 @@ class HoldingRow(BaseModel):
     closed: bool = False
     dividends: Decimal = Decimal("0")
     realized_pnl: Decimal = Decimal("0")
+    trade_count: int = 0
+    cycle_started_at: datetime | None = None
+    closed_cycles_pnl: Decimal = Decimal("0")
+
+
+class ClosedCycleRow(BaseModel):
+    cycle_index: int
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    trade_count: int = 0
+    realized_cost: Decimal = Decimal("0")
+    realized_pnl: Decimal = Decimal("0")
+    realized_pnl_percent: Decimal = Decimal("0")
+    buy_amount: Decimal = Decimal("0")
+    sell_amount: Decimal = Decimal("0")
+
+
+class ClosedHoldingRow(BaseModel):
+    symbol: str
+    name: str | None = None
+    logo_url: str | None = None
+    exchange: str | None = None
+    cycle_count: int = 0
+    trade_count: int = 0
+    realized_cost: Decimal = Decimal("0")
+    realized_pnl: Decimal = Decimal("0")
+    realized_pnl_percent: Decimal = Decimal("0")
+    buy_amount: Decimal = Decimal("0")
+    sell_amount: Decimal = Decimal("0")
+    currently_open: bool = False
+    # Named cycles (not children) so ant-design-vue won't treat rows as tree data
+    cycles: list[ClosedCycleRow] = Field(default_factory=list)
 
 
 class HoldingsResponse(BaseModel):
     items: list[HoldingRow]
     total_market_value: Decimal
     cash: Decimal
+
+
+class ClosedHoldingsResponse(BaseModel):
+    items: list[ClosedHoldingRow]
+    total_trade_count: int = 0
+    total_realized_pnl: Decimal = Decimal("0")
+    total_realized_cost: Decimal = Decimal("0")
+    total_buy_amount: Decimal = Decimal("0")
+    total_sell_amount: Decimal = Decimal("0")
+    total_market_value: Decimal = Decimal("0")
+    cash: Decimal = Decimal("0")
 
 
 class NavPoint(BaseModel):

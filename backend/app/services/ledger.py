@@ -17,12 +17,38 @@ settings = get_settings()
 
 
 @dataclass
+class ClosedCycle:
+    """One 建仓 → 清仓 period for a symbol."""
+
+    started_at: datetime | None
+    ended_at: datetime
+    trade_count: int
+    realized_pnl: Decimal
+    realized_cost: Decimal
+    buy_amount: Decimal = ZERO
+    sell_amount: Decimal = ZERO
+
+
+@dataclass
 class PositionState:
     quantity: Decimal = ZERO
     avg_price: Decimal = ZERO
     cost_basis: Decimal = ZERO
+    # Current open cycle (resets after each full 清仓)
     realized_pnl: Decimal = ZERO
-    realized_cost: Decimal = ZERO  # cost basis of sold shares (for closed % return)
+    realized_cost: Decimal = ZERO
+    cycle_trade_count: int = 0
+    cycle_started_at: datetime | None = None
+    cycle_buy_amount: Decimal = ZERO
+    cycle_sell_amount: Decimal = ZERO
+    # Completed cycles (all-time for this symbol)
+    closed_cycles: list[ClosedCycle] = field(default_factory=list)
+    closed_cycles_pnl: Decimal = ZERO
+    closed_cycles_cost: Decimal = ZERO
+    last_cycle_pnl: Decimal = ZERO
+    last_cycle_trade_count: int = 0
+    last_cycle_realized_cost: Decimal = ZERO
+    last_cycle_started_at: datetime | None = None
     dividends: Decimal = ZERO
 
 
@@ -46,6 +72,89 @@ def _dec(v) -> Decimal:
     if isinstance(v, Decimal):
         return v
     return Decimal(str(v))
+
+
+def us_equity_session_date(now: datetime | None = None) -> date:
+    """US equity session date (weekends roll back to Friday)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = now or datetime.now(ZoneInfo("America/New_York"))
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=ZoneInfo("America/New_York"))
+        else:
+            now = now.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        now = now or datetime.utcnow()
+    d = now.date()
+    # Early morning ET: still attribute to previous session
+    if getattr(now, "hour", 12) < 4:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def trade_us_session_date(dt: datetime) -> date:
+    """
+    Map a trade's closing_time to the US equity session date.
+    Naive timestamps are treated as China local (CSV / broker export convention).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        et = dt.astimezone(ZoneInfo("America/New_York"))
+        d = et.date()
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d
+    except Exception:
+        d = dt.date()
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d
+
+
+def position_day_pnl(
+    symbol: str,
+    symbol_trades: list[Trade],
+    last: Decimal | None,
+    prev_close: Decimal | None,
+    end_qty: Decimal,
+    session_date: date | None = None,
+) -> tuple[Decimal | None, Decimal | None]:
+    """
+    Day P/L for a symbol:
+      end_qty * last - start_qty * prev_close - today_buys + today_sells
+    Overnight shares use prev_close; same-session buys use fill price.
+    Trade times are bucketed by US session date (CN naive → ET).
+    """
+    if last is None or prev_close is None or end_qty < ZERO:
+        return None, None
+    session_date = session_date or us_equity_session_date()
+    sym = symbol.upper()
+
+    start_state = PortfolioState()
+    today_buy = ZERO
+    today_sell = ZERO
+    for t in sorted(symbol_trades, key=lambda x: (x.closing_time, x.id or 0)):
+        tday = trade_us_session_date(t.closing_time)
+        if tday < session_date:
+            apply_trade(start_state, t)
+        elif tday == session_date and t.side == "Buy":
+            today_buy += _dec(t.qty) * _dec(t.fill_price)
+        elif tday == session_date and t.side == "Sell":
+            today_sell += _dec(t.qty) * _dec(t.fill_price)
+
+    start_qty = start_state.positions.get(sym, PositionState()).quantity
+    day_pnl = end_qty * last - start_qty * prev_close - today_buy + today_sell
+    denom = start_qty * prev_close + today_buy
+    day_pct = (day_pnl / denom * Decimal("100")) if denom > ZERO else None
+    return day_pnl.quantize(Decimal("0.01")), (
+        day_pct.quantize(Decimal("0.01")) if day_pct is not None else None
+    )
 
 
 def apply_trade(state: PortfolioState, trade: Trade) -> None:
@@ -78,6 +187,12 @@ def apply_trade(state: PortfolioState, trade: Trade) -> None:
         if symbol:
             pos = state.positions.setdefault(symbol, PositionState())
             pos.dividends += amount
+            # Only count into an open cycle
+            if pos.quantity > ZERO:
+                pos.realized_pnl += amount
+                pos.cycle_trade_count += 1
+            else:
+                pos.closed_cycles_pnl += amount
         return
     if not symbol:
         return
@@ -85,34 +200,73 @@ def apply_trade(state: PortfolioState, trade: Trade) -> None:
     pos = state.positions.setdefault(symbol, PositionState())
 
     if side == "Buy":
-        cost = qty * price + commission
-        state.cash -= cost
+        # New cycle after 清仓
+        if pos.quantity <= ZERO:
+            pos.realized_pnl = ZERO
+            pos.realized_cost = ZERO
+            pos.cycle_trade_count = 0
+            pos.cycle_buy_amount = ZERO
+            pos.cycle_sell_amount = ZERO
+            pos.cycle_started_at = trade.closing_time
+        # Position cost ignores commission; cash still pays the fee (手续费另算)
+        notional = qty * price
+        state.cash -= notional + commission
         new_qty = pos.quantity + qty
         if new_qty > 0:
-            pos.cost_basis = pos.cost_basis + cost
+            pos.cost_basis = pos.cost_basis + notional
             pos.avg_price = pos.cost_basis / new_qty
             pos.quantity = new_qty
+        pos.cycle_buy_amount += notional
+        pos.cycle_trade_count += 1
         return
 
     if side == "Sell":
-        proceeds = qty * price - commission
-        state.cash += proceeds
+        notional = qty * price
+        state.cash += notional - commission
         sell_qty = min(qty, pos.quantity) if pos.quantity > 0 else qty
         cost_removed = pos.avg_price * sell_qty
-        pnl = proceeds - cost_removed if pos.quantity > 0 else proceeds
-        # If selling more than held, treat remaining as realized at fill
-        if qty > pos.quantity and pos.quantity > 0:
-            pnl = (pos.quantity * price - commission * (pos.quantity / qty)) - cost_removed
-            pnl += (qty - pos.quantity) * price
+        # Realized PnL ignores commission (手续费另算)
+        if pos.quantity > 0:
+            pnl = sell_qty * price - cost_removed
+            if qty > pos.quantity:
+                pnl += (qty - pos.quantity) * price
+        else:
+            pnl = notional
         pos.realized_pnl += pnl
         pos.realized_cost += cost_removed
+        pos.cycle_sell_amount += notional
         state.realized_pnl += pnl
         pos.quantity -= sell_qty
         pos.cost_basis = pos.avg_price * pos.quantity
+        pos.cycle_trade_count += 1
         if pos.quantity <= ZERO:
+            # 清仓：锁定本轮盈亏，之后新开仓重新计算
             pos.quantity = ZERO
             pos.cost_basis = ZERO
             pos.avg_price = ZERO
+            pos.last_cycle_pnl = pos.realized_pnl
+            pos.last_cycle_trade_count = pos.cycle_trade_count
+            pos.last_cycle_realized_cost = pos.realized_cost
+            pos.last_cycle_started_at = pos.cycle_started_at
+            pos.closed_cycles.append(
+                ClosedCycle(
+                    started_at=pos.cycle_started_at or trade.closing_time,
+                    ended_at=trade.closing_time,
+                    trade_count=pos.cycle_trade_count,
+                    realized_pnl=pos.realized_pnl,
+                    realized_cost=pos.realized_cost,
+                    buy_amount=pos.cycle_buy_amount,
+                    sell_amount=pos.cycle_sell_amount,
+                )
+            )
+            pos.closed_cycles_pnl += pos.realized_pnl
+            pos.closed_cycles_cost += pos.realized_cost
+            pos.realized_pnl = ZERO
+            pos.realized_cost = ZERO
+            pos.cycle_trade_count = 0
+            pos.cycle_buy_amount = ZERO
+            pos.cycle_sell_amount = ZERO
+            pos.cycle_started_at = None
         return
 
 
@@ -141,12 +295,17 @@ def compute_holdings(
 ) -> dict:
     trades = load_trades(db, portfolio_id)
     state = replay(trades)
+    trades_by_symbol: dict[str, list[Trade]] = {}
+    for t in trades:
+        if t.symbol:
+            trades_by_symbol.setdefault(t.symbol.upper(), []).append(t)
     symbols = list(state.positions.keys())
     quotes = get_quotes(db, symbols)
     metas = {
         m.symbol: m
         for m in db.query(SymbolMeta).filter(SymbolMeta.symbol.in_(symbols)).all()
     } if symbols else {}
+    session_date = us_equity_session_date()
 
     open_items = []
     closed_items = []
@@ -159,14 +318,17 @@ def compute_holdings(
             last = pos.avg_price
         last = _dec(last) if last is not None else None
         closed = pos.quantity <= ZERO
+        prev_close = _dec(q.get("prev_close")) if q.get("prev_close") is not None else None
 
         if not closed:
-            # Open: total P/L = unrealized + realized; % vs all capital deployed
+            # Open: current cycle only (after last 清仓); historical cycles go to 清仓盈亏
             mv = pos.quantity * (last if last is not None else pos.avg_price)
             cost = pos.cost_basis
             unrealized = mv - cost
             pnl = unrealized + pos.realized_pnl
             invested = cost + pos.realized_cost
+            trade_count = pos.cycle_trade_count
+            cycle_started_at = pos.cycle_started_at
             if invested > ZERO:
                 pnl_pct = pnl / invested * Decimal("100")
             elif pos.avg_price > ZERO and last is not None:
@@ -174,17 +336,29 @@ def compute_holdings(
             else:
                 pnl_pct = ZERO
         else:
-            # Closed: realized P/L vs cost of sold shares
+            # Closed: all completed cycles (lifetime). last_cycle_* kept for trade-history UX.
             mv = ZERO
-            cost = pos.realized_cost
-            pnl = pos.realized_pnl
+            cost = pos.closed_cycles_cost
+            pnl = pos.closed_cycles_pnl
             invested = cost
+            trade_count = sum((c.trade_count for c in pos.closed_cycles), 0)
+            cycle_started_at = (
+                pos.closed_cycles[0].started_at if pos.closed_cycles else pos.last_cycle_started_at
+            )
             pnl_pct = (pnl / invested * Decimal("100")) if invested > ZERO else ZERO
 
-        day_chg = None
-        day_pct = q.get("change_percent")
-        if not closed and q.get("change") is not None:
-            day_chg = _dec(q.get("change")) * pos.quantity
+        day_chg, day_pct = (None, None)
+        if not closed:
+            day_chg, day_pct = position_day_pnl(
+                sym,
+                trades_by_symbol.get(sym, []),
+                last,
+                prev_close,
+                pos.quantity,
+                session_date=session_date,
+            )
+            if day_pct is None and q.get("change_percent") is not None:
+                day_pct = _dec(q.get("change_percent"))
 
         row = {
             "symbol": sym,
@@ -206,8 +380,11 @@ def compute_holdings(
             "low_price": q.get("low"),
             "prev_close": q.get("prev_close"),
             "closed": closed,
-            "realized_pnl": pos.realized_pnl,
+            "realized_pnl": pos.realized_pnl if not closed else pos.closed_cycles_pnl,
             "dividends": pos.dividends,
+            "trade_count": trade_count,
+            "cycle_started_at": cycle_started_at,
+            "closed_cycles_pnl": pos.closed_cycles_pnl,
         }
         if pos.quantity > ZERO:
             total_mv += mv
@@ -235,6 +412,92 @@ def compute_holdings(
     }
 
 
+def compute_closed_holdings(db: Session, portfolio_id: int = 1) -> dict:
+    """
+    Nested 清仓 view: parent = symbol, cycles = each 建仓→清仓 period.
+    Includes symbols that later reopened.
+    """
+    trades = load_trades(db, portfolio_id)
+    state = replay(trades)
+    symbols = [s for s, p in state.positions.items() if p.closed_cycles]
+    metas = {
+        m.symbol: m
+        for m in db.query(SymbolMeta).filter(SymbolMeta.symbol.in_(symbols)).all()
+    } if symbols else {}
+
+    items = []
+    total_trade_count = 0
+    total_realized_pnl = ZERO
+    total_realized_cost = ZERO
+    total_buy_amount = ZERO
+    total_sell_amount = ZERO
+
+    for sym in symbols:
+        pos = state.positions[sym]
+        cycles = []
+        for idx, cyc in enumerate(pos.closed_cycles, start=1):
+            pct = (
+                (cyc.realized_pnl / cyc.realized_cost * Decimal("100"))
+                if cyc.realized_cost > ZERO
+                else ZERO
+            )
+            cycles.append(
+                {
+                    "cycle_index": idx,
+                    "started_at": cyc.started_at,
+                    "ended_at": cyc.ended_at,
+                    "trade_count": cyc.trade_count,
+                    "realized_cost": cyc.realized_cost,
+                    "realized_pnl": cyc.realized_pnl,
+                    "realized_pnl_percent": pct.quantize(Decimal("0.01")),
+                    "buy_amount": cyc.buy_amount,
+                    "sell_amount": cyc.sell_amount,
+                }
+            )
+        trade_count = sum(c["trade_count"] for c in cycles)
+        realized_cost = sum((c["realized_cost"] for c in cycles), ZERO)
+        realized_pnl = sum((c["realized_pnl"] for c in cycles), ZERO)
+        buy_amount = sum((c["buy_amount"] for c in cycles), ZERO)
+        sell_amount = sum((c["sell_amount"] for c in cycles), ZERO)
+        pnl_pct = (
+            (realized_pnl / realized_cost * Decimal("100")) if realized_cost > ZERO else ZERO
+        )
+        items.append(
+            {
+                "symbol": sym,
+                "name": metas.get(sym).name if metas.get(sym) else None,
+                "logo_url": metas.get(sym).logo_url if metas.get(sym) else None,
+                "exchange": exchange_of(sym),
+                "cycle_count": len(cycles),
+                "trade_count": trade_count,
+                "realized_cost": realized_cost,
+                "realized_pnl": realized_pnl,
+                "realized_pnl_percent": pnl_pct.quantize(Decimal("0.01")),
+                "buy_amount": buy_amount,
+                "sell_amount": sell_amount,
+                "currently_open": pos.quantity > ZERO,
+                "cycles": cycles,
+            }
+        )
+        total_trade_count += trade_count
+        total_realized_pnl += realized_pnl
+        total_realized_cost += realized_cost
+        total_buy_amount += buy_amount
+        total_sell_amount += sell_amount
+
+    items.sort(key=lambda r: r["realized_pnl"])
+    return {
+        "items": items,
+        "total_trade_count": total_trade_count,
+        "total_realized_pnl": total_realized_pnl,
+        "total_realized_cost": total_realized_cost,
+        "total_buy_amount": total_buy_amount,
+        "total_sell_amount": total_sell_amount,
+        "cash": state.cash,
+        "total_market_value": ZERO,
+    }
+
+
 def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
     data = compute_holdings(db, portfolio_id, include_closed=True)
     state: PortfolioState = data["state"]
@@ -245,12 +508,13 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
     # Total equity (holdings + cash); KPI「投资组合金额」uses holdings_value only
     portfolio_value = holdings_value + cash
 
-    # 持仓盈亏: Σ(仍持仓标的累计盈亏)，与持股汇总口径一致
-    # 持仓盈亏%: 持仓盈亏 / 持仓市值
-    # 清仓盈亏: 已清仓标的累计盈亏；累计盈亏 = 持仓 + 清仓
+    # 持仓盈亏: 仍持仓标的的当前周期盈亏之和
+    # 清仓盈亏: 所有已结束周期盈亏之和（含后来又重开的标的的历史清仓）
     open_pnl = sum((_dec(i["total_pnl"]) for i in open_items), ZERO)
-    closed_pnl = sum((_dec(i["total_pnl"]) for i in closed_items), ZERO)
+    closed_pnl = sum((p.closed_cycles_pnl for p in state.positions.values()), ZERO)
+    closed_cost = sum((p.closed_cycles_cost for p in state.positions.values()), ZERO)
     open_pct = (open_pnl / holdings_value * Decimal("100")) if holdings_value > ZERO else ZERO
+    realized_pct = (closed_pnl / closed_cost * Decimal("100")) if closed_cost > ZERO else ZERO
 
     day_change = sum((_dec(i["day_change"]) for i in open_items if i["day_change"] is not None), ZERO)
     prev_mv = ZERO
@@ -262,7 +526,6 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
             prev_mv += i["market_value"]
 
     realized = closed_pnl
-    total_pnl = open_pnl + closed_pnl
 
     trades = load_trades(db, portfolio_id)
     commissions = sum((_dec(t.commission) for t in trades), ZERO)
@@ -273,10 +536,13 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
         buy_notional = ZERO
         for t in trades:
             if t.side == "Buy":
-                buy_notional += _dec(t.qty) * _dec(t.fill_price) + _dec(t.commission)
+                buy_notional += _dec(t.qty) * _dec(t.fill_price)
         cost_open = sum((_dec(i["cost_basis"]) for i in open_items), ZERO)
         net_invested = buy_notional if buy_notional > ZERO else (cost_open if cost_open > ZERO else Decimal("1"))
 
+    # 累计盈亏不含手续费 = 持仓盈亏 + 清仓盈亏
+    # 等价：现金 + 持仓市值 - 净入金 + 手续费（现金里已扣的手续费加回）
+    total_pnl = open_pnl + closed_pnl
     total_pct = (total_pnl / abs(net_invested) * Decimal("100")) if net_invested != ZERO else ZERO
 
     day_change_pct = (day_change / prev_mv * Decimal("100")) if prev_mv > ZERO else ZERO
@@ -305,6 +571,7 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
         "day_change": day_change.quantize(Decimal("0.01")),
         "day_change_percent": day_change_pct.quantize(Decimal("0.01")),
         "realized_pnl": realized,
+        "realized_pnl_percent": realized_pct.quantize(Decimal("0.01")),
         "dividends": state.dividends,
         "commissions": commissions,
         "total_pnl": total_pnl,
@@ -617,27 +884,83 @@ def total_movers(
     db: Session,
     portfolio_id: int = 1,
     include_closed: bool = False,
+    closed_only: bool = False,
 ) -> dict:
     """Overall P/L winners & losers (not day change). No count limit."""
-    data = compute_holdings(db, portfolio_id, include_closed=include_closed)
-    scored = []
-    for item in data["items"]:
-        pct = item.get("total_pnl_percent")
-        amt = item.get("total_pnl")
-        if pct is None and amt is None:
-            continue
-        pct_v = _dec(pct) if pct is not None else ZERO
-        amt_v = _dec(amt) if amt is not None else ZERO
-        scored.append(
-            {
-                "symbol": item["symbol"],
-                "name": item["name"],
-                "logo_url": item["logo_url"],
-                "change": amt_v,
-                "change_percent": pct_v,
-                "closed": bool(item.get("closed")),
-            }
-        )
+    if closed_only:
+        data = compute_closed_holdings(db, portfolio_id)
+        scored = []
+        for item in data["items"]:
+            pct_v = _dec(item.get("realized_pnl_percent"))
+            amt_v = _dec(item.get("realized_pnl"))
+            scored.append(
+                {
+                    "symbol": item["symbol"],
+                    "name": item["name"],
+                    "logo_url": item["logo_url"],
+                    "change": amt_v,
+                    "change_percent": pct_v,
+                    "closed": True,
+                }
+            )
+    elif include_closed:
+        # 累计盈亏: lifetime per symbol = all closed cycles + current open cycle (if any)
+        data = compute_holdings(db, portfolio_id, include_closed=True)
+        state: PortfolioState = data["state"]
+        by_symbol = {i["symbol"]: i for i in data["items"]}
+        scored = []
+        for sym, pos in state.positions.items():
+            row = by_symbol.get(sym)
+            has_open = pos.quantity > ZERO
+            has_closed = bool(pos.closed_cycles) or pos.closed_cycles_pnl != ZERO
+            if not has_open and not has_closed:
+                continue
+            if has_open:
+                if row is None:
+                    continue
+                cycle_pnl = _dec(row["total_pnl"])
+                cycle_cost = _dec(row["invested"])
+                amt_v = cycle_pnl + pos.closed_cycles_pnl
+                cost_v = cycle_cost + pos.closed_cycles_cost
+            else:
+                amt_v = pos.closed_cycles_pnl
+                cost_v = pos.closed_cycles_cost
+            pct_v = (
+                (amt_v / cost_v * Decimal("100")).quantize(Decimal("0.01"))
+                if cost_v > ZERO
+                else ZERO
+            )
+            scored.append(
+                {
+                    "symbol": sym,
+                    "name": row["name"] if row else None,
+                    "logo_url": row["logo_url"] if row else None,
+                    "change": amt_v,
+                    "change_percent": pct_v,
+                    "closed": not has_open,
+                }
+            )
+    else:
+        # 持仓盈亏: current open cycle only
+        data = compute_holdings(db, portfolio_id, include_closed=False)
+        scored = []
+        for item in data["items"]:
+            pct = item.get("total_pnl_percent")
+            amt = item.get("total_pnl")
+            if pct is None and amt is None:
+                continue
+            pct_v = _dec(pct) if pct is not None else ZERO
+            amt_v = _dec(amt) if amt is not None else ZERO
+            scored.append(
+                {
+                    "symbol": item["symbol"],
+                    "name": item["name"],
+                    "logo_url": item["logo_url"],
+                    "change": amt_v,
+                    "change_percent": pct_v,
+                    "closed": bool(item.get("closed")),
+                }
+            )
     winners = [x for x in scored if x["change_percent"] > 0 or x["change"] > 0]
     winners.sort(key=lambda x: x["change_percent"], reverse=True)
     losers = [x for x in scored if x["change_percent"] < 0 or x["change"] < 0]

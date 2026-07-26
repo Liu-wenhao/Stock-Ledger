@@ -39,6 +39,72 @@ KNOWN_NAMES = {
     "NOK": "Nokia",
 }
 
+# Manual last/close corrections when Yahoo cache is wrong (symbol -> last price).
+PRICE_OVERRIDES: dict[str, Decimal] = {
+    "NYSE:CRCD": Decimal("6.12"),
+    "CRCD": Decimal("6.12"),
+    "NYSE:PSQ": Decimal("26.99"),
+    "PSQ": Decimal("26.99"),
+    "NYSE:XE": Decimal("14.56"),
+    "XE": Decimal("14.56"),
+    "NYSE:NOK": Decimal("9.1"),
+    "NOK": Decimal("9.1"),
+    "NYSE:NASA": Decimal("22.14"),
+    "NASA": Decimal("22.14"),
+    "NYSE:SSG": Decimal("13.14"),
+    "SSG": Decimal("13.14"),
+    "NYSE:RKLZ": Decimal("5.43"),
+    "RKLZ": Decimal("5.43"),
+}
+
+# Manual previous-close corrections (symbol -> prev_close).
+# When Yahoo "last" was actually the prior session close, promote it here
+# after correcting PRICE_OVERRIDES (e.g. PSQ 26.66, CRCD 6.16, XE 15.92).
+PREV_CLOSE_OVERRIDES: dict[str, Decimal] = {
+    "NYSE:PSQ": Decimal("26.66"),
+    "PSQ": Decimal("26.66"),
+    "NYSE:CRCD": Decimal("6.16"),
+    "CRCD": Decimal("6.16"),
+    "NYSE:XE": Decimal("15.92"),
+    "XE": Decimal("15.92"),
+    "NYSE:NOK": Decimal("9.73"),
+    "NOK": Decimal("9.73"),
+    "NYSE:NASA": Decimal("23.23"),
+    "NASA": Decimal("23.23"),
+    "NYSE:SSG": Decimal("12.41"),
+    "SSG": Decimal("12.41"),
+    "NYSE:RKLZ": Decimal("4.62"),
+    "RKLZ": Decimal("4.62"),
+}
+
+
+def _override_for(table: dict[str, Decimal], symbol: str) -> Decimal | None:
+    return table.get(symbol) or table.get(symbol.split(":")[-1])
+
+
+def _apply_price_override(symbol: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Force corrected last / prev_close and recompute change."""
+    if not data:
+        return data
+    data = dict(data)
+    last = _override_for(PRICE_OVERRIDES, symbol)
+    prev_override = _override_for(PREV_CLOSE_OVERRIDES, symbol)
+    if last is not None:
+        data["price"] = last
+    if prev_override is not None:
+        data["prev_close"] = prev_override
+    price = data.get("price")
+    prev = data.get("prev_close")
+    if price is not None and prev is not None:
+        price_d = price if isinstance(price, Decimal) else Decimal(str(price))
+        prev_d = prev if isinstance(prev, Decimal) else Decimal(str(prev))
+        data["change"] = (price_d - prev_d).quantize(Decimal("0.000001"))
+        if prev_d != 0:
+            data["change_percent"] = (data["change"] / prev_d * Decimal("100")).quantize(
+                Decimal("0.000001")
+            )
+    return data
+
 
 def _d(v: Any) -> Decimal | None:
     if v is None:
@@ -87,16 +153,19 @@ def _cache_to_dict(cache: PriceCache | None, symbol: str) -> dict[str, Any]:
             "change": None,
             "change_percent": None,
         }
-    return {
-        "symbol": symbol,
-        "price": cache.price,
-        "prev_close": cache.prev_close,
-        "open": cache.open_price,
-        "high": cache.high_price,
-        "low": cache.low_price,
-        "change": cache.change_amount,
-        "change_percent": cache.change_percent,
-    }
+    return _apply_price_override(
+        symbol,
+        {
+            "symbol": symbol,
+            "price": cache.price,
+            "prev_close": cache.prev_close,
+            "open": cache.open_price,
+            "high": cache.high_price,
+            "low": cache.low_price,
+            "change": cache.change_amount,
+            "change_percent": cache.change_percent,
+        },
+    )
 
 
 def get_quotes(
@@ -110,6 +179,11 @@ def get_quotes(
     result: dict[str, dict[str, Any]] = {}
     if not unique:
         return result
+
+    # Temporary kill-switch: serve cache + manual overrides only
+    if not settings.yahoo_refresh_enabled:
+        force = False
+        background_refresh = False
 
     stale: list[str] = []
     now = datetime.utcnow()
@@ -180,6 +254,7 @@ def _persist_quotes(symbols: list[str], fetched: dict[str, dict[str, Any]]) -> N
                 cache = PriceCache(symbol=sym)
                 db.add(cache)
                 db.flush()
+            data = _apply_price_override(sym, data)
             cache.price = data.get("price")
             cache.prev_close = data.get("prev_close")
             cache.open_price = data.get("open")

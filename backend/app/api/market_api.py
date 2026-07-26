@@ -1,18 +1,20 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.models.entities import SymbolMeta, Trade
 from app.schemas.portfolio import QuoteOut, SymbolSearchItem
 from app.services.market import get_quotes, refresh_quotes_sync
 
 router = APIRouter(prefix="/api", tags=["market"])
+settings = get_settings()
 
 
 @router.get("/market/quote", response_model=list[QuoteOut])
 def quotes(symbols: str = Query(...), db: Session = Depends(get_db)):
     syms = [s.strip() for s in symbols.split(",") if s.strip()]
-    data = get_quotes(db, syms, background_refresh=True)
+    data = get_quotes(db, syms, background_refresh=settings.yahoo_refresh_enabled)
     metas = {
         m.symbol: m
         for m in db.query(SymbolMeta).filter(SymbolMeta.symbol.in_(syms)).all()
@@ -30,6 +32,13 @@ def quotes(symbols: str = Query(...), db: Session = Depends(get_db)):
 
 @router.post("/market/refresh")
 def refresh_market(db: Session = Depends(get_db)):
+    if not settings.yahoo_refresh_enabled:
+        return {
+            "symbols": 0,
+            "priced": 0,
+            "disabled": True,
+            "message": "Yahoo refresh temporarily disabled (yahoo_refresh_enabled=false)",
+        }
     syms = [
         r[0]
         for r in db.query(Trade.symbol)
@@ -39,7 +48,7 @@ def refresh_market(db: Session = Depends(get_db)):
     ]
     data = refresh_quotes_sync(db, syms)
     priced = sum(1 for v in data.values() if v.get("price") is not None)
-    return {"symbols": len(syms), "priced": priced}
+    return {"symbols": len(syms), "priced": priced, "disabled": False}
 
 
 @router.get("/symbols/search", response_model=list[SymbolSearchItem])

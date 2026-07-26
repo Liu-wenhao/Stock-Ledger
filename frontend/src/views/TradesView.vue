@@ -1,5 +1,6 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import dayjs from 'dayjs'
 import { Modal, message } from 'ant-design-vue'
 import {
@@ -21,6 +22,8 @@ import { formatMoney, formatQty } from '@/utils/format'
 import { useTableScrollY } from '@/composables/useTableScroll'
 
 const emit = defineEmits(['changed'])
+const route = useRoute()
+const router = useRouter()
 const sideGroup = ref('trades')
 const keyword = ref('')
 const sideType = ref('')
@@ -28,6 +31,7 @@ const loading = ref(false)
 const rows = ref([])
 const modalOpen = ref(false)
 const editRecord = ref(null)
+const highlightId = ref(null)
 const tableScrollY = useTableScrollY(420)
 
 const pagination = reactive({
@@ -72,11 +76,11 @@ const typeOptions = computed(() => {
 const columns = [
   { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
   { title: '类型', key: 'side', dataIndex: 'side', width: 100 },
-  { title: '日期', key: 'closing_time', dataIndex: 'closing_time', width: 160 },
-  { title: '数量', key: 'qty', dataIndex: 'qty', align: 'right' },
+  { title: '日期', key: 'closing_time', dataIndex: 'closing_time', width: 180 },
   { title: '价格', key: 'fill_price', dataIndex: 'fill_price', align: 'right' },
+  { title: '数量', key: 'qty', dataIndex: 'qty', align: 'right' },
   { title: '手续费', key: 'commission', dataIndex: 'commission', align: 'right' },
-  { title: '总计', key: 'total', dataIndex: 'total', align: 'right' },
+  { title: '总额', key: 'total', dataIndex: 'total', align: 'right' },
   { title: '笔记', key: 'notes', dataIndex: 'notes' },
   { title: '操作', key: 'actions', width: 90, align: 'center' },
 ]
@@ -119,6 +123,51 @@ function openEdit(record) {
   modalOpen.value = true
 }
 
+function customRow(record) {
+  return {
+    class: record.id === highlightId.value ? 'trade-row-highlight' : undefined,
+  }
+}
+
+async function focusTradeById(rawId) {
+  const id = Number(rawId)
+  if (!Number.isFinite(id) || id <= 0) return
+
+  keyword.value = ''
+  sideType.value = ''
+
+  // Probe both tabs so we land on the correct list
+  let record = null
+  for (const group of ['trades', 'dividends']) {
+    sideGroup.value = group
+    await load()
+    record = rows.value.find((r) => Number(r.id) === id) || null
+    if (record) break
+  }
+  if (!record) {
+    message.warning('未找到该交易')
+    await router.replace({ name: 'trades', query: {} })
+    return
+  }
+
+  const wantGroup = record.side === 'Dividend' ? 'dividends' : 'trades'
+  if (sideGroup.value !== wantGroup) {
+    sideGroup.value = wantGroup
+    await load()
+    record = rows.value.find((r) => Number(r.id) === id) || record
+  }
+
+  const idx = rows.value.findIndex((r) => Number(r.id) === id)
+  if (idx >= 0) {
+    pagination.current = Math.floor(idx / pagination.pageSize) + 1
+  }
+  highlightId.value = id
+  openEdit(record)
+  await router.replace({ name: 'trades', query: {} })
+  await nextTick()
+  document.querySelector('.trade-row-highlight')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+}
+
 function onRemove(record) {
   Modal.confirm({
     title: '移除交易？',
@@ -152,7 +201,17 @@ watch(sideType, () => {
   load()
 })
 
-onMounted(load)
+watch(
+  () => route.query.editId,
+  async (editId) => {
+    if (editId) await focusTradeById(editId)
+  },
+)
+
+onMounted(async () => {
+  await load()
+  if (route.query.editId) await focusTradeById(route.query.editId)
+})
 </script>
 
 <template>
@@ -206,6 +265,7 @@ onMounted(load)
       :pagination="pagination"
       :scroll="tableScroll"
       size="middle"
+      :custom-row="customRow"
       @change="onTableChange"
     >
       <template #bodyCell="{ column, record }">
@@ -224,13 +284,13 @@ onMounted(load)
           </a-tag>
         </template>
         <template v-else-if="column.key === 'closing_time'">
-          {{ dayjs(record.closing_time).format('YYYY年M月D日') }}
+          {{ dayjs(record.closing_time).format('YYYY年M月D日 HH:mm') }}
         </template>
         <template v-else-if="column.key === 'qty'">
           {{ ['Deposit', 'Withdrawal'].includes(record.side) ? '—' : formatQty(record.qty) }}
         </template>
         <template v-else-if="column.key === 'fill_price'">
-          {{ formatMoney(record.fill_price).replace(' USD', '') }}
+          {{ formatMoney(record.fill_price, 'USD', 4).replace(' USD', '') }}
         </template>
         <template v-else-if="column.key === 'commission'">
           {{ formatMoney(record.commission) }}
@@ -257,3 +317,9 @@ onMounted(load)
     <TradeFormModal v-model:open="modalOpen" :edit-record="editRecord" @saved="onSaved" />
   </div>
 </template>
+
+<style scoped>
+:deep(.trade-row-highlight > td) {
+  background: #e8f0fe !important;
+}
+</style>

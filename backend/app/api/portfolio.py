@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.schemas.portfolio import (
+    ClosedHoldingRow,
+    ClosedHoldingsResponse,
     DailyMoversResponse,
     HoldingRow,
     HoldingsResponse,
@@ -41,18 +43,42 @@ def movers(db: Session = Depends(get_db)):
 @router.get("/portfolio/total-movers", response_model=DailyMoversResponse)
 def total_movers(
     include_closed: bool = False,
+    closed_only: bool = False,
     db: Session = Depends(get_db),
 ):
-    return ledger.total_movers(db, include_closed=include_closed)
+    return ledger.total_movers(db, include_closed=include_closed, closed_only=closed_only)
 
 
-@router.get("/holdings", response_model=HoldingsResponse)
+@router.get("/holdings")
 def holdings(
     view: str = Query("positions"),
     include_closed: bool = False,
     q: str | None = None,
     db: Session = Depends(get_db),
 ):
+    # Do not use a Union response_model here: FastAPI/Pydantic may coerce
+    # open holdings into ClosedHoldingsResponse and drop total_pnl / market_value.
+    if view == "closed":
+        data = ledger.compute_closed_holdings(db)
+        items = data["items"]
+        if q:
+            ql = q.strip().upper()
+            items = [
+                i
+                for i in items
+                if ql in i["symbol"].upper() or (i.get("name") and ql in i["name"].upper())
+            ]
+        return ClosedHoldingsResponse(
+            items=[ClosedHoldingRow(**i) for i in items],
+            total_trade_count=data["total_trade_count"],
+            total_realized_pnl=data["total_realized_pnl"],
+            total_realized_cost=data["total_realized_cost"],
+            total_buy_amount=data["total_buy_amount"],
+            total_sell_amount=data["total_sell_amount"],
+            total_market_value=data["total_market_value"],
+            cash=data["cash"],
+        )
+
     data = ledger.compute_holdings(db, include_closed=include_closed)
     items = data["items"]
     if q:
@@ -62,11 +88,11 @@ def holdings(
             for i in items
             if ql in i["symbol"].upper() or (i.get("name") and ql in i["name"].upper())
         ]
-    return {
-        "items": [HoldingRow(**{k: v for k, v in i.items() if k in HoldingRow.model_fields}) for i in items],
-        "total_market_value": data["total_market_value"],
-        "cash": data["cash"],
-    }
+    return HoldingsResponse(
+        items=[HoldingRow(**{k: v for k, v in i.items() if k in HoldingRow.model_fields}) for i in items],
+        total_market_value=data["total_market_value"],
+        cash=data["cash"],
+    )
 
 
 @router.get("/analysis/monthly-returns", response_model=MonthlyReturnsResponse)

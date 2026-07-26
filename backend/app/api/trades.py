@@ -50,6 +50,7 @@ def _to_out(db: Session, t: Trade) -> TradeOut:
 def list_trades(
     side_group: str = Query("trades", pattern="^(trades|dividends|all)$"),
     side: str | None = Query(None, description="Exact Side filter, e.g. Buy/Deposit"),
+    symbol: str | None = Query(None, description="Exact symbol, e.g. NYSE:PSQ"),
     q: str | None = None,
     db: Session = Depends(get_db),
 ):
@@ -60,6 +61,8 @@ def list_trades(
         query = query.filter(Trade.side == "Dividend")
     if side:
         query = query.filter(Trade.side == side)
+    if symbol:
+        query = query.filter(Trade.symbol == symbol.strip().upper())
     if q:
         like = f"%{q.strip()}%"
         query = query.filter(Trade.symbol.ilike(like))

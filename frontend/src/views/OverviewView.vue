@@ -17,7 +17,6 @@ import { usePortfolioStore } from '@/stores/portfolio'
 const store = usePortfolioStore()
 const mode = ref('value')
 const range = ref('3M')
-const includeClosed = ref(false)
 
 function formatPnlByMode(amount, percent) {
   if (mode.value === 'percent') return formatPct(percent)
@@ -32,20 +31,34 @@ const dayPnlText = computed(() => {
 
 const dayPnlClass = computed(() => pnlClass(store.summary?.day_change))
 
-const cumulativeTitle = computed(() => (includeClosed.value ? '累计盈亏' : '持仓盈亏'))
-
-const totalPnlText = computed(() => {
+const holdingPnlText = computed(() => {
   const s = store.summary
   if (!s) return '—'
-  if (includeClosed.value) return formatPnlByMode(s.total_pnl, s.total_pnl_percent)
   return formatPnlByMode(s.unrealized_pnl, s.unrealized_pnl_percent)
 })
 
-const totalPnlClass = computed(() =>
-  pnlClass(includeClosed.value ? store.summary?.total_pnl : store.summary?.unrealized_pnl),
-)
+const holdingPnlClass = computed(() => pnlClass(store.summary?.unrealized_pnl))
+
+const closedPnlText = computed(() => {
+  const s = store.summary
+  if (!s) return '—'
+  return formatPnlByMode(s.realized_pnl, s.realized_pnl_percent)
+})
+
+const closedPnlClass = computed(() => pnlClass(store.summary?.realized_pnl))
+
+const cumulativePnlText = computed(() => {
+  const s = store.summary
+  if (!s) return '—'
+  return formatPnlByMode(s.total_pnl, s.total_pnl_percent)
+})
+
+const cumulativePnlClass = computed(() => pnlClass(store.summary?.total_pnl))
+
 const nav = ref({ points: [], ranges: [] })
 const movers = ref({ winners: [], losers: [] })
+const holdingMovers = ref({ winners: [], losers: [] })
+const closedMovers = ref({ winners: [], losers: [] })
 const totalMovers = ref({ winners: [], losers: [] })
 const chartRef = ref(null)
 const DAILY_LIMIT = 5
@@ -86,11 +99,21 @@ function rankMovers(list, direction, limit = null) {
 const dailyPool = computed(() =>
   uniqueBySymbol([...(movers.value.winners || []), ...(movers.value.losers || [])]),
 )
+const holdingPool = computed(() =>
+  uniqueBySymbol([...(holdingMovers.value.winners || []), ...(holdingMovers.value.losers || [])]),
+)
+const closedPool = computed(() =>
+  uniqueBySymbol([...(closedMovers.value.winners || []), ...(closedMovers.value.losers || [])]),
+)
 const totalPool = computed(() =>
   uniqueBySymbol([...(totalMovers.value.winners || []), ...(totalMovers.value.losers || [])]),
 )
 const dailyWinners = computed(() => rankMovers(dailyPool.value, 'up', DAILY_LIMIT))
 const dailyLosers = computed(() => rankMovers(dailyPool.value, 'down', DAILY_LIMIT))
+const holdingWinners = computed(() => rankMovers(holdingPool.value, 'up'))
+const holdingLosers = computed(() => rankMovers(holdingPool.value, 'down'))
+const closedWinners = computed(() => rankMovers(closedPool.value, 'up'))
+const closedLosers = computed(() => rankMovers(closedPool.value, 'down'))
 const totalWinners = computed(() => rankMovers(totalPool.value, 'up'))
 const totalLosers = computed(() => rankMovers(totalPool.value, 'down'))
 
@@ -104,18 +127,19 @@ function formatDateLabel(iso) {
   return `${day}日`
 }
 
-async function loadTotalMovers() {
-  totalMovers.value = await fetchTotalMovers({ include_closed: includeClosed.value })
-}
-
 async function load() {
-  const [navRes, moversRes] = await Promise.all([
+  const [navRes, moversRes, holdingRes, closedRes, totalRes] = await Promise.all([
     fetchNav({ range: range.value, mode: mode.value }),
     fetchMovers(),
+    fetchTotalMovers({ include_closed: false }),
+    fetchTotalMovers({ closed_only: true }),
+    fetchTotalMovers({ include_closed: true }),
   ])
   nav.value = navRes
   movers.value = moversRes
-  await loadTotalMovers()
+  holdingMovers.value = holdingRes
+  closedMovers.value = closedRes
+  totalMovers.value = totalRes
   await nextTick()
   renderChart()
 }
@@ -232,7 +256,6 @@ function onResize() {
 }
 
 watch([mode, range], load)
-watch(includeClosed, loadTotalMovers)
 onMounted(() => {
   load()
   window.addEventListener('resize', onResize)
@@ -285,7 +308,7 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section class="day-pnl-section">
+    <section class="pnl-section">
       <h2 class="section-title">
         今日盈亏<span class="section-pnl" :class="dayPnlClass">（{{ dayPnlText }}）</span>
       </h2>
@@ -317,21 +340,77 @@ onUnmounted(() => {
       </section>
     </div>
 
-    <div class="total-movers-header">
+    <section class="pnl-section">
       <h2 class="section-title">
-        {{ cumulativeTitle }}<span class="section-pnl" :class="totalPnlClass">（{{ totalPnlText }}）</span>
+        持仓盈亏<span class="section-pnl" :class="holdingPnlClass">（{{ holdingPnlText }}）</span>
       </h2>
-      <button
-        type="button"
-        class="mode-btn"
-        :class="{ active: includeClosed }"
-        @click="includeClosed = !includeClosed"
-      >
-        显示已清仓
-      </button>
+    </section>
+
+    <div class="movers">
+      <section class="mover-panel">
+        <h3 class="mover-title">总赢家</h3>
+        <div v-for="item in holdingWinners" :key="'hw-' + item.symbol" class="mover-row">
+          <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
+          <div class="mover-bar">
+            <span class="bar-fill up" :style="{ width: barWidth(item, holdingWinners) }" />
+          </div>
+          <div class="mover-pct pnl-up">{{ formatMover(item) }}</div>
+        </div>
+        <a-empty v-if="!holdingWinners.length" description="暂无数据" />
+      </section>
+
+      <section class="mover-panel">
+        <h3 class="mover-title">总输家</h3>
+        <div v-for="item in holdingLosers" :key="'hl-' + item.symbol" class="mover-row">
+          <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
+          <div class="mover-bar">
+            <span class="bar-fill down" :style="{ width: barWidth(item, holdingLosers) }" />
+          </div>
+          <div class="mover-pct pnl-down">{{ formatMover(item) }}</div>
+        </div>
+        <a-empty v-if="!holdingLosers.length" description="暂无数据" />
+      </section>
     </div>
 
-    <div class="movers total-movers">
+    <section class="pnl-section">
+      <h2 class="section-title">
+        清仓盈亏<span class="section-pnl" :class="closedPnlClass">（{{ closedPnlText }}）</span>
+      </h2>
+    </section>
+
+    <div class="movers">
+      <section class="mover-panel">
+        <h3 class="mover-title">总赢家</h3>
+        <div v-for="item in closedWinners" :key="'cw-' + item.symbol" class="mover-row">
+          <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
+          <div class="mover-bar">
+            <span class="bar-fill up" :style="{ width: barWidth(item, closedWinners) }" />
+          </div>
+          <div class="mover-pct pnl-up">{{ formatMover(item) }}</div>
+        </div>
+        <a-empty v-if="!closedWinners.length" description="暂无数据" />
+      </section>
+
+      <section class="mover-panel">
+        <h3 class="mover-title">总输家</h3>
+        <div v-for="item in closedLosers" :key="'cl-' + item.symbol" class="mover-row">
+          <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
+          <div class="mover-bar">
+            <span class="bar-fill down" :style="{ width: barWidth(item, closedLosers) }" />
+          </div>
+          <div class="mover-pct pnl-down">{{ formatMover(item) }}</div>
+        </div>
+        <a-empty v-if="!closedLosers.length" description="暂无数据" />
+      </section>
+    </div>
+
+    <section class="pnl-section">
+      <h2 class="section-title">
+        累计盈亏<span class="section-pnl" :class="cumulativePnlClass">（{{ cumulativePnlText }}）</span>
+      </h2>
+    </section>
+
+    <div class="movers">
       <section class="mover-panel">
         <h3 class="mover-title">总赢家</h3>
         <div v-for="item in totalWinners" :key="'tw-' + item.symbol" class="mover-row">
@@ -439,7 +518,7 @@ onUnmounted(() => {
   font-weight: 700;
 }
 
-.day-pnl-section {
+.pnl-section {
   margin-top: 28px;
   padding-top: 8px;
 }
@@ -455,22 +534,6 @@ onUnmounted(() => {
   gap: 24px;
   margin-top: 20px;
   padding-top: 8px;
-}
-
-.total-movers-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin-top: 36px;
-}
-
-.total-movers-header .section-title {
-  margin: 0;
-}
-
-.total-movers {
-  margin-top: 12px;
 }
 
 .mover-panel {
