@@ -1,0 +1,278 @@
+:root {
+  --bg: #ffffff;
+  --panel: #ffffff;
+  --text: #131722;
+  --muted: #787b86;
+  --border: #e0e3eb;
+  --green: #089981;
+  --red: #f23645;
+  --blue: #2962ff;
+  --teal: #26a69a;
+  --chip: #f0f3fa;
+  --shadow: none;
+  font-family: "Trebuchet MS", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  width: 100%;
+  min-height: 100%;
+  max-width: none;
+  max-height: none;
+  background: var(--bg);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.page {
+  width: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 20px 20px 0;
+  box-sizing: border-box;
+}
+
+.pnl-up {
+  color: var(--green) !important;
+}
+
+.pnl-down {
+  color: var(--red) !important;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.panel {
+  background: var(--panel);
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+/* KPI card layout lives in SummaryCards.vue (separated cards) */
+
+.symbol-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.symbol-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #eef1f6;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #555;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.symbol-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.symbol-meta {
+  min-width: 0;
+}
+
+.symbol-meta .code {
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.symbol-meta .name {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.range-chips {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.range-chip {
+  border: none;
+  background: transparent;
+  border-radius: 8px;
+  padding: 10px 8px;
+  text-align: center;
+  cursor: pointer;
+  transition: 0.15s ease;
+}
+
+.range-chip.active {
+  background: var(--chip);
+}
+
+.range-chip .r-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.range-chip .r-value {
+  margin-top: 4px;
+  font-weight: 700;
+}
+
+.movers {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.mover-row {
+  display: grid;
+  grid-template-columns: 120px 1fr 60px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+}
+
+.mover-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: #eef1f6;
+  overflow: hidden;
+}
+
+.mover-bar > span {
+  display: block;
+  height: 100%;
+}
+
+.empty-tab {
+  padding: 64px 24px;
+  text-align: center;
+  color: var(--muted);
+}
+
+/* Table scrollbars — match Ant Design ScrollBar / sticky thumb */
+.ant-table-body,
+.ant-table-content,
+.ant-table-header {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.25) transparent;
+}
+
+.ant-table-body::-webkit-scrollbar,
+.ant-table-content::-webkit-scrollbar,
+.ant-table-header::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.ant-table-body::-webkit-scrollbar-thumb,
+.ant-table-content::-webkit-scrollbar-thumb,
+.ant-table-header::-webkit-scrollbar-thumb {
+  background-color: rgba(0, 0, 0, 0.25);
+  border-radius: 100px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background-color 0.2s;
+}
+
+.ant-table-body::-webkit-scrollbar-thumb:hover,
+.ant-table-content::-webkit-scrollbar-thumb:hover,
+.ant-table-header::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(0, 0, 0, 0.45);
+}
+
+.ant-table-body::-webkit-scrollbar-track,
+.ant-table-content::-webkit-scrollbar-track,
+.ant-table-header::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.ant-table-body::-webkit-scrollbar-corner,
+.ant-table-content::-webkit-scrollbar-corner,
+.ant-table-header::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Ant Design tabs — TradingView-like underline */
+.page .ant-tabs-nav {
+  margin-bottom: 16px !important;
+}
+
+.page .ant-tabs-tab {
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  padding: 10px 4px !important;
+  color: var(--muted) !important;
+}
+
+.page .ant-tabs-tab-active .ant-tabs-tab-btn {
+  color: var(--text) !important;
+}
+
+.page .ant-tabs-ink-bar {
+  background: var(--text) !important;
+  height: 2px !important;
+}
+
+.page .ant-tabs-nav::before {
+  border-bottom-color: var(--border) !important;
+}
+
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.page-header h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+@media (max-width: 800px) {
+  .movers,
+  .range-chips {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .page {
+    padding: 12px 14px 32px;
+  }
+}
