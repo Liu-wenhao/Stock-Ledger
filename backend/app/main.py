@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api import market_api, portfolio, trades
@@ -10,10 +12,29 @@ from app.core.database import Base, SessionLocal, engine
 from app.models.entities import Portfolio
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
+
+
+def _ensure_schema() -> None:
+    """Additive column patches for existing DBs (create_all does not ALTER)."""
+    stmts = [
+        "ALTER TABLE price_cache ADD COLUMN price_as_of DATE NULL",
+    ]
+    with engine.begin() as conn:
+        for sql in stmts:
+            try:
+                conn.execute(text(sql))
+            except Exception as exc:
+                # Duplicate column / already migrated — ignore
+                msg = str(exc).lower()
+                if "duplicate" in msg or "exists" in msg or "1060" in msg:
+                    continue
+                logger.debug("schema patch skipped: %s (%s)", sql, exc)
 
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    _ensure_schema()
     db: Session = SessionLocal()
     try:
         existing = db.query(Portfolio).filter(Portfolio.id == settings.default_portfolio_id).first()

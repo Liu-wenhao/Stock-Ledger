@@ -368,6 +368,7 @@ def compute_holdings(
             "quantity": pos.quantity,
             "avg_price": pos.avg_price,
             "last_price": last,
+            "price_as_of": q.get("price_as_of"),
             "cost_basis": cost,
             "market_value": mv,
             "invested": invested,

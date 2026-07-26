@@ -42,6 +42,8 @@ class HoldingRow(BaseModel):
     quantity: Decimal
     avg_price: Decimal
     last_price: Decimal | None = None
+    # US trading-day date for last_price / 收盘价; omit/null when unknown
+    price_as_of: date | None = None
     cost_basis: Decimal
     market_value: Decimal
     invested: Decimal = Decimal("0")

@@ -9,7 +9,8 @@ class Settings(BaseSettings):
     database_url: str = "mysql+pymysql://stock:stockledger123@127.0.0.1:3306/stock_ledger"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     quote_cache_seconds: int = 60
-    # Temporarily disable Yahoo quote refresh (use cache + PRICE_OVERRIDES only)
+    # When false, serve DB cache only (no Yahoo overwrite). Set true to refresh
+    # previous completed US session close into PriceCache.
     yahoo_refresh_enabled: bool = False
     benchmark_symbol: str = "QQQ"
     default_portfolio_id: int = 1

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
@@ -36,6 +36,18 @@ const symbolTrades = ref([])
 /** trade id -> true when this sell closed a cycle */
 const clearTradeIds = ref(new Set())
 
+const priceModalOpen = ref(false)
+const priceModalLoading = ref(false)
+const priceModalSymbol = ref('')
+const priceChartRef = ref(null)
+const priceTrades = ref([])
+/** ms timestamp for vertical dashed separator between 清仓 and 持仓 */
+const cycleSplitMs = ref(null)
+/** clicked row's open-position average cost */
+const priceAvgCost = ref(null)
+/** clicked row's last/close price; omit markLine when null */
+const priceLastClose = ref(null)
+
 const SIDE_LABELS = {
   Buy: '买入',
   Sell: '卖出',
@@ -51,6 +63,7 @@ const SIDE_STEP_STATUS = {
 }
 
 let chart
+let priceChart
 
 function onTableChange(pag) {
   if (pag) {
@@ -61,6 +74,13 @@ function onTableChange(pag) {
 
 function sortByNumber(key) {
   return (a, b) => toNumber(a[key]) - toNumber(b[key])
+}
+
+/** Compact trading-day label for 收盘价; empty when unknown. */
+function formatCloseDate(v) {
+  if (!v) return ''
+  const d = dayjs(v)
+  return d.isValid() ? d.format('MM-DD') : ''
 }
 
 const reserved = ['financials', 'risk', 'technical']
@@ -177,13 +197,308 @@ function tradeStepDesc(t) {
   return parts.join(' · ')
 }
 
+/**
+ * Replay Buy/Sell qty chronologically; when qty hits 0 a cycle ends.
+ * Separator sits between the last clearing sell and the first buy of the
+ * current open cycle. No line if the symbol never fully cleared.
+ */
+function findCycleSplitMs(trades) {
+  let qty = 0
+  let lastClearMs = null
+  let openCycleStartMs = null
+
+  for (const t of trades) {
+    const q = toNumber(t.qty)
+    const ts = new Date(t.closing_time).getTime()
+    if (t.side === 'Buy') {
+      if (qty <= 0) openCycleStartMs = ts
+      qty += q
+    } else if (t.side === 'Sell') {
+      qty -= Math.min(q, qty)
+      if (qty <= 0) {
+        qty = 0
+        lastClearMs = ts
+        openCycleStartMs = null
+      }
+    }
+  }
+
+  // Only draw when history has a closed cycle and a subsequent open cycle
+  if (lastClearMs == null || openCycleStartMs == null || qty <= 0) return null
+  if (openCycleStartMs <= lastClearMs) return lastClearMs
+  return (lastClearMs + openCycleStartMs) / 2
+}
+
+async function openAvgPriceChart(record) {
+  priceModalSymbol.value = record.symbol
+  priceModalOpen.value = true
+  priceModalLoading.value = true
+  priceTrades.value = []
+  cycleSplitMs.value = null
+  priceAvgCost.value = record.avg_price != null ? toNumber(record.avg_price) : null
+  const close = record.last_price != null ? toNumber(record.last_price) : null
+  priceLastClose.value = close != null && Number.isFinite(close) ? close : null
+
+  try {
+    const rows = await fetchTrades({
+      side_group: 'trades',
+      symbol: record.symbol,
+    })
+    const trades = [...rows]
+      .filter((t) => t.side === 'Buy' || t.side === 'Sell')
+      .sort((a, b) => {
+        const ta = new Date(a.closing_time).getTime()
+        const tb = new Date(b.closing_time).getTime()
+        return ta - tb || (a.id || 0) - (b.id || 0)
+      })
+
+    priceTrades.value = trades
+    cycleSplitMs.value = findCycleSplitMs(trades)
+    await nextTick()
+    renderPriceChart()
+  } finally {
+    priceModalLoading.value = false
+  }
+}
+
+function disposePriceChart() {
+  if (priceChart) {
+    priceChart.dispose()
+    priceChart = null
+  }
+}
+
+function renderPriceChart() {
+  if (!priceChartRef.value) return
+  if (!priceChart) priceChart = echarts.init(priceChartRef.value)
+
+  const trades = priceTrades.value
+  const lineData = trades.map((t) => [
+    new Date(t.closing_time).getTime(),
+    toNumber(t.fill_price),
+  ])
+  const qtys = trades.map((t) => toNumber(t.qty)).filter((n) => Number.isFinite(n) && n > 0)
+  const qtyMin = qtys.length ? Math.min(...qtys) : 0
+  const qtyMax = qtys.length ? Math.max(...qtys) : 0
+  // Baseline = ECharts scatter default (no symbolSize before qty scaling).
+  // minQty → base; larger qtys grow up (never shrink below base). Soften small ratios.
+  const SYM_SIZE_BASE = 10
+  const SYM_SIZE_MAX = 22
+  const qtyToSymbolSize = (qty) => {
+    const q = toNumber(qty)
+    if (!Number.isFinite(q) || q <= 0) return SYM_SIZE_BASE
+    if (qtyMax <= qtyMin) return SYM_SIZE_BASE
+    const logMin = Math.log(qtyMin)
+    const logMax = Math.log(qtyMax)
+    const t = (Math.log(q) - logMin) / (logMax - logMin) // 0..1 on log qty
+    // Full grow span only when qtyMax/qtyMin ≈ 8×; ~1.7× (3 vs 5) → ~0.24 damp.
+    const ratio = qtyMax / qtyMin
+    const damp = Math.min(1, Math.log2(ratio) / 3)
+    return SYM_SIZE_BASE + t * (SYM_SIZE_MAX - SYM_SIZE_BASE) * damp
+  }
+  const points = trades.map((t) => {
+    const isBuy = t.side === 'Buy'
+    const color = isBuy ? '#089981' : '#f23645'
+    return {
+      value: [new Date(t.closing_time).getTime(), toNumber(t.fill_price)],
+      side: t.side,
+      qty: t.qty,
+      symbolSize: qtyToSymbolSize(t.qty),
+      itemStyle: { color },
+      label: {
+        show: true,
+        formatter: isBuy ? 'B' : 'S',
+        color,
+        fontSize: 12,
+        fontWeight: 700,
+        position: 'top',
+        distance: 4,
+      },
+    }
+  })
+
+  const split = cycleSplitMs.value
+  const avg = priceAvgCost.value
+  const close = priceLastClose.value
+  const markLineData = []
+  if (split != null) {
+    markLineData.push({
+      xAxis: split,
+      label: {
+        show: true,
+        formatter: '清仓 | 持仓',
+        color: '#787b86',
+        fontSize: 11,
+        position: 'insideEndTop',
+      },
+      lineStyle: {
+        type: 'dashed',
+        color: '#787b86',
+        width: 1.5,
+      },
+    })
+  }
+  if (avg != null && Number.isFinite(avg)) {
+    markLineData.push({
+      yAxis: avg,
+      label: {
+        show: true,
+        formatter: `均价 ${formatMoney(avg, 'USD', 4).replace(' USD', '')}`,
+        color: '#e6a700',
+        fontSize: 11,
+        position: 'insideEndTop',
+      },
+      lineStyle: {
+        type: 'dashed',
+        color: '#e6a700',
+        width: 1.5,
+      },
+    })
+  }
+  if (close != null && Number.isFinite(close)) {
+    markLineData.push({
+      yAxis: close,
+      label: {
+        show: true,
+        formatter: `收盘价 ${formatMoney(close, 'USD', 4).replace(' USD', '')}`,
+        color: '#26a69a',
+        fontSize: 11,
+        position: 'insideStartTop',
+      },
+      lineStyle: {
+        type: 'solid',
+        color: '#26a69a',
+        width: 1.5,
+      },
+    })
+  }
+  const markLine = markLineData.length
+    ? {
+        symbol: 'none',
+        silent: true,
+        data: markLineData,
+      }
+    : undefined
+
+  // ECharts does not expand axis range for markLine; include avg/close so they aren't clipped
+  const yExtent = trades
+    .map((t) => toNumber(t.fill_price))
+    .filter((n) => Number.isFinite(n))
+  if (avg != null && Number.isFinite(avg)) yExtent.push(avg)
+  if (close != null && Number.isFinite(close)) yExtent.push(close)
+  let yAxisMin
+  let yAxisMax
+  if (yExtent.length) {
+    const lo = Math.min(...yExtent)
+    const hi = Math.max(...yExtent)
+    const pad = Math.max((hi - lo) * 0.08, Math.abs(hi || lo || 1) * 0.002, 0.01)
+    yAxisMin = lo - pad
+    yAxisMax = hi + pad
+  }
+
+  priceChart.setOption(
+    {
+      animationDuration: 300,
+      grid: { left: 16, right: 48, top: 36, bottom: 40, containLabel: true },
+      tooltip: {
+        trigger: 'item',
+        backgroundColor: '#fff',
+        borderColor: '#e0e3eb',
+        textStyle: { color: '#131722', fontSize: 12 },
+        formatter: (p) => {
+          const d = p?.data
+          if (!d || !d.value) return ''
+          const [ts, price] = d.value || []
+          const side = d.side === 'Buy' ? '买入' : '卖出'
+          return [
+            `${side} ${d.side === 'Buy' ? 'B' : 'S'}`,
+            dayjs(ts).format('YYYY-MM-DD HH:mm'),
+            `成交价 ${formatMoney(price, 'USD', 4).replace(' USD', '')}`,
+            `数量 ${formatQty(d.qty)}`,
+          ].join('<br/>')
+        },
+      },
+      xAxis: {
+        type: 'time',
+        axisLine: { lineStyle: { color: '#e0e3eb' } },
+        axisTick: { show: false },
+        splitLine: { show: false },
+        axisLabel: {
+          color: '#787b86',
+          fontSize: 11,
+          hideOverlap: true,
+          // Day only; show M/D when month changes. Cache survives ECharts re-measure passes.
+          formatter: (() => {
+            const cache = new Map()
+            let prevMonthKey = null
+            let prevValue = null
+            return (v) => {
+              if (cache.has(v)) return cache.get(v)
+              if (prevValue != null && v < prevValue) {
+                cache.clear()
+                prevMonthKey = null
+              }
+              const d = dayjs(v)
+              const monthKey = d.year() * 12 + d.month()
+              const label =
+                prevMonthKey !== monthKey
+                  ? `${d.month() + 1}/${d.date()}`
+                  : String(d.date())
+              prevMonthKey = monthKey
+              prevValue = v
+              cache.set(v, label)
+              return label
+            }
+          })(),
+        },
+      },
+      yAxis: {
+        type: 'value',
+        scale: true,
+        min: yAxisMin,
+        max: yAxisMax,
+        position: 'right',
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { color: '#f0f3f6', type: 'dashed' } },
+        axisLabel: {
+          color: '#787b86',
+          fontSize: 11,
+          formatter: (v) => Number(v).toFixed(2),
+        },
+      },
+      series: [
+        {
+          type: 'line',
+          data: lineData,
+          showSymbol: false,
+          symbol: 'none',
+          clip: false,
+          lineStyle: { color: '#2962ff', width: 2 },
+          itemStyle: { color: '#2962ff' },
+          markLine,
+          tooltip: { show: false },
+          z: 1,
+        },
+        {
+          type: 'scatter',
+          data: points,
+          z: 2,
+        },
+      ],
+    },
+    true,
+  )
+  priceChart.resize()
+}
+
 const positionColumns = [
   { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
   { title: '交易笔数', key: 'trade_count', dataIndex: 'trade_count', width: 100, align: 'right' },
   { title: '分配 %', dataIndex: 'allocation', key: 'allocation', align: 'right' },
   { title: '数量', dataIndex: 'quantity', key: 'quantity', align: 'right' },
   { title: '平均价格', dataIndex: 'avg_price', key: 'avg_price', align: 'right' },
-  { title: '目前收盘价', dataIndex: 'last_price', key: 'last_price', align: 'right' },
+  { title: '收盘价', dataIndex: 'last_price', key: 'last_price', align: 'right' },
   { title: '成本值', dataIndex: 'cost_basis', key: 'cost_basis', align: 'right' },
   {
     title: '值',
@@ -210,7 +525,7 @@ const positionColumns = [
 
 const priceColumns = [
   { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
-  { title: '目前收盘价', dataIndex: 'last_price', key: 'last_price', align: 'right' },
+  { title: '收盘价', dataIndex: 'last_price', key: 'last_price', align: 'right' },
   { title: '日涨跌', dataIndex: 'day_change', key: 'day_change', align: 'right' },
   { title: '日涨跌 %', dataIndex: 'day_change_percent', key: 'day_change_percent', align: 'right' },
   { title: '开盘', dataIndex: 'open_price', key: 'open_price', align: 'right' },
@@ -454,7 +769,17 @@ watch([subTab, includeClosed], () => {
 watch([metric, perfFilter, () => data.value.items], () => {
   if (subTab.value === 'performance') renderPerf()
 })
+watch(priceModalOpen, (open) => {
+  if (!open) disposePriceChart()
+})
 onMounted(load)
+onUnmounted(() => {
+  disposePriceChart()
+  if (chart) {
+    chart.dispose()
+    chart = null
+  }
+})
 </script>
 
 <template>
@@ -650,7 +975,30 @@ onMounted(load)
           </template>
           <template v-else-if="column.key === 'allocation'">{{ formatPct(record.allocation).replace('+', '') }}</template>
           <template v-else-if="column.key === 'quantity'">{{ formatQty(record.quantity) }}</template>
-          <template v-else-if="['avg_price', 'last_price', 'open_price', 'high_price', 'low_price', 'prev_close'].includes(column.key)">
+          <template v-else-if="column.key === 'last_price'">
+            <span v-if="record.last_price == null">—</span>
+            <span v-else class="close-price-cell">
+              {{ formatMoney(record.last_price).replace(' USD', '') }}
+              <span
+                v-if="formatCloseDate(record.price_as_of)"
+                class="close-price-date"
+                :title="dayjs(record.price_as_of).format('YYYY-MM-DD')"
+              >({{ formatCloseDate(record.price_as_of) }})</span>
+            </span>
+          </template>
+          <template v-else-if="column.key === 'avg_price'">
+            <a
+              v-if="record.avg_price != null && subTab === 'positions'"
+              class="trade-count-link"
+              @click.prevent="openAvgPriceChart(record)"
+            >
+              {{ formatMoney(record.avg_price).replace(' USD', '') }}
+            </a>
+            <span v-else>
+              {{ record.avg_price == null ? '—' : formatMoney(record.avg_price).replace(' USD', '') }}
+            </span>
+          </template>
+          <template v-else-if="['open_price', 'high_price', 'low_price', 'prev_close'].includes(column.key)">
             {{ record[column.key] == null ? '—' : formatMoney(record[column.key]).replace(' USD', '') }}
           </template>
           <template v-else-if="['cost_basis', 'market_value', 'day_change'].includes(column.key)">
@@ -740,10 +1088,35 @@ onMounted(load)
         </a-steps>
       </a-spin>
     </a-modal>
+
+    <a-modal
+      v-model:open="priceModalOpen"
+      :title="`${tickerOf(priceModalSymbol)} 交易价格`"
+      :footer="null"
+      width="760px"
+      centered
+      destroy-on-close
+      @afterOpenChange="(open) => open && nextTick(() => renderPriceChart())"
+    >
+      <a-spin :spinning="priceModalLoading">
+        <a-empty v-if="!priceModalLoading && !priceTrades.length" description="暂无交易" />
+        <div v-show="priceTrades.length" ref="priceChartRef" class="avg-price-chart" />
+      </a-spin>
+    </a-modal>
   </div>
 </template>
 
 <style scoped>
+.close-price-cell {
+  white-space: nowrap;
+}
+
+.close-price-date {
+  margin-left: 6px;
+  color: #787b86;
+  font-size: 12px;
+}
+
 .trade-count-link {
   color: #2962ff;
   font-weight: 600;
@@ -853,5 +1226,10 @@ onMounted(load)
   flex: 1;
   min-width: 0;
   height: 100%;
+}
+
+.avg-price-chart {
+  width: 100%;
+  height: 380px;
 }
 </style>
