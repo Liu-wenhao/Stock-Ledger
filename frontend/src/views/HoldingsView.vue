@@ -3,9 +3,10 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
-import { fetchHoldings, fetchTrades } from '@/api/portfolio'
+import { fetchHoldings, fetchTrades, refreshMarket } from '@/api/portfolio'
 import SymbolCell from '@/components/SymbolCell.vue'
 import { formatMoney, formatPct, formatQty, pnlClass, tickerOf, toNumber } from '@/utils/format'
+import { isUsMarketOpen } from '@/utils/marketHours'
 import { useTableScrollY } from '@/composables/useTableScroll'
 
 const router = useRouter()
@@ -64,6 +65,10 @@ const SIDE_STEP_STATUS = {
 
 let chart
 let priceChart
+let quoteRefreshTimer
+let quoteRefreshBusy = false
+
+const QUOTE_REFRESH_INTERVAL_MS = 10_000
 
 function onTableChange(pag) {
   if (pag) {
@@ -76,29 +81,55 @@ function sortByNumber(key) {
   return (a, b) => toNumber(a[key]) - toNumber(b[key])
 }
 
-/** Compact trading-day label for 收盘价; empty when unknown. */
+/** Compact US-market quote time for the latest price; empty when unknown. */
 function formatCloseDate(v) {
   if (!v) return ''
   const d = dayjs(v)
-  return d.isValid() ? d.format('MM-DD') : ''
+  return d.isValid() ? d.format('MM-DD HH:mm:ss') : ''
 }
 
 const reserved = ['financials', 'risk', 'technical']
 
-async function load() {
-  loading.value = true
+async function load({ silent = false } = {}) {
+  if (!silent) loading.value = true
   try {
     const isClosed = subTab.value === 'closed'
+    const isCumulative = subTab.value === 'cumulative'
     data.value = await fetchHoldings({
-      view: isClosed ? 'closed' : 'positions',
+      view: isClosed ? 'closed' : isCumulative ? 'cumulative' : 'positions',
       // 持仓/价格始终只看当前持仓；表现页仍可用「显示已清仓」
       include_closed: subTab.value === 'performance' ? includeClosed.value : false,
       q: keyword.value || undefined,
     })
     if (subTab.value === 'performance') renderPerf()
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
+}
+
+async function autoRefreshQuotes() {
+  if (quoteRefreshBusy || loading.value || !isUsMarketOpen()) return
+  quoteRefreshBusy = true
+  try {
+    await refreshMarket(true)
+    await load({ silent: true })
+    emit('changed')
+  } catch {
+    // Keep the timer alive; the next market-open interval can retry.
+  } finally {
+    quoteRefreshBusy = false
+  }
+}
+
+function startQuoteRefreshTimer() {
+  if (quoteRefreshTimer) return
+  quoteRefreshTimer = window.setInterval(autoRefreshQuotes, QUOTE_REFRESH_INTERVAL_MS)
+}
+
+function stopQuoteRefreshTimer() {
+  if (!quoteRefreshTimer) return
+  window.clearInterval(quoteRefreshTimer)
+  quoteRefreshTimer = undefined
 }
 
 function tradeInCycle(t, startMs, endMs) {
@@ -229,7 +260,7 @@ function findCycleSplitMs(trades) {
   return (lastClearMs + openCycleStartMs) / 2
 }
 
-async function openAvgPriceChart(record) {
+async function openAvgPriceChart(record, cycle = null) {
   priceModalSymbol.value = record.symbol
   priceModalOpen.value = true
   priceModalLoading.value = true
@@ -246,6 +277,14 @@ async function openAvgPriceChart(record) {
     })
     const trades = [...rows]
       .filter((t) => t.side === 'Buy' || t.side === 'Sell')
+      .filter((t) => {
+        if (!cycle) return true
+        return tradeInCycle(
+          t,
+          cycle.started_at ? new Date(cycle.started_at).getTime() : null,
+          cycle.ended_at ? new Date(cycle.ended_at).getTime() : null,
+        )
+      })
       .sort((a, b) => {
         const ta = new Date(a.closing_time).getTime()
         const tb = new Date(b.closing_time).getTime()
@@ -346,7 +385,7 @@ function renderPriceChart() {
         formatter: `均价 ${formatMoney(avg, 'USD', 4).replace(' USD', '')}`,
         color: '#e6a700',
         fontSize: 11,
-        position: 'insideEndTop',
+        position: 'insideStartTop',
       },
       lineStyle: {
         type: 'dashed',
@@ -360,7 +399,7 @@ function renderPriceChart() {
       yAxis: close,
       label: {
         show: true,
-        formatter: `收盘价 ${formatMoney(close, 'USD', 4).replace(' USD', '')}`,
+        formatter: `价格 ${formatMoney(close, 'USD', 4).replace(' USD', '')}`,
         color: '#26a69a',
         fontSize: 11,
         position: 'insideStartTop',
@@ -498,7 +537,7 @@ const positionColumns = [
   { title: '分配 %', dataIndex: 'allocation', key: 'allocation', align: 'right' },
   { title: '数量', dataIndex: 'quantity', key: 'quantity', align: 'right' },
   { title: '平均价格', dataIndex: 'avg_price', key: 'avg_price', align: 'right' },
-  { title: '收盘价', dataIndex: 'last_price', key: 'last_price', align: 'right' },
+  { title: '价格', dataIndex: 'last_price', key: 'last_price', align: 'right' },
   { title: '成本值', dataIndex: 'cost_basis', key: 'cost_basis', align: 'right' },
   {
     title: '值',
@@ -525,7 +564,7 @@ const positionColumns = [
 
 const priceColumns = [
   { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
-  { title: '收盘价', dataIndex: 'last_price', key: 'last_price', align: 'right' },
+  { title: '价格', dataIndex: 'last_price', key: 'last_price', align: 'right' },
   { title: '日涨跌', dataIndex: 'day_change', key: 'day_change', align: 'right' },
   { title: '日涨跌 %', dataIndex: 'day_change_percent', key: 'day_change_percent', align: 'right' },
   { title: '开盘', dataIndex: 'open_price', key: 'open_price', align: 'right' },
@@ -587,7 +626,44 @@ const cycleColumns = [
   { title: '清仓盈亏 %', key: 'realized_pnl_percent', dataIndex: 'realized_pnl_percent', align: 'right' },
 ]
 
-const columns = computed(() => (subTab.value === 'price' ? priceColumns : positionColumns))
+const cumulativeColumns = [
+  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
+  { title: '周期数', key: 'cycle_count', dataIndex: 'cycle_count', width: 90, align: 'right' },
+  { title: '交易笔数', key: 'trade_count', dataIndex: 'trade_count', width: 100, align: 'right' },
+  { title: '平均价格', key: 'avg_price', dataIndex: 'avg_price', align: 'right' },
+  { title: '价格', key: 'last_price', dataIndex: 'last_price', align: 'right' },
+  { title: '成本值', key: 'cost', dataIndex: 'cost', align: 'right' },
+  { title: '累计盈亏', key: 'total_pnl', dataIndex: 'total_pnl', align: 'right' },
+  { title: '累计盈亏 %', key: 'total_pnl_percent', dataIndex: 'total_pnl_percent', align: 'right' },
+]
+
+const cumulativeCycleColumns = [
+  { title: '周期', key: 'cycle_index', dataIndex: 'cycle_index', width: 70, align: 'right' },
+  { title: '状态', key: 'status', dataIndex: 'status', width: 80 },
+  { title: '建仓时间', key: 'started_at', dataIndex: 'started_at' },
+  { title: '结束时间', key: 'ended_at', dataIndex: 'ended_at' },
+  { title: '交易笔数', key: 'trade_count', dataIndex: 'trade_count', width: 100, align: 'right' },
+  { title: '平均价格', key: 'avg_price', dataIndex: 'avg_price', align: 'right' },
+  { title: '价格', key: 'price', dataIndex: 'price', align: 'right' },
+  { title: '成本值', key: 'cost', dataIndex: 'cost', align: 'right' },
+  { title: '周期盈亏', key: 'pnl', dataIndex: 'pnl', align: 'right' },
+  { title: '周期盈亏 %', key: 'pnl_percent', dataIndex: 'pnl_percent', align: 'right' },
+]
+
+const columns = computed(() => {
+  if (subTab.value === 'price') return priceColumns
+  if (subTab.value === 'cumulative') return cumulativeColumns
+  return positionColumns
+})
+
+function avgPriceClass(record) {
+  const avg = toNumber(record?.avg_price)
+  const price = toNumber(record?.last_price)
+  if (record?.avg_price == null || record?.last_price == null) return ''
+  if (avg > price) return 'pnl-down'
+  if (avg < price) return 'pnl-up'
+  return ''
+}
 
 const positionsSummary = computed(() => {
   // 当前持仓行合计；% = 盈亏合计 / 市值合计
@@ -620,6 +696,14 @@ const closedSummary = computed(() => {
     realized_pnl_percent: cost > 0 ? (pnl / cost) * 100 : 0,
   }
 })
+
+const cumulativeSummary = computed(() => ({
+  cycle_count: (data.value.items || []).reduce((acc, row) => acc + toNumber(row.cycle_count), 0),
+  trade_count: toNumber(data.value.total_trade_count),
+  cost: toNumber(data.value.total_cost),
+  total_pnl: toNumber(data.value.total_pnl),
+  total_pnl_percent: toNumber(data.value.total_pnl_percent),
+}))
 
 const perfItems = computed(() => {
   let items = [...(data.value.items || [])]
@@ -772,8 +856,12 @@ watch([metric, perfFilter, () => data.value.items], () => {
 watch(priceModalOpen, (open) => {
   if (!open) disposePriceChart()
 })
-onMounted(load)
+onMounted(() => {
+  load()
+  startQuoteRefreshTimer()
+})
 onUnmounted(() => {
+  stopQuoteRefreshTimer()
   disposePriceChart()
   if (chart) {
     chart.dispose()
@@ -786,6 +874,7 @@ onUnmounted(() => {
   <div>
     <a-tabs v-model:activeKey="subTab" size="small">
       <a-tab-pane key="positions" tab="持仓" />
+      <a-tab-pane key="cumulative" tab="累计" />
       <a-tab-pane key="closed" tab="清仓" />
       <a-tab-pane key="price" tab="价格" />
       <a-tab-pane key="performance" tab="表现" />
@@ -830,6 +919,133 @@ onUnmounted(() => {
         </div>
         <div ref="chartRef" class="perf-chart" />
       </div>
+    </template>
+
+    <template v-else-if="subTab === 'cumulative'">
+      <div class="toolbar">
+        <a-input-search
+          v-model:value="keyword"
+          placeholder="搜索商品代码"
+          style="width: 240px"
+          allow-clear
+          @search="load"
+        />
+      </div>
+      <a-table
+        :columns="cumulativeColumns"
+        :data-source="data.items"
+        :loading="loading"
+        row-key="symbol"
+        :pagination="pagination"
+        :scroll="tableScroll"
+        size="middle"
+        children-column-name="__no_tree_children__"
+        @change="onTableChange"
+      >
+        <template #expandedRowRender="{ record }">
+          <a-table
+            class="cycle-inner-table"
+            :columns="cumulativeCycleColumns"
+            :data-source="record.cycles || []"
+            :pagination="false"
+            size="small"
+            row-key="cycle_index"
+          >
+            <template #bodyCell="{ column, record: cycle }">
+              <template v-if="column.key === 'cycle_index'">#{{ cycle.cycle_index }}</template>
+              <template v-else-if="column.key === 'started_at' || column.key === 'ended_at'">
+                {{ cycle[column.key] ? dayjs(cycle[column.key]).format('YYYY-MM-DD HH:mm') : '—' }}
+              </template>
+              <template v-else-if="column.key === 'trade_count'">
+                <a
+                  v-if="cycle.trade_count > 0"
+                  class="trade-count-link"
+                  @click.prevent="openTradeHistory(record, cycle)"
+                >{{ cycle.trade_count }}</a>
+                <span v-else>0</span>
+              </template>
+              <template v-else-if="column.key === 'avg_price'">
+                <a
+                  v-if="cycle.avg_price != null"
+                  class="trade-count-link"
+                  :class="avgPriceClass({ avg_price: cycle.avg_price, last_price: cycle.price })"
+                  @click.prevent="openAvgPriceChart({ ...record, avg_price: cycle.avg_price, last_price: cycle.price }, cycle)"
+                >{{ formatMoney(cycle.avg_price).replace(' USD', '') }}</a>
+                <span v-else>—</span>
+              </template>
+              <template v-else-if="column.key === 'price'">
+                {{ cycle.price == null ? '—' : formatMoney(cycle.price).replace(' USD', '') }}
+              </template>
+              <template v-else-if="column.key === 'cost'">
+                {{ formatMoney(cycle.cost) }}
+              </template>
+              <template v-else-if="column.key === 'pnl'">
+                <span :class="pnlClass(cycle.pnl)">{{ formatMoney(cycle.pnl) }}</span>
+              </template>
+              <template v-else-if="column.key === 'pnl_percent'">
+                <span :class="pnlClass(cycle.pnl_percent)">{{ formatPct(cycle.pnl_percent) }}</span>
+              </template>
+            </template>
+          </a-table>
+        </template>
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'symbol'">
+            <SymbolCell :symbol="record.symbol" :name="record.name" :logo-url="record.logo_url" />
+          </template>
+          <template v-else-if="column.key === 'trade_count'">
+            <a v-if="record.trade_count > 0" class="trade-count-link" @click.prevent="openTradeHistory(record)">
+              {{ record.trade_count }}
+            </a>
+            <span v-else>0</span>
+          </template>
+          <template v-else-if="column.key === 'cycle_count'">{{ record.cycle_count }}</template>
+          <template v-else-if="column.key === 'avg_price'">
+            <a
+              v-if="record.avg_price != null"
+              class="trade-count-link"
+              :class="avgPriceClass(record)"
+              @click.prevent="openAvgPriceChart(record)"
+            >{{ formatMoney(record.avg_price).replace(' USD', '') }}</a>
+            <span v-else>—</span>
+          </template>
+          <template v-else-if="column.key === 'last_price'">
+            <span v-if="record.last_price == null">—</span>
+            <span v-else class="close-price-cell">
+              {{ formatMoney(record.last_price).replace(' USD', '') }}
+              <span
+                v-if="formatCloseDate(record.price_as_of)"
+                class="close-price-date"
+                :title="dayjs(record.price_as_of).format('YYYY-MM-DD HH:mm:ss')"
+              >({{ formatCloseDate(record.price_as_of) }})</span>
+            </span>
+          </template>
+          <template v-else-if="column.key === 'cost'">{{ formatMoney(record.cost) }}</template>
+          <template v-else-if="column.key === 'total_pnl'">
+            <span :class="pnlClass(record.total_pnl)">{{ formatMoney(record.total_pnl) }}</span>
+          </template>
+          <template v-else-if="column.key === 'total_pnl_percent'">
+            <span :class="pnlClass(record.total_pnl_percent)">{{ formatPct(record.total_pnl_percent) }}</span>
+          </template>
+        </template>
+        <template #summary>
+          <a-table-summary fixed>
+            <a-table-summary-row class="holdings-summary-row">
+              <a-table-summary-cell :index="0"><strong>汇总</strong></a-table-summary-cell>
+              <a-table-summary-cell :index="1" align="right">—</a-table-summary-cell>
+              <a-table-summary-cell :index="2" align="right">{{ cumulativeSummary.cycle_count }}</a-table-summary-cell>
+              <a-table-summary-cell :index="3" align="right">{{ cumulativeSummary.trade_count }}</a-table-summary-cell>
+              <a-table-summary-cell :index="4" align="right">—</a-table-summary-cell>
+              <a-table-summary-cell :index="5" align="right">{{ formatMoney(cumulativeSummary.cost) }}</a-table-summary-cell>
+              <a-table-summary-cell :index="6" align="right">
+                <span :class="pnlClass(cumulativeSummary.total_pnl)">{{ formatMoney(cumulativeSummary.total_pnl) }}</span>
+              </a-table-summary-cell>
+              <a-table-summary-cell :index="7" align="right">
+                <span :class="pnlClass(cumulativeSummary.total_pnl_percent)">{{ formatPct(cumulativeSummary.total_pnl_percent) }}</span>
+              </a-table-summary-cell>
+            </a-table-summary-row>
+          </a-table-summary>
+        </template>
+      </a-table>
     </template>
 
     <template v-else-if="subTab === 'closed'">
@@ -982,7 +1198,7 @@ onUnmounted(() => {
               <span
                 v-if="formatCloseDate(record.price_as_of)"
                 class="close-price-date"
-                :title="dayjs(record.price_as_of).format('YYYY-MM-DD')"
+                :title="dayjs(record.price_as_of).format('YYYY-MM-DD HH:mm:ss')"
               >({{ formatCloseDate(record.price_as_of) }})</span>
             </span>
           </template>
@@ -990,6 +1206,7 @@ onUnmounted(() => {
             <a
               v-if="record.avg_price != null && subTab === 'positions'"
               class="trade-count-link"
+              :class="avgPriceClass(record)"
               @click.prevent="openAvgPriceChart(record)"
             >
               {{ formatMoney(record.avg_price).replace(' USD', '') }}

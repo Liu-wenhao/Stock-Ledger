@@ -18,7 +18,14 @@ logger = logging.getLogger(__name__)
 def _ensure_schema() -> None:
     """Additive column patches for existing DBs (create_all does not ALTER)."""
     stmts = [
-        "ALTER TABLE price_cache ADD COLUMN price_as_of DATE NULL",
+        "ALTER TABLE price_cache ADD COLUMN price_as_of DATETIME NULL",
+        "ALTER TABLE price_cache MODIFY COLUMN price_as_of DATETIME NULL",
+        (
+            "UPDATE price_cache SET price_as_of = fetched_at "
+            "WHERE price_as_of IS NOT NULL "
+            "AND TIME(price_as_of) = '00:00:00' "
+            "AND fetched_at IS NOT NULL"
+        ),
     ]
     with engine.begin() as conn:
         for sql in stmts:

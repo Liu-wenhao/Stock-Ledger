@@ -5,11 +5,15 @@ from app.core.database import get_db
 from app.schemas.portfolio import (
     ClosedHoldingRow,
     ClosedHoldingsResponse,
+    CumulativeCycleRow,
+    CumulativeHoldingRow,
+    CumulativeHoldingsResponse,
     DailyMoversResponse,
     HoldingRow,
     HoldingsResponse,
     MonthlyReturnsResponse,
     NavSeriesResponse,
+    PeriodPerformanceResponse,
     PortfolioSummary,
     ProfitSeriesResponse,
 )
@@ -49,6 +53,14 @@ def total_movers(
     return ledger.total_movers(db, include_closed=include_closed, closed_only=closed_only)
 
 
+@router.get("/portfolio/period-performance", response_model=PeriodPerformanceResponse)
+def period_performance(
+    range: str = Query("3M", alias="range"),
+    db: Session = Depends(get_db),
+):
+    return ledger.period_performance(db, range_key=range)
+
+
 @router.get("/holdings")
 def holdings(
     view: str = Query("positions"),
@@ -75,6 +87,32 @@ def holdings(
             total_realized_cost=data["total_realized_cost"],
             total_buy_amount=data["total_buy_amount"],
             total_sell_amount=data["total_sell_amount"],
+            total_market_value=data["total_market_value"],
+            cash=data["cash"],
+        )
+    if view == "cumulative":
+        data = ledger.compute_cumulative_holdings(db)
+        items = data["items"]
+        if q:
+            ql = q.strip().upper()
+            items = [
+                i for i in items
+                if ql in i["symbol"].upper() or (i.get("name") and ql in i["name"].upper())
+            ]
+        return CumulativeHoldingsResponse(
+            items=[
+                CumulativeHoldingRow(
+                    **{
+                        **{k: v for k, v in item.items() if k != "cycles"},
+                        "cycles": [CumulativeCycleRow(**cycle) for cycle in item.get("cycles", [])],
+                    }
+                )
+                for item in items
+            ],
+            total_trade_count=data["total_trade_count"],
+            total_cost=data["total_cost"],
+            total_pnl=data["total_pnl"],
+            total_pnl_percent=data["total_pnl_percent"],
             total_market_value=data["total_market_value"],
             cash=data["cash"],
         )

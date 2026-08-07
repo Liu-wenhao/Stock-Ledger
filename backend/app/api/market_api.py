@@ -14,7 +14,7 @@ settings = get_settings()
 @router.get("/market/quote", response_model=list[QuoteOut])
 def quotes(symbols: str = Query(...), db: Session = Depends(get_db)):
     syms = [s.strip() for s in symbols.split(",") if s.strip()]
-    data = get_quotes(db, syms, background_refresh=settings.yahoo_refresh_enabled)
+    data = get_quotes(db, syms, background_refresh=settings.quote_refresh_enabled)
     metas = {
         m.symbol: m
         for m in db.query(SymbolMeta).filter(SymbolMeta.symbol.in_(syms)).all()
@@ -31,22 +31,21 @@ def quotes(symbols: str = Query(...), db: Session = Depends(get_db)):
 
 
 @router.post("/market/refresh")
-def refresh_market(db: Session = Depends(get_db)):
-    if not settings.yahoo_refresh_enabled:
+def refresh_market(force: bool = Query(True), db: Session = Depends(get_db)):
+    if not settings.quote_refresh_enabled:
         return {
             "symbols": 0,
             "priced": 0,
             "disabled": True,
-            "message": "Yahoo refresh temporarily disabled (yahoo_refresh_enabled=false)",
+            "message": "Market refresh disabled (MARKET_REFRESH_ENABLED=false)",
         }
-    syms = [
-        r[0]
-        for r in db.query(Trade.symbol)
-        .filter(Trade.symbol.isnot(None))
-        .distinct()
-        .all()
-    ]
-    data = refresh_quotes_sync(db, syms)
+    from app.services import ledger
+
+    state = ledger.replay(ledger.load_trades(db, settings.default_portfolio_id))
+    syms = sorted(
+        sym for sym, position in state.positions.items() if position.quantity > 0
+    )
+    data = refresh_quotes_sync(db, syms, force=force)
     priced = sum(1 for v in data.values() if v.get("price") is not None)
     return {"symbols": len(syms), "priced": priced, "disabled": False}
 

@@ -66,8 +66,8 @@ class PriceCache(Base):
     low_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
     change_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
     change_percent: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
-    # Trading-day date of `price` (US session). Null when unknown — never invent.
-    price_as_of: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Quote/bar time in the US market session. Null when unknown — never invent.
+    price_as_of: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

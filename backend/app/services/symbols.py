@@ -1,4 +1,4 @@
-"""Symbol helpers: EXCHANGE:TICKER -> Yahoo ticker."""
+"""Symbol helpers: normalize EXCHANGE:TICKER values for market providers."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def split_symbol(symbol: str | None) -> tuple[str | None, str | None]:
     return None, s
 
 
-def to_yahoo_symbol(symbol: str | None) -> str | None:
+def to_market_symbol(symbol: str | None) -> str | None:
     exchange, ticker = split_symbol(symbol)
     if not ticker or ticker in {"CASH", "USD"}:
         return None
@@ -31,6 +31,11 @@ def to_yahoo_symbol(symbol: str | None) -> str | None:
         # HK tickers often need numeric padding; leave as-is for now
         return f"{ticker}{EXCHANGE_SUFFIX[exchange]}"
     return ticker
+
+
+def to_yahoo_symbol(symbol: str | None) -> str | None:
+    """Backward-compatible alias for the legacy database field name."""
+    return to_market_symbol(symbol)
 
 
 def exchange_of(symbol: str | None) -> str | None:

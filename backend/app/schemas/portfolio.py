@@ -42,8 +42,8 @@ class HoldingRow(BaseModel):
     quantity: Decimal
     avg_price: Decimal
     last_price: Decimal | None = None
-    # US trading-day date for last_price / 收盘价; omit/null when unknown
-    price_as_of: date | None = None
+    # US market quote/bar time for last_price / 价格; omit/null when unknown
+    price_as_of: datetime | None = None
     cost_basis: Decimal
     market_value: Decimal
     invested: Decimal = Decimal("0")
@@ -110,6 +110,45 @@ class ClosedHoldingsResponse(BaseModel):
     cash: Decimal = Decimal("0")
 
 
+class CumulativeCycleRow(BaseModel):
+    cycle_index: int
+    status: str
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    trade_count: int = 0
+    avg_price: Decimal = Decimal("0")
+    price: Decimal | None = None
+    cost: Decimal = Decimal("0")
+    pnl: Decimal = Decimal("0")
+    pnl_percent: Decimal = Decimal("0")
+
+
+class CumulativeHoldingRow(BaseModel):
+    symbol: str
+    name: str | None = None
+    logo_url: str | None = None
+    exchange: str | None = None
+    cycle_count: int = 0
+    trade_count: int = 0
+    avg_price: Decimal = Decimal("0")
+    last_price: Decimal | None = None
+    price_as_of: datetime | None = None
+    cost: Decimal = Decimal("0")
+    total_pnl: Decimal = Decimal("0")
+    total_pnl_percent: Decimal = Decimal("0")
+    cycles: list[CumulativeCycleRow] = Field(default_factory=list)
+
+
+class CumulativeHoldingsResponse(BaseModel):
+    items: list[CumulativeHoldingRow]
+    total_trade_count: int = 0
+    total_cost: Decimal = Decimal("0")
+    total_pnl: Decimal = Decimal("0")
+    total_pnl_percent: Decimal = Decimal("0")
+    total_market_value: Decimal = Decimal("0")
+    cash: Decimal = Decimal("0")
+
+
 class NavPoint(BaseModel):
     date: date
     total_value: Decimal
@@ -145,6 +184,20 @@ class MoverItem(BaseModel):
 class DailyMoversResponse(BaseModel):
     winners: list[MoverItem]
     losers: list[MoverItem]
+
+
+class PeriodPerformanceSection(BaseModel):
+    pnl: Decimal = Decimal("0")
+    pnl_percent: Decimal = Decimal("0")
+    winners: list[MoverItem] = Field(default_factory=list)
+    losers: list[MoverItem] = Field(default_factory=list)
+
+
+class PeriodPerformanceResponse(BaseModel):
+    range: str
+    holding: PeriodPerformanceSection
+    closed: PeriodPerformanceSection
+    cumulative: PeriodPerformanceSection
 
 
 class MonthlyReturnPoint(BaseModel):

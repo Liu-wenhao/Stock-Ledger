@@ -27,6 +27,8 @@ class ClosedCycle:
     realized_cost: Decimal
     buy_amount: Decimal = ZERO
     sell_amount: Decimal = ZERO
+    buy_quantity: Decimal = ZERO
+    close_price: Decimal | None = None
 
 
 @dataclass
@@ -41,6 +43,7 @@ class PositionState:
     cycle_started_at: datetime | None = None
     cycle_buy_amount: Decimal = ZERO
     cycle_sell_amount: Decimal = ZERO
+    cycle_buy_quantity: Decimal = ZERO
     # Completed cycles (all-time for this symbol)
     closed_cycles: list[ClosedCycle] = field(default_factory=list)
     closed_cycles_pnl: Decimal = ZERO
@@ -207,6 +210,7 @@ def apply_trade(state: PortfolioState, trade: Trade) -> None:
             pos.cycle_trade_count = 0
             pos.cycle_buy_amount = ZERO
             pos.cycle_sell_amount = ZERO
+            pos.cycle_buy_quantity = ZERO
             pos.cycle_started_at = trade.closing_time
         # Position cost ignores commission; cash still pays the fee (手续费另算)
         notional = qty * price
@@ -217,6 +221,7 @@ def apply_trade(state: PortfolioState, trade: Trade) -> None:
             pos.avg_price = pos.cost_basis / new_qty
             pos.quantity = new_qty
         pos.cycle_buy_amount += notional
+        pos.cycle_buy_quantity += qty
         pos.cycle_trade_count += 1
         return
 
@@ -257,6 +262,8 @@ def apply_trade(state: PortfolioState, trade: Trade) -> None:
                     realized_cost=pos.realized_cost,
                     buy_amount=pos.cycle_buy_amount,
                     sell_amount=pos.cycle_sell_amount,
+                    buy_quantity=pos.cycle_buy_quantity,
+                    close_price=price,
                 )
             )
             pos.closed_cycles_pnl += pos.realized_pnl
@@ -266,6 +273,7 @@ def apply_trade(state: PortfolioState, trade: Trade) -> None:
             pos.cycle_trade_count = 0
             pos.cycle_buy_amount = ZERO
             pos.cycle_sell_amount = ZERO
+            pos.cycle_buy_quantity = ZERO
             pos.cycle_started_at = None
         return
 
@@ -499,6 +507,120 @@ def compute_closed_holdings(db: Session, portfolio_id: int = 1) -> dict:
     }
 
 
+def compute_cumulative_holdings(db: Session, portfolio_id: int = 1) -> dict:
+    """Current positions with all completed cycles plus the open cycle."""
+    holdings = compute_holdings(db, portfolio_id, include_closed=False)
+    state: PortfolioState = holdings["state"]
+    items = []
+    total_trade_count = 0
+    total_cost = ZERO
+    total_pnl = ZERO
+
+    for row in holdings["items"]:
+        sym = row["symbol"]
+        pos = state.positions[sym]
+        if pos.quantity <= ZERO:
+            continue
+
+        cycles = []
+        for idx, cyc in enumerate(pos.closed_cycles, start=1):
+            avg_price = (
+                cyc.buy_amount / cyc.buy_quantity if cyc.buy_quantity > ZERO else ZERO
+            )
+            pct = (
+                cyc.realized_pnl / cyc.realized_cost * Decimal("100")
+                if cyc.realized_cost > ZERO
+                else ZERO
+            )
+            cycles.append(
+                {
+                    "cycle_index": idx,
+                    "status": "清仓",
+                    "started_at": cyc.started_at,
+                    "ended_at": cyc.ended_at,
+                    "trade_count": cyc.trade_count,
+                    "avg_price": avg_price,
+                    "price": cyc.close_price,
+                    "cost": cyc.realized_cost,
+                    "pnl": cyc.realized_pnl,
+                    "pnl_percent": pct.quantize(Decimal("0.01")),
+                }
+            )
+
+        open_cost = _dec(row["invested"])
+        open_pnl = _dec(row["total_pnl"])
+        open_pct = (
+            open_pnl / open_cost * Decimal("100") if open_cost > ZERO else ZERO
+        )
+        cycles.append(
+            {
+                "cycle_index": len(cycles) + 1,
+                "status": "持仓",
+                "started_at": pos.cycle_started_at,
+                "ended_at": None,
+                "trade_count": pos.cycle_trade_count,
+                "avg_price": pos.avg_price,
+                "price": row["last_price"],
+                "cost": open_cost,
+                "pnl": open_pnl,
+                "pnl_percent": open_pct.quantize(Decimal("0.01")),
+            }
+        )
+
+        # Lifetime break-even average for the remaining position. Realized
+        # losses raise the effective cost; realized profits lower it.
+        # Invariant:
+        #   (last_price - cumulative_avg_price) * current_quantity
+        #   == lifetime cumulative P/L (when last_price is available).
+        lifetime_realized_pnl = pos.closed_cycles_pnl + pos.realized_pnl
+        effective_cost_basis = pos.cost_basis - lifetime_realized_pnl
+        cumulative_avg_price = (
+            effective_cost_basis / pos.quantity if pos.quantity > ZERO else ZERO
+        )
+
+        cumulative_cost = pos.closed_cycles_cost + open_cost
+        cumulative_pnl = pos.closed_cycles_pnl + open_pnl
+        cumulative_pct = (
+            cumulative_pnl / cumulative_cost * Decimal("100")
+            if cumulative_cost > ZERO
+            else ZERO
+        )
+        trade_count = sum(c["trade_count"] for c in cycles)
+        items.append(
+            {
+                "symbol": sym,
+                "name": row.get("name"),
+                "logo_url": row.get("logo_url"),
+                "exchange": row.get("exchange"),
+                "cycle_count": len(cycles),
+                "trade_count": trade_count,
+                "avg_price": cumulative_avg_price,
+                "last_price": row["last_price"],
+                "price_as_of": row.get("price_as_of"),
+                "cost": cumulative_cost,
+                "total_pnl": cumulative_pnl,
+                "total_pnl_percent": cumulative_pct.quantize(Decimal("0.01")),
+                "cycles": cycles,
+            }
+        )
+        total_trade_count += trade_count
+        total_cost += cumulative_cost
+        total_pnl += cumulative_pnl
+
+    items.sort(key=lambda r: r["total_pnl"])
+    return {
+        "items": items,
+        "total_trade_count": total_trade_count,
+        "total_cost": total_cost,
+        "total_pnl": total_pnl,
+        "total_pnl_percent": (
+            total_pnl / total_cost * Decimal("100") if total_cost > ZERO else ZERO
+        ).quantize(Decimal("0.01")),
+        "total_market_value": holdings["total_market_value"],
+        "cash": holdings["cash"],
+    }
+
+
 def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
     data = compute_holdings(db, portfolio_id, include_closed=True)
     state: PortfolioState = data["state"]
@@ -585,6 +707,7 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
 
 
 RANGE_DEFS = [
+    ("1W", "1周", 7),
     ("1M", "1个月", 30),
     ("3M", "3个月", 90),
     ("6M", "6个月", 180),
@@ -879,6 +1002,186 @@ def daily_movers(db: Session, portfolio_id: int = 1) -> dict:
     winners.sort(key=lambda x: x["change_percent"], reverse=True)
     losers.sort(key=lambda x: x["change_percent"])
     return {"winners": winners, "losers": losers}
+
+
+def _period_section(items: list[dict]) -> dict:
+    """Build one period P/L summary and its winner/loser lists."""
+    scored = []
+    total_pnl = ZERO
+    total_cost = ZERO
+    for item in items:
+        amount = _dec(item.get("amount"))
+        cost = _dec(item.get("cost"))
+        if amount == ZERO and cost == ZERO:
+            continue
+        pct = amount / cost * Decimal("100") if cost > ZERO else ZERO
+        scored.append(
+            {
+                "symbol": item["symbol"],
+                "name": item.get("name"),
+                "logo_url": item.get("logo_url"),
+                "change": amount,
+                "change_percent": pct.quantize(Decimal("0.01")),
+                "closed": bool(item.get("closed")),
+            }
+        )
+        total_pnl += amount
+        total_cost += cost
+
+    winners = [x for x in scored if x["change_percent"] > ZERO or x["change"] > ZERO]
+    losers = [x for x in scored if x["change_percent"] < ZERO or x["change"] < ZERO]
+    winners.sort(key=lambda x: x["change_percent"], reverse=True)
+    losers.sort(key=lambda x: x["change_percent"])
+    return {
+        "pnl": total_pnl,
+        "pnl_percent": (
+            total_pnl / total_cost * Decimal("100") if total_cost > ZERO else ZERO
+        ).quantize(Decimal("0.01")),
+        "winners": winners,
+        "losers": losers,
+    }
+
+
+def period_performance(db: Session, portfolio_id: int = 1, range_key: str = "3M") -> dict:
+    """Calculate holding/closed/lifetime P/L contributed during a selected range."""
+    trades = load_trades(db, portfolio_id)
+    empty = {"pnl": ZERO, "pnl_percent": ZERO, "winners": [], "losers": []}
+    if not trades:
+        return {"range": range_key, "holding": empty, "closed": empty, "cumulative": empty}
+
+    first_trade_date = min(t.closing_time.date() for t in trades)
+    if range_key == "ALL":
+        start_date = first_trade_date - timedelta(days=1)
+    else:
+        start_date = range_start(range_key, first_trade_date)
+    start_until = datetime.combine(start_date, datetime.max.time())
+
+    start_state = replay(trades, until=start_until)
+    end_data = compute_holdings(db, portfolio_id, include_closed=True)
+    end_state: PortfolioState = end_data["state"]
+    end_rows = {row["symbol"]: row for row in end_data["items"]}
+
+    start_symbols = [
+        sym for sym, pos in start_state.positions.items() if pos.quantity > ZERO
+    ]
+    histories = (
+        get_history_closes(
+            start_symbols,
+            datetime.combine(start_date - timedelta(days=14), datetime.min.time()),
+            datetime.combine(start_date, datetime.max.time()),
+        )
+        if start_symbols
+        else {}
+    )
+
+    def start_price(symbol: str, position: PositionState) -> Decimal:
+        closes = histories.get(symbol, {})
+        eligible = [day for day in closes if day <= start_date.isoformat()]
+        if eligible:
+            return _dec(closes[max(eligible)])
+        return position.avg_price
+
+    def open_pnl(position: PositionState, price: Decimal) -> Decimal:
+        return position.quantity * price - position.cost_basis + position.realized_pnl
+
+    holding_items = []
+    closed_items = []
+    cumulative_items = []
+    symbols = set(start_state.positions) | set(end_state.positions)
+    for symbol in symbols:
+        start_pos = start_state.positions.get(symbol, PositionState())
+        end_pos = end_state.positions.get(symbol, PositionState())
+        row = end_rows.get(symbol) or {}
+        start_px = start_price(symbol, start_pos) if start_pos.quantity > ZERO else ZERO
+        start_value = start_pos.quantity * start_px
+        start_open_pnl = (
+            open_pnl(start_pos, start_px) if start_pos.quantity > ZERO else ZERO
+        )
+
+        # Closed cycles appended after the range boundary. If the first one
+        # is the cycle that was already open at the boundary, subtract its
+        # pre-period P/L so only this range's contribution remains.
+        old_closed_count = len(start_pos.closed_cycles)
+        new_cycles = end_pos.closed_cycles[old_closed_count:]
+        same_start_cycle = bool(
+            start_pos.quantity > ZERO
+            and start_pos.cycle_started_at is not None
+            and new_cycles
+            and new_cycles[0].started_at == start_pos.cycle_started_at
+        )
+        raw_closed_pnl = sum((c.realized_pnl for c in new_cycles), ZERO)
+        closed_amount = raw_closed_pnl - start_open_pnl if same_start_cycle else raw_closed_pnl
+        closed_cost = ZERO
+        for index, cycle in enumerate(new_cycles):
+            if index == 0 and same_start_cycle:
+                closed_cost += start_value + max(cycle.buy_amount - start_pos.cycle_buy_amount, ZERO)
+            else:
+                closed_cost += cycle.realized_cost
+        # Dividends (or other realized entries) that do not create a cycle.
+        closed_amount += (
+            end_pos.closed_cycles_pnl
+            - start_pos.closed_cycles_pnl
+            - raw_closed_pnl
+        )
+
+        holding_amount = ZERO
+        holding_cost = ZERO
+        if end_pos.quantity > ZERO:
+            end_px = _dec(row.get("last_price")) if row.get("last_price") is not None else end_pos.avg_price
+            end_open_pnl = open_pnl(end_pos, end_px)
+            same_open_cycle = bool(
+                start_pos.quantity > ZERO
+                and start_pos.cycle_started_at is not None
+                and end_pos.cycle_started_at == start_pos.cycle_started_at
+            )
+            if same_open_cycle:
+                holding_amount = end_open_pnl - start_open_pnl
+                holding_cost = start_value + max(
+                    end_pos.cycle_buy_amount - start_pos.cycle_buy_amount, ZERO
+                )
+            else:
+                holding_amount = end_open_pnl
+                holding_cost = end_pos.cycle_buy_amount
+
+        name = row.get("name")
+        logo_url = row.get("logo_url")
+        holding_items.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "logo_url": logo_url,
+                "amount": holding_amount,
+                "cost": holding_cost,
+                "closed": False,
+            }
+        )
+        closed_items.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "logo_url": logo_url,
+                "amount": closed_amount,
+                "cost": closed_cost,
+                "closed": True,
+            }
+        )
+        cumulative_items.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "logo_url": logo_url,
+                "amount": holding_amount + closed_amount,
+                "cost": holding_cost + closed_cost,
+                "closed": end_pos.quantity <= ZERO,
+            }
+        )
+
+    return {
+        "range": range_key,
+        "holding": _period_section(holding_items),
+        "closed": _period_section(closed_items),
+        "cumulative": _period_section(cumulative_items),
+    }
 
 
 def total_movers(

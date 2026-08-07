@@ -5,41 +5,46 @@ import { message } from 'ant-design-vue'
 import SummaryCards from '@/components/SummaryCards.vue'
 import { usePortfolioStore } from '@/stores/portfolio'
 import { refreshMarket } from '@/api/portfolio'
+import { isUsMarketOpen } from '@/utils/marketHours'
 
 const store = usePortfolioStore()
 const route = useRoute()
 const router = useRouter()
 const refreshing = ref(false)
+const refreshVersion = ref(0)
 
 const activeKey = computed({
   get: () => route.name,
   set: (name) => router.push({ name }),
 })
 
-async function onRefresh() {
+async function onRefresh(notify = true) {
   refreshing.value = true
   try {
-    const res = await refreshMarket()
+    const res = await refreshMarket(notify)
     await store.loadSummary()
-    message.success(`行情已更新（${res.priced}/${res.symbols}）`)
+    refreshVersion.value += 1
+    if (notify) message.success(`行情及盈亏已更新（${res.priced}/${res.symbols}）`)
   } catch (e) {
     await store.loadSummary()
+    refreshVersion.value += 1
   } finally {
     refreshing.value = false
   }
 }
 
 onMounted(() => {
-  store.loadSummary()
+  if (isUsMarketOpen()) onRefresh(false)
+  else store.loadSummary()
 })
 </script>
 
 <template>
   <div class="page">
-    <!--<div class="page-header">
+    <div class="page-header">
       <h1>我的投资组合</h1>
-      <a-button :loading="refreshing" @click="onRefresh">刷新行情</a-button>
-    </div>-->
+      <a-button :loading="refreshing" @click="onRefresh()">刷新行情及盈亏</a-button>
+    </div>
 
     <SummaryCards :summary="store.summary" :loading="store.loading" />
 
@@ -50,7 +55,7 @@ onMounted(() => {
         <a-tab-pane key="trades" tab="交易" />
         <a-tab-pane key="analysis" tab="分析" />
       </a-tabs>
-      <router-view @changed="store.loadSummary()" />
+      <router-view :key="refreshVersion" @changed="store.loadSummary()" />
     </div>
   </div>
 </template>

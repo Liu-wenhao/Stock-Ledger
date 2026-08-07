@@ -82,7 +82,7 @@ const columns = [
   { title: '手续费', key: 'commission', dataIndex: 'commission', align: 'right' },
   { title: '总额', key: 'total', dataIndex: 'total', align: 'right' },
   { title: '笔记', key: 'notes', dataIndex: 'notes' },
-  { title: '操作', key: 'actions', width: 90, align: 'center' },
+  { title: '操作', key: 'actions', width: 130, align: 'center' },
 ]
 
 function resetPage() {
@@ -297,19 +297,14 @@ onMounted(async () => {
         </template>
         <template v-else-if="column.key === 'total'">{{ formatMoney(record.total) }}</template>
         <template v-else-if="column.key === 'actions'">
-          <a-dropdown>
-            <a class="ant-dropdown-link" @click.prevent>···</a>
-            <template #overlay>
-              <a-menu>
-                <a-menu-item @click="openEdit(record)">
-                  <EditOutlined /> 编辑交易...
-                </a-menu-item>
-                <a-menu-item danger @click="onRemove(record)">
-                  <DeleteOutlined /> 移除
-                </a-menu-item>
-              </a-menu>
-            </template>
-          </a-dropdown>
+          <a-space :size="0">
+            <a-button type="link" size="small" @click="openEdit(record)">
+              <EditOutlined />
+            </a-button>
+            <a-button type="link" size="small" danger @click="onRemove(record)">
+              <DeleteOutlined />
+            </a-button>
+          </a-space>
         </template>
       </template>
     </a-table>

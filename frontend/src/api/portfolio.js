@@ -5,6 +5,8 @@ export const fetchNav = (params) => http.get('/api/portfolio/nav', { params }).t
 export const fetchMovers = () => http.get('/api/portfolio/daily-movers').then((r) => r.data)
 export const fetchTotalMovers = (params) =>
   http.get('/api/portfolio/total-movers', { params }).then((r) => r.data)
+export const fetchPeriodPerformance = (params) =>
+  http.get('/api/portfolio/period-performance', { params }).then((r) => r.data)
 export const fetchHoldings = (params) => http.get('/api/holdings', { params }).then((r) => r.data)
 export const fetchMonthlyReturns = (params) =>
   http.get('/api/analysis/monthly-returns', { params }).then((r) => r.data)
@@ -22,4 +24,5 @@ export const importTrades = (file) => {
 export const exportTradesUrl = '/api/trades/export'
 export const searchSymbols = (q) =>
   http.get('/api/symbols/search', { params: { q } }).then((r) => r.data)
-export const refreshMarket = () => http.post('/api/market/refresh').then((r) => r.data)
+export const refreshMarket = (force = true) =>
+  http.post('/api/market/refresh', null, { params: { force } }).then((r) => r.data)

@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
-import { fetchMovers, fetchNav, fetchTotalMovers } from '@/api/portfolio'
+import { fetchMovers, fetchNav, fetchPeriodPerformance } from '@/api/portfolio'
 import { formatMoney, formatPct, pnlClass, toNumber } from '@/utils/format'
 import {
   axisLabelStyle,
@@ -17,6 +17,7 @@ import { usePortfolioStore } from '@/stores/portfolio'
 const store = usePortfolioStore()
 const mode = ref('value')
 const range = ref('3M')
+const periodPerformance = ref(null)
 
 function formatPnlByMode(amount, percent) {
   if (mode.value === 'percent') return formatPct(percent)
@@ -32,34 +33,34 @@ const dayPnlText = computed(() => {
 const dayPnlClass = computed(() => pnlClass(store.summary?.day_change))
 
 const holdingPnlText = computed(() => {
-  const s = store.summary
-  if (!s) return '—'
-  return formatPnlByMode(s.unrealized_pnl, s.unrealized_pnl_percent)
+  const section = periodPerformance.value?.holding
+  if (!section) return '—'
+  return formatPnlByMode(section.pnl, section.pnl_percent)
 })
 
-const holdingPnlClass = computed(() => pnlClass(store.summary?.unrealized_pnl))
+const holdingPnlClass = computed(() => pnlClass(periodPerformance.value?.holding?.pnl))
 
 const closedPnlText = computed(() => {
-  const s = store.summary
-  if (!s) return '—'
-  return formatPnlByMode(s.realized_pnl, s.realized_pnl_percent)
+  const section = periodPerformance.value?.closed
+  if (!section) return '—'
+  return formatPnlByMode(section.pnl, section.pnl_percent)
 })
 
-const closedPnlClass = computed(() => pnlClass(store.summary?.realized_pnl))
+const closedPnlClass = computed(() => pnlClass(periodPerformance.value?.closed?.pnl))
 
 const cumulativePnlText = computed(() => {
-  const s = store.summary
-  if (!s) return '—'
-  return formatPnlByMode(s.total_pnl, s.total_pnl_percent)
+  const section = periodPerformance.value?.cumulative
+  if (!section) return '—'
+  return formatPnlByMode(section.pnl, section.pnl_percent)
 })
 
-const cumulativePnlClass = computed(() => pnlClass(store.summary?.total_pnl))
+const cumulativePnlClass = computed(() => pnlClass(periodPerformance.value?.cumulative?.pnl))
 
 const nav = ref({ points: [], ranges: [] })
 const movers = ref({ winners: [], losers: [] })
-const holdingMovers = ref({ winners: [], losers: [] })
-const closedMovers = ref({ winners: [], losers: [] })
-const totalMovers = ref({ winners: [], losers: [] })
+const holdingMovers = computed(() => periodPerformance.value?.holding || { winners: [], losers: [] })
+const closedMovers = computed(() => periodPerformance.value?.closed || { winners: [], losers: [] })
+const totalMovers = computed(() => periodPerformance.value?.cumulative || { winners: [], losers: [] })
 const chartRef = ref(null)
 const DAILY_LIMIT = 5
 let chart
@@ -128,18 +129,14 @@ function formatDateLabel(iso) {
 }
 
 async function load() {
-  const [navRes, moversRes, holdingRes, closedRes, totalRes] = await Promise.all([
+  const [navRes, moversRes, periodRes] = await Promise.all([
     fetchNav({ range: range.value, mode: mode.value }),
     fetchMovers(),
-    fetchTotalMovers({ include_closed: false }),
-    fetchTotalMovers({ closed_only: true }),
-    fetchTotalMovers({ include_closed: true }),
+    fetchPeriodPerformance({ range: range.value }),
   ])
   nav.value = navRes
   movers.value = moversRes
-  holdingMovers.value = holdingRes
-  closedMovers.value = closedRes
-  totalMovers.value = totalRes
+  periodPerformance.value = periodRes
   await nextTick()
   renderChart()
 }
@@ -483,7 +480,7 @@ onUnmounted(() => {
 
 .range-chips {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 8px;
   margin-top: 8px;
 }

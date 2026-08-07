@@ -1,6 +1,6 @@
 # Stock Ledger
 
-仿 [TradingView Portfolios](https://cn.tradingview.com/portfolios/) 的股票买卖记录与收益率统计（Vue3 + FastAPI + MySQL + Yahoo Finance）。
+仿 [TradingView Portfolios](https://cn.tradingview.com/portfolios/) 的股票买卖记录与收益率统计（Vue3 + FastAPI + MySQL + global-stock-data）。
 
 ## 环境要求
 
@@ -43,7 +43,7 @@ npm run dev
 
 打开 http://localhost:5173 。样例 CSV 已导入；也可在「交易」页重新上传 `sample-data/Code_20260726.csv`（全量替换）。
 
-> 说明：样例 CSV 仅有 Buy/Sell、无 Deposit，因此现金会为负值（与 TradingView 导入同类数据表现类似）。可在交易页补一条「入金」记录。点击「刷新行情」会同步 Yahoo Finance 最新价（遇限流时会自动退避，界面仍可用成本价展示）。
+> 说明：样例 CSV 仅有 Buy/Sell、无 Deposit，因此现金会为负值（与 TradingView 导入同类数据表现类似）。可在交易页补一条「入金」记录。点击「刷新行情」会通过 global-stock-data 的新浪/腾讯数据源同步美股最新价（请求失败时保留数据库缓存）。
 
 ## 功能概览
 

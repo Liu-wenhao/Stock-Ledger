@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -11,18 +14,25 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.models.entities import PriceCache, SymbolMeta
-from app.services.symbols import to_yahoo_symbol
+from app.services.symbols import to_market_symbol
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-_yahoo_backoff_until: datetime | None = None
+_market_backoff_until: datetime | None = None
 _refresh_lock = threading.Lock()
 _refreshing = False
 
-# US regular session close (America/New_York). Bars dated today before this
-# hour are treated as incomplete and must not become 收盘价.
-_US_REGULAR_CLOSE_HOUR = 16
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0 Safari/537.36"
+)
+_SINA_QUOTE_URL = "https://hq.sinajs.cn/list={symbols}"
+_TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q={symbols}"
+_SINA_KLINE_URL = (
+    "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var/"
+    "US_MinKService.getDailyK"
+)
 
 KNOWN_NAMES = {
     "AAPL": "Apple Inc.",
@@ -44,53 +54,28 @@ KNOWN_NAMES = {
 }
 
 
-def _now_eastern() -> datetime:
+def _bar_datetime(idx: Any) -> datetime | None:
+    """Convert a provider timestamp to a naive America/New_York datetime."""
     try:
-        from zoneinfo import ZoneInfo
+        if hasattr(idx, "to_pydatetime") and callable(idx.to_pydatetime):
+            value = idx.to_pydatetime()
+        elif isinstance(idx, datetime):
+            value = idx
+        elif isinstance(idx, date):
+            value = datetime.combine(idx, datetime.min.time())
+        else:
+            value = datetime.fromisoformat(str(idx).replace("Z", "+00:00"))
+        if value.tzinfo is not None:
+            try:
+                from zoneinfo import ZoneInfo
 
-        return datetime.now(ZoneInfo("America/New_York"))
-    except Exception:
-        return datetime.utcnow()
-
-
-def _max_completed_session_date(now_et: datetime | None = None) -> date:
-    """
-    Latest calendar date whose US regular session can be treated as completed.
-
-    Before 16:00 ET, today's Yahoo daily bar (if present) is incomplete / intraday
-    and must be ignored. After the close, today's bar is the official close.
-    Weekends/holidays are handled by filtering against available daily bars.
-    """
-    now_et = now_et or _now_eastern()
-    d = now_et.date()
-    if getattr(now_et, "hour", 12) < _US_REGULAR_CLOSE_HOUR:
-        d -= timedelta(days=1)
-    return d
-
-
-def _bar_date(idx: Any) -> date | None:
-    try:
-        if hasattr(idx, "date") and callable(idx.date):
-            return idx.date()
-        if isinstance(idx, date) and not isinstance(idx, datetime):
-            return idx
-        return datetime.fromisoformat(str(idx)[:10]).date()
+                value = value.astimezone(ZoneInfo("America/New_York"))
+            except Exception:
+                pass
+            value = value.replace(tzinfo=None)
+        return value
     except Exception:
         return None
-
-
-def _completed_closes(close_series: Any, max_date: date) -> Any:
-    """Keep only daily closes on or before the last completed session date."""
-    if close_series is None or getattr(close_series, "empty", True):
-        return close_series
-    keep_idx = []
-    for idx in close_series.index:
-        d = _bar_date(idx)
-        if d is not None and d <= max_date:
-            keep_idx.append(idx)
-    if not keep_idx:
-        return close_series.iloc[0:0]
-    return close_series.loc[keep_idx]
 
 
 def _d(v: Any) -> Decimal | None:
@@ -114,34 +99,47 @@ def _change_fields(price: Decimal | None, prev: Decimal | None) -> tuple[Decimal
     return change, change_pct
 
 
-def _parse_as_of(v: Any) -> date | None:
-    """Parse Yahoo bar / API date. Returns None when unknown — never invent."""
+def _parse_as_of(v: Any) -> datetime | None:
+    """Parse a provider bar/API timestamp. Returns None when unknown."""
     if v is None:
         return None
-    if isinstance(v, datetime):
-        return v.date()
-    if isinstance(v, date):
-        return v
-    try:
-        return date.fromisoformat(str(v)[:10])
-    except Exception:
-        return None
+    if isinstance(v, str):
+        value = v.strip()
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y%m%d%H%M%S",
+            "%Y%m%d %H:%M:%S",
+            "%Y-%m-%d",
+        ):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+    return _bar_datetime(v)
+
+
+def _positive_d(v: Any) -> Decimal | None:
+    value = _d(v)
+    return value if value is not None and value > 0 else None
 
 
 def ensure_symbol_meta(db: Session, symbol: str, fetch_remote: bool = False) -> SymbolMeta:
     row = db.query(SymbolMeta).filter(SymbolMeta.symbol == symbol).first()
-    yahoo = to_yahoo_symbol(symbol) or symbol
+    provider_symbol = to_market_symbol(symbol) or symbol
     if row:
         if not row.name:
-            row.name = KNOWN_NAMES.get(yahoo) or row.name
+            row.name = KNOWN_NAMES.get(provider_symbol) or row.name
             db.commit()
         return row
 
     exchange = symbol.split(":")[0] if ":" in symbol else None
     row = SymbolMeta(
         symbol=symbol,
-        yahoo_symbol=yahoo,
-        name=KNOWN_NAMES.get(yahoo),
+        # The legacy column also stores the normalized ticker used by the
+        # global-stock-data quote providers.
+        yahoo_symbol=provider_symbol,
+        name=KNOWN_NAMES.get(provider_symbol),
         exchange=exchange,
         currency="USD",
         logo_url=None,
@@ -184,14 +182,14 @@ def get_quotes(
     force: bool = False,
     background_refresh: bool = True,
 ) -> dict[str, dict[str, Any]]:
-    """Return quotes from DB cache. Optionally kick off background Yahoo refresh."""
+    """Return cached quotes and optionally refresh global-stock-data providers."""
     unique = sorted({s for s in symbols if s and s.upper() not in {"CASH", "USD"}})
     result: dict[str, dict[str, Any]] = {}
     if not unique:
         return result
 
-    # Kill-switch: serve cache only (no Yahoo overwrite)
-    if not settings.yahoo_refresh_enabled:
+    # Kill-switch: serve cache only (no external quote overwrite).
+    if not settings.quote_refresh_enabled:
         force = False
         background_refresh = False
 
@@ -212,9 +210,10 @@ def get_quotes(
 
     if stale and background_refresh:
         _start_background_refresh(stale)
-    elif stale and force:
-        # synchronous path only when explicitly forced (e.g. refresh button endpoint)
-        fetched = _fetch_yahoo_batch(stale)
+    elif stale:
+        # Explicit refresh endpoints wait for fresh data; ordinary reads keep
+        # serving the cache while their background refresh runs.
+        fetched = _fetch_global_stock_data_batch(stale)
         _persist_quotes(stale, fetched)
         for sym in stale:
             cache = db.query(PriceCache).filter(PriceCache.symbol == sym).first()
@@ -224,8 +223,8 @@ def get_quotes(
 
 
 def _start_background_refresh(symbols: list[str]) -> None:
-    global _refreshing, _yahoo_backoff_until
-    if _yahoo_backoff_until and datetime.utcnow() < _yahoo_backoff_until:
+    global _refreshing, _market_backoff_until
+    if _market_backoff_until and datetime.utcnow() < _market_backoff_until:
         return
     with _refresh_lock:
         if _refreshing:
@@ -233,17 +232,17 @@ def _start_background_refresh(symbols: list[str]) -> None:
         _refreshing = True
 
     def worker() -> None:
-        global _refreshing, _yahoo_backoff_until
+        global _refreshing, _market_backoff_until
         try:
-            fetched = _fetch_yahoo_batch(symbols)
+            fetched = _fetch_global_stock_data_batch(symbols)
             if not any(v.get("price") is not None for v in fetched.values()):
-                _yahoo_backoff_until = datetime.utcnow() + timedelta(minutes=5)
-                logger.warning("Yahoo returned no prices; backoff 5 minutes (cache unchanged)")
+                _market_backoff_until = datetime.utcnow() + timedelta(minutes=2)
+                logger.warning("market providers returned no prices; backoff 2 minutes")
             else:
                 _persist_quotes(symbols, fetched)
         except Exception as exc:
             logger.warning("background quote refresh failed: %s", exc)
-            _yahoo_backoff_until = datetime.utcnow() + timedelta(minutes=5)
+            _market_backoff_until = datetime.utcnow() + timedelta(minutes=2)
         finally:
             with _refresh_lock:
                 _refreshing = False
@@ -252,7 +251,7 @@ def _start_background_refresh(symbols: list[str]) -> None:
 
 
 def _persist_quotes(symbols: list[str], fetched: dict[str, dict[str, Any]]) -> None:
-    """Write Yahoo results to cache. Skip symbols with no usable price (keep DB)."""
+    """Write provider results to cache. Failed symbols keep their previous value."""
     db = SessionLocal()
     try:
         now = datetime.utcnow()
@@ -270,7 +269,7 @@ def _persist_quotes(symbols: list[str], fetched: dict[str, dict[str, Any]]) -> N
 
             prev = data.get("prev_close")
             if prev is None:
-                # Keep cached 昨收 when Yahoo only returned one completed bar
+                # Keep cached previous close when the provider omits it.
                 prev = cache.prev_close
 
             change, change_pct = _change_fields(
@@ -280,7 +279,7 @@ def _persist_quotes(symbols: list[str], fetched: dict[str, dict[str, Any]]) -> N
 
             cache.price = price
             cache.prev_close = prev
-            # As-of trading day for this close; None if Yahoo bar date unknown
+            # Provider quote/bar timestamp; null when unknown.
             cache.price_as_of = _parse_as_of(
                 data.get("price_as_of") if data.get("price_as_of") is not None else data.get("session_date")
             )
@@ -303,165 +302,197 @@ def _persist_quotes(symbols: list[str], fetched: dict[str, dict[str, Any]]) -> N
         db.close()
 
 
-def refresh_quotes_sync(db: Session, symbols: list[str]) -> dict[str, dict[str, Any]]:
-    return get_quotes(db, symbols, force=True, background_refresh=False)
+def refresh_quotes_sync(
+    db: Session,
+    symbols: list[str],
+    force: bool = True,
+) -> dict[str, dict[str, Any]]:
+    return get_quotes(db, symbols, force=force, background_refresh=False)
 
 
-def _quote_from_frame(frame: Any, max_completed: date) -> dict[str, Any]:
-    """
-    Build a quote from daily OHLCV.
+def _request_text(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    referer: str | None = None,
+    timeout: int = 5,
+) -> str:
+    import requests
 
-    price / 收盘价 = last completed trading day's close
-    prev_close / 昨收 = the trading day before that (if available)
-    price_as_of = that completed session's calendar date (from the bar)
-    """
-    if frame is None or getattr(frame, "empty", True):
+    headers = {"User-Agent": _USER_AGENT}
+    if referer:
+        headers["Referer"] = referer
+    response = requests.get(url, params=params, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    response.encoding = "gbk"
+    return response.text
+
+
+def _provider_ticker(symbol: str) -> str:
+    return (to_market_symbol(symbol) or symbol).strip().upper()
+
+
+def _quote_payload(
+    *,
+    price: Any,
+    prev_close: Any,
+    open_price: Any,
+    high: Any,
+    low: Any,
+    timestamp: Any,
+) -> dict[str, Any]:
+    price_d = _d(price)
+    if price_d is None or price_d <= 0:
         return {}
-    if "Close" not in frame:
-        return {}
-
-    close = frame["Close"].dropna()
-    completed = _completed_closes(close, max_completed)
-    if completed is None or getattr(completed, "empty", True):
-        return {}
-
-    price = _d(completed.iloc[-1])
-    if price is None:
-        return {}
-
-    prev = _d(completed.iloc[-2]) if len(completed) >= 2 else None
-    change, change_pct = _change_fields(price, prev)
-
-    last_idx = completed.index[-1]
-    as_of = _bar_date(last_idx)
-    open_v = high_v = low_v = None
-    try:
-        if "Open" in frame:
-            open_v = _d(frame.loc[last_idx, "Open"])
-        if "High" in frame:
-            high_v = _d(frame.loc[last_idx, "High"])
-        if "Low" in frame:
-            low_v = _d(frame.loc[last_idx, "Low"])
-    except Exception:
-        pass
-
+    prev_d = _positive_d(prev_close)
+    change, change_pct = _change_fields(price_d, prev_d)
+    as_of = _parse_as_of(timestamp)
     return {
-        "price": price,
-        "prev_close": prev,
-        "open": open_v,
-        "high": high_v,
-        "low": low_v,
+        "price": price_d,
+        "prev_close": prev_d,
+        "open": _positive_d(open_price),
+        "high": _positive_d(high),
+        "low": _positive_d(low),
         "change": change,
         "change_percent": change_pct,
         "price_as_of": as_of,
-        "session_date": as_of.isoformat() if as_of else None,
+        "session_date": as_of.date().isoformat() if as_of else None,
     }
 
 
-def _fetch_yahoo_batch(symbols: list[str]) -> dict[str, dict[str, Any]]:
-    """
-    Fetch previous completed US session close for each symbol.
+def _parse_sina_quote(text: str, ticker: str) -> dict[str, Any]:
+    pattern = rf'var\s+hq_str_gb_{re.escape(ticker.lower())}="([^"]*)"'
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if not match:
+        return {}
+    fields = match.group(1).split(",")
+    if len(fields) < 30:
+        return {}
+    return _quote_payload(
+        price=fields[1],
+        prev_close=fields[26],
+        open_price=fields[5],
+        high=fields[6],
+        low=fields[7],
+        timestamp=fields[3],
+    )
 
-    On any global/per-symbol failure, that symbol maps to {} so callers leave
-    the DB cache unchanged.
-    """
-    out: dict[str, dict[str, Any]] = {s: {} for s in symbols}
-    try:
-        import yfinance as yf
-    except Exception as exc:
-        logger.error("yfinance import failed: %s", exc)
+
+def _parse_tencent_quote(text: str, ticker: str) -> dict[str, Any]:
+    pattern = rf'v_us{re.escape(ticker)}="([^"]*)"'
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if not match:
+        return {}
+    fields = match.group(1).split("~")
+    if len(fields) < 52:
+        return {}
+    return _quote_payload(
+        price=fields[3],
+        prev_close=fields[4],
+        open_price=fields[5],
+        high=fields[33],
+        low=fields[34],
+        timestamp=fields[30],
+    )
+
+
+def _fetch_global_stock_data_batch(
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Fetch US quotes using global-stock-data's Sina -> Tencent priority."""
+    out: dict[str, dict[str, Any]] = {symbol: {} for symbol in symbols}
+    mapping = {symbol: _provider_ticker(symbol) for symbol in symbols}
+    tickers = sorted({ticker for ticker in mapping.values() if ticker})
+    if not tickers:
         return out
 
-    mapping = {sym: (to_yahoo_symbol(sym) or sym) for sym in symbols}
-    yahoo_list = sorted({v for v in mapping.values() if v})
-    if not yahoo_list:
-        return out
-
-    max_completed = _max_completed_session_date()
-    yahoo_to_data: dict[str, dict[str, Any]] = {}
+    sina_text = ""
     try:
-        # Extra days so weekends/holidays still yield >= 2 completed bars for 昨收
-        hist = yf.download(
-            yahoo_list,
-            period="10d",
-            group_by="ticker",
-            auto_adjust=True,
-            threads=True,
-            progress=False,
+        sina_codes = ",".join(f"gb_{ticker.lower()}" for ticker in tickers)
+        sina_text = _request_text(
+            _SINA_QUOTE_URL.format(symbols=sina_codes),
+            referer="https://finance.sina.com.cn/",
         )
-        if hist is not None and not hist.empty:
-            for ysym in yahoo_list:
-                try:
-                    frame = hist if len(yahoo_list) == 1 else hist[ysym]
-                    quote = _quote_from_frame(frame, max_completed)
-                    if quote.get("price") is not None:
-                        yahoo_to_data[ysym] = quote
-                except Exception as exc:
-                    logger.debug("skip Yahoo symbol %s: %s", ysym, exc)
-                    continue
     except Exception as exc:
-        logger.warning("yf.download failed: %s", exc)
-        return out
+        logger.warning("Sina quote request failed: %s", exc)
 
-    for sym, ysym in mapping.items():
-        out[sym] = yahoo_to_data.get(ysym, {})
+    by_ticker = {ticker: _parse_sina_quote(sina_text, ticker) for ticker in tickers}
+    missing = [ticker for ticker in tickers if not by_ticker[ticker].get("price")]
+    if missing:
+        try:
+            tencent_codes = ",".join(f"us{ticker}" for ticker in missing)
+            text = _request_text(_TENCENT_QUOTE_URL.format(symbols=tencent_codes))
+            for ticker in missing:
+                quote = _parse_tencent_quote(text, ticker)
+                if quote.get("price") is not None:
+                    by_ticker[ticker] = quote
+        except Exception as exc:
+            logger.warning("Tencent quote fallback failed: %s", exc)
+
+    for symbol, ticker in mapping.items():
+        out[symbol] = by_ticker.get(ticker, {})
     return out
+
+
+def _fetch_sina_history(ticker: str, num: int) -> list[dict[str, Any]]:
+    text = _request_text(
+        _SINA_KLINE_URL,
+        params={"symbol": ticker, "num": num},
+        referer="https://finance.sina.com.cn/",
+        timeout=15,
+    )
+    match = re.search(r"\((\[.+\])\)", text, flags=re.DOTALL)
+    if not match:
+        return []
+    payload = json.loads(match.group(1))
+    return payload if isinstance(payload, list) else []
 
 
 def get_history_closes(
     symbols: list[str], start: datetime, end: datetime | None = None
 ) -> dict[str, dict[str, Decimal]]:
-    global _yahoo_backoff_until
-    if _yahoo_backoff_until and datetime.utcnow() < _yahoo_backoff_until:
-        return {s: {} for s in symbols}
-
-    try:
-        import yfinance as yf
-    except Exception:
-        return {s: {} for s in symbols}
+    global _market_backoff_until
+    result = {symbol: {} for symbol in symbols}
+    if _market_backoff_until and datetime.utcnow() < _market_backoff_until:
+        return result
 
     end = end or datetime.utcnow()
-    yahoo_map = {sym: (to_yahoo_symbol(sym) or sym) for sym in symbols}
-    yahoo_list = sorted({v for v in yahoo_map.values() if v})
-    result = {s: {} for s in symbols}
-    if not yahoo_list:
+    mapping = {symbol: _provider_ticker(symbol) for symbol in symbols}
+    tickers = sorted({ticker for ticker in mapping.values() if ticker})
+    if not tickers:
         return result
 
-    try:
-        hist = yf.download(
-            yahoo_list,
-            start=start.date(),
-            end=(end.date() + timedelta(days=1)),
-            group_by="ticker",
-            auto_adjust=True,
-            threads=True,
-            progress=False,
-        )
-    except Exception as exc:
-        logger.warning("history download failed: %s", exc)
-        _yahoo_backoff_until = datetime.utcnow() + timedelta(minutes=5)
-        return result
+    # Calendar-day range plus a buffer for weekends and market holidays.
+    num = max(120, min(12000, (end.date() - start.date()).days + 30))
+    histories: dict[str, dict[str, Decimal]] = {ticker: {} for ticker in tickers}
 
-    yahoo_closes: dict[str, dict[str, Decimal]] = {}
-    if hist is not None and not hist.empty:
-        for ysym in yahoo_list:
-            closes: dict[str, Decimal] = {}
+    def load(ticker: str) -> tuple[str, dict[str, Decimal]]:
+        closes: dict[str, Decimal] = {}
+        for item in _fetch_sina_history(ticker, num):
+            day = str(item.get("d") or "")[:10]
+            value = _d(item.get("c"))
+            if value is None or not day:
+                continue
             try:
-                frame = hist if len(yahoo_list) == 1 else hist[ysym]
-                if frame is None or getattr(frame, "empty", True):
-                    yahoo_closes[ysym] = {}
-                    continue
-                for idx, row in frame.iterrows():
-                    val = _d(row.get("Close"))
-                    if val is not None:
-                        closes[idx.date().isoformat()] = val
-            except Exception:
-                closes = {}
-            yahoo_closes[ysym] = closes
+                day_date = date.fromisoformat(day)
+            except ValueError:
+                continue
+            if start.date() <= day_date <= end.date():
+                closes[day] = value
+        return ticker, closes
 
-    if not any(yahoo_closes.values()):
-        _yahoo_backoff_until = datetime.utcnow() + timedelta(minutes=5)
+    with ThreadPoolExecutor(max_workers=min(6, len(tickers))) as executor:
+        futures = {executor.submit(load, ticker): ticker for ticker in tickers}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                _, closes = future.result()
+                histories[ticker] = closes
+            except Exception as exc:
+                logger.warning("Sina history request failed for %s: %s", ticker, exc)
 
-    for sym, ysym in yahoo_map.items():
-        result[sym] = yahoo_closes.get(ysym, {})
+    if not any(histories.values()):
+        _market_backoff_until = datetime.utcnow() + timedelta(minutes=2)
+    for symbol, ticker in mapping.items():
+        result[symbol] = histories.get(ticker, {})
     return result

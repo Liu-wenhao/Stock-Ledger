@@ -32,8 +32,8 @@ const cards = computed(() => {
     return [
       { label: '投资组合金额', parts: null, secondaryLines: null },
       { label: '持仓盈亏', parts: null, secondaryLines: null },
-      { label: '清仓盈亏', parts: null, secondaryLines: null },
       { label: '累计盈亏', parts: null, secondaryLines: null },
+      { label: '清仓盈亏', parts: null, secondaryLines: null },
       { label: '手续费', parts: null, secondaryLines: null },
     ]
   }
@@ -82,21 +82,6 @@ const cards = computed(() => {
       ],
     },
     {
-      label: '清仓盈亏',
-      valueClass: pnlClass(s.realized_pnl),
-      parts: {
-        amount: realized.amount,
-        currency: realized.currency,
-      },
-      secondaryLines: [
-        {
-          prefix: '股息',
-          amount: dividends.amount,
-          currency: dividends.currency,
-        },
-      ],
-    },
-    {
       label: '累计盈亏',
       valueClass: pnlClass(s.total_pnl),
       parts: {
@@ -109,6 +94,21 @@ const cards = computed(() => {
           className: pnlClass(s.annualized_return),
           prefix: '年化收益率',
           percent: formatPct(s.annualized_return),
+        },
+      ],
+    },
+    {
+      label: '清仓盈亏',
+      valueClass: pnlClass(s.realized_pnl),
+      parts: {
+        amount: realized.amount,
+        currency: realized.currency,
+      },
+      secondaryLines: [
+        {
+          prefix: '股息',
+          amount: dividends.amount,
+          currency: dividends.currency,
         },
       ],
     },
