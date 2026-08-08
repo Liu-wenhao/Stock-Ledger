@@ -114,10 +114,13 @@ async function save(addMore = false) {
     :title="editRecord ? '编辑交易' : '添加交易'"
     :footer="null"
     width="520px"
+    wrap-class-name="mobile-sheet-modal trade-form-modal"
+    centered
     destroy-on-close
     @cancel="emit('update:open', false)"
   >
     <a-segmented
+      class="trade-side-segmented"
       v-model:value="form.side"
       block
       style="margin-bottom: 16px"
@@ -129,7 +132,7 @@ async function save(addMore = false) {
         { label: '股息', value: 'Dividend' },
       ]"
     />
-    <a-form layout="vertical">
+    <a-form layout="vertical" >
       <a-form-item v-if="!isCash || form.side === 'Dividend'" label="商品代码">
         <a-auto-complete
           v-model:value="form.symbol"
@@ -152,14 +155,42 @@ async function save(addMore = false) {
         <a-input-number v-model:value="form.commission" :min="0" :step="0.01" style="width: 100%" />
       </a-form-item>
       <a-form-item label="笔记">
-        <a-textarea v-model:value="form.notes" :maxlength="128" show-count :rows="3" />
+        <a-textarea v-model:value="form.notes" :maxlength="128" show-count :rows="1" />
       </a-form-item>
-      <div style="margin-bottom: 16px; font-weight: 600">共计 {{ total.toFixed(2) }} USD</div>
-      <div style="display: flex; justify-content: flex-end; gap: 8px">
+      <div class="trade-total">共计 {{ total.toFixed(2) }} USD</div>
+      <div class="trade-form-actions">
         <a-button @click="emit('update:open', false)">取消</a-button>
         <a-button type="primary" :loading="saving" @click="save(false)">保存</a-button>
-        <a-button v-if="!editRecord" :loading="saving" @click="save(true)">保存并添加更多</a-button>
+        <a-button v-if="!editRecord" type="primary" :loading="saving" @click="save(true)">保存并添加更多</a-button>
       </div>
     </a-form>
   </a-modal>
 </template>
+
+<style scoped>
+.trade-total {
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.trade-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+@media (max-width: 560px) {
+  .trade-form-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .trade-form-actions :deep(.ant-btn) {
+    width: 100%;
+  }
+
+  .trade-form-actions :deep(.ant-btn:last-child:nth-child(3)) {
+    grid-column: 1 / -1;
+  }
+}
+</style>

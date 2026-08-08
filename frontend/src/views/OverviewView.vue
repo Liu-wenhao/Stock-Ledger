@@ -145,6 +145,8 @@ function renderChart() {
   if (!chartRef.value) return
   if (!chart) chart = echarts.init(chartRef.value)
 
+  const compact = window.innerWidth <= 560
+
   const points = nav.value.points || []
   const isPct = mode.value === 'percent'
   const dates = points.map((p) => p.date)
@@ -156,7 +158,7 @@ function renderChart() {
   chart.setOption(
     {
       animationDuration: 400,
-      grid: { left: 12, right: 72, top: 28, bottom: 28 },
+      grid: { left: compact ? 4 : 12, right: compact ? 38 : 72, top: 28, bottom: compact ? 22 : 28 },
       tooltip: {
         trigger: 'axis',
         backgroundColor: '#fff',
@@ -173,7 +175,7 @@ function renderChart() {
         axisLabel: {
           ...axisLabelStyle,
           formatter: formatDateLabel,
-          interval: Math.max(Math.floor(dates.length / 8), 0),
+          interval: Math.max(Math.floor(dates.length / (compact ? 4 : 8)), 0),
         },
       },
       yAxis: {
@@ -205,7 +207,7 @@ function renderChart() {
           lineStyle: { color: '#2962ff', width: 2 },
           itemStyle: { color: '#2962ff' },
           markLine: zeroMarkLine,
-          endLabel: lastMain == null
+          endLabel: lastMain == null || compact
             ? undefined
             : {
                 show: true,
@@ -228,7 +230,7 @@ function renderChart() {
           z: 2,
           lineStyle: { color: '#26a69a', width: 2 },
           itemStyle: { color: '#26a69a' },
-          endLabel: lastSec == null
+          endLabel: lastSec == null || compact
             ? undefined
             : {
                 show: true,
@@ -250,6 +252,7 @@ function renderChart() {
 
 function onResize() {
   chart?.resize()
+  renderChart()
 }
 
 watch([mode, range], load)
@@ -293,6 +296,7 @@ onUnmounted(() => {
           v-for="r in nav.ranges || []"
           :key="r.key"
           type="button"
+          size="small"
           class="range-chip"
           :class="{ active: range === r.key }"
           @click="range = r.key"
@@ -371,38 +375,6 @@ onUnmounted(() => {
 
     <section class="pnl-section">
       <h2 class="section-title">
-        清仓盈亏<span class="section-pnl" :class="closedPnlClass">（{{ closedPnlText }}）</span>
-      </h2>
-    </section>
-
-    <div class="movers">
-      <section class="mover-panel">
-        <h3 class="mover-title">总赢家</h3>
-        <div v-for="item in closedWinners" :key="'cw-' + item.symbol" class="mover-row">
-          <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
-          <div class="mover-bar">
-            <span class="bar-fill up" :style="{ width: barWidth(item, closedWinners) }" />
-          </div>
-          <div class="mover-pct pnl-up">{{ formatMover(item) }}</div>
-        </div>
-        <a-empty v-if="!closedWinners.length" description="暂无数据" />
-      </section>
-
-      <section class="mover-panel">
-        <h3 class="mover-title">总输家</h3>
-        <div v-for="item in closedLosers" :key="'cl-' + item.symbol" class="mover-row">
-          <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
-          <div class="mover-bar">
-            <span class="bar-fill down" :style="{ width: barWidth(item, closedLosers) }" />
-          </div>
-          <div class="mover-pct pnl-down">{{ formatMover(item) }}</div>
-        </div>
-        <a-empty v-if="!closedLosers.length" description="暂无数据" />
-      </section>
-    </div>
-
-    <section class="pnl-section">
-      <h2 class="section-title">
         累计盈亏<span class="section-pnl" :class="cumulativePnlClass">（{{ cumulativePnlText }}）</span>
       </h2>
     </section>
@@ -430,6 +402,38 @@ onUnmounted(() => {
           <div class="mover-pct pnl-down">{{ formatMover(item) }}</div>
         </div>
         <a-empty v-if="!totalLosers.length" description="暂无数据" />
+      </section>
+    </div>
+
+    <section class="pnl-section">
+      <h2 class="section-title">
+        清仓盈亏<span class="section-pnl" :class="closedPnlClass">（{{ closedPnlText }}）</span>
+      </h2>
+    </section>
+
+    <div class="movers">
+      <section class="mover-panel">
+        <h3 class="mover-title">总赢家</h3>
+        <div v-for="item in closedWinners" :key="'cw-' + item.symbol" class="mover-row">
+          <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
+          <div class="mover-bar">
+            <span class="bar-fill up" :style="{ width: barWidth(item, closedWinners) }" />
+          </div>
+          <div class="mover-pct pnl-up">{{ formatMover(item) }}</div>
+        </div>
+        <a-empty v-if="!closedWinners.length" description="暂无数据" />
+      </section>
+
+      <section class="mover-panel">
+        <h3 class="mover-title">总输家</h3>
+        <div v-for="item in closedLosers" :key="'cl-' + item.symbol" class="mover-row">
+          <SymbolCell :symbol="item.symbol" :name="item.name" :logo-url="item.logo_url" />
+          <div class="mover-bar">
+            <span class="bar-fill down" :style="{ width: barWidth(item, closedLosers) }" />
+          </div>
+          <div class="mover-pct pnl-down">{{ formatMover(item) }}</div>
+        </div>
+        <a-empty v-if="!closedLosers.length" description="暂无数据" />
       </section>
     </div>
   </div>
@@ -584,7 +588,88 @@ onUnmounted(() => {
 @media (max-width: 800px) {
   .movers,
   .range-chips {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .range-chips {
+    gap: 6px;
+  }
+
+  .range-chip {
+    min-height: 52px;
+    padding: 9px 6px;
+  }
+
+  .mover-row {
+    grid-template-columns: minmax(108px, 1fr) 64px;
+    gap: 8px;
+  }
+
+  .mover-row .mover-bar {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    height: 7px;
+  }
+
+  .mover-row .mover-pct {
+    width: auto;
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 560px) {
+  .nav-chart {
+    height: 260px;
+  }
+
+  .mode-toggle {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 4px;
+  }
+
+  .mode-btn {
+    height: 36px;
+    flex: 1;
+    border-radius: 10px;
+  }
+
+  .range-chips {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    margin-top: 4px;
+  }
+
+  .range-chip {
+    min-height: 58px;
+    border: 1px solid #e0e3eb;
+  }
+
+  .range-chip.active {
+    border-color: #c7d2fe;
+  }
+
+  .pnl-section {
+    margin-top: 22px;
+    padding-top: 4px;
+  }
+
+  .section-title {
+    font-size: 16px;
+    line-height: 1.4;
+  }
+
+  .movers {
     grid-template-columns: 1fr;
+    gap: 18px;
+    margin-top: 14px;
+  }
+
+  .mover-title {
+    margin-bottom: 4px;
+  }
+
+  .mover-row {
+    padding: 8px 0;
   }
 }
 </style>

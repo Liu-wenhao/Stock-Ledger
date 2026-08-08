@@ -236,9 +236,65 @@ const cards = computed(() => {
   }
 }
 
+@media (min-width: 640px) and (max-width: 800px) {
+  .kpi-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 560px) {
   .kpi-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .kpi-card {
+    min-height: 94px;
+    padding: 13px 12px;
+  }
+
+  .kpi-card:first-child {
+    grid-column: 1 / -1;
+    min-height: 88px;
+  }
+
+  .label {
+    margin-bottom: 6px;
+  }
+
+  .value {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 0;
+    font-size: clamp(16px, 4.8vw, 19px);
+  }
+
+  .value .percent {
+    width: 100%;
+    margin: 3px 0 0;
+    font-size: 13px;
+  }
+
+  .secondary {
+    margin-top: 6px;
+    line-height: 1.35;
+  }
+}
+
+@media (max-width: 360px) {
+  .secondary {
+    font-size: 11px;
+  }
+
+  .secondary .prefix {
+    display: block;
+    margin: 0 0 1px;
+  }
+
+  .value .currency {
+    font-size: 11px;
   }
 }
 </style>

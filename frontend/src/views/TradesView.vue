@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import dayjs from 'dayjs'
 import { Modal, message } from 'ant-design-vue'
@@ -33,6 +33,7 @@ const modalOpen = ref(false)
 const editRecord = ref(null)
 const highlightId = ref(null)
 const tableScrollY = useTableScrollY(420)
+const viewportWidth = ref(window.innerWidth)
 
 const pagination = reactive({
   current: 1,
@@ -42,7 +43,10 @@ const pagination = reactive({
   pageSizeOptions: ['10', '20', '50', '100'],
 })
 
-const tableScroll = computed(() => ({ x: 1100, y: tableScrollY.value }))
+const tableScroll = computed(() => ({
+  x: viewportWidth.value <= 560 ? 860 : 1100,
+  y: viewportWidth.value <= 560 ? undefined : tableScrollY.value,
+}))
 
 const SIDE_LABELS = {
   Buy: '买入',
@@ -73,8 +77,8 @@ const typeOptions = computed(() => {
   ]
 })
 
-const columns = [
-  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
+const baseColumns = [
+  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', minWidth: 160, fixed: 'left' },
   { title: '类型', key: 'side', dataIndex: 'side', width: 100 },
   { title: '日期', key: 'closing_time', dataIndex: 'closing_time', width: 180 },
   { title: '价格', key: 'fill_price', dataIndex: 'fill_price', align: 'right' },
@@ -84,6 +88,33 @@ const columns = [
   { title: '笔记', key: 'notes', dataIndex: 'notes' },
   { title: '操作', key: 'actions', width: 130, align: 'center' },
 ]
+
+const compactColumnWidths = {
+  symbol: 136,
+  side: 72,
+  closing_time: 128,
+  fill_price: 88,
+  qty: 70,
+  commission: 84,
+  total: 88,
+  notes: 108,
+  actions: 96,
+}
+
+const columns = computed(() => {
+  if (viewportWidth.value > 560) return baseColumns
+  return baseColumns.map((column) => {
+    const width = compactColumnWidths[column.key]
+    return width
+      ? {
+          ...column,
+          width,
+          minWidth: undefined,
+          fixed: column.key === 'symbol' ? undefined : column.fixed,
+        }
+      : column
+  })
+})
 
 function resetPage() {
   pagination.current = 1
@@ -196,6 +227,10 @@ function onSaved() {
   emit('changed')
 }
 
+function onViewportResize() {
+  viewportWidth.value = window.innerWidth
+}
+
 watch(sideType, () => {
   resetPage()
   load()
@@ -209,30 +244,35 @@ watch(
 )
 
 onMounted(async () => {
+  window.addEventListener('resize', onViewportResize)
   await load()
   if (route.query.editId) await focusTradeById(route.query.editId)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('resize', onViewportResize)
 })
 </script>
 
 <template>
-  <div>
+  <div class="trades-view">
     <a-tabs v-model:activeKey="sideGroup" size="small" @change="onTabChange">
       <a-tab-pane key="trades" tab="交易" />
       <a-tab-pane key="dividends" tab="股息" />
     </a-tabs>
 
-    <div class="toolbar">
-      <a-space>
+    <div class="toolbar trades-toolbar">
+      <a-space class="filter-actions">
         <a-select
           v-model:value="sideType"
-          style="width: 140px"
+          class="type-select"
           :options="typeOptions"
           placeholder="类型"
         />
         <a-input-search
           v-model:value="keyword"
           placeholder="搜索商品代码"
-          style="width: 240px"
+          class="trade-search"
           allow-clear
           @search="
             () => {
@@ -242,7 +282,7 @@ onMounted(async () => {
           "
         />
       </a-space>
-      <a-space>
+      <a-space class="primary-actions">
         <a-button type="primary" @click="openCreate">
           <PlusOutlined /> 添加交易
         </a-button>
@@ -257,7 +297,9 @@ onMounted(async () => {
       </a-space>
     </div>
 
+    <div class="mobile-scroll-hint">左右滑动查看价格、数量和操作</div>
     <a-table
+      class="mobile-data-table trades-table"
       :columns="columns"
       :data-source="rows"
       :loading="loading"
@@ -298,10 +340,10 @@ onMounted(async () => {
         <template v-else-if="column.key === 'total'">{{ formatMoney(record.total) }}</template>
         <template v-else-if="column.key === 'actions'">
           <a-space :size="0">
-            <a-button type="link" size="small" @click="openEdit(record)">
+            <a-button class="action-button" type="link" size="small" aria-label="编辑交易" title="编辑" @click="openEdit(record)">
               <EditOutlined />
             </a-button>
-            <a-button type="link" size="small" danger @click="onRemove(record)">
+            <a-button class="action-button" type="link" size="small" danger aria-label="删除交易" title="删除" @click="onRemove(record)">
               <DeleteOutlined />
             </a-button>
           </a-space>
@@ -314,7 +356,72 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.type-select {
+  width: 140px;
+}
+
+.trade-search {
+  width: 240px;
+}
+
+.action-button {
+  min-width: 40px;
+}
+
 :deep(.trade-row-highlight > td) {
   background: #e8f0fe !important;
+}
+
+@media (max-width: 800px) {
+  .trades-toolbar,
+  .filter-actions,
+  .primary-actions {
+    width: 100%;
+  }
+
+  .filter-actions,
+  .primary-actions {
+    display: grid;
+    gap: 8px !important;
+  }
+
+  .filter-actions {
+    grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1.2fr);
+  }
+
+  .primary-actions {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .filter-actions :deep(.ant-space-item),
+  .primary-actions :deep(.ant-space-item),
+  .primary-actions :deep(.ant-upload),
+  .primary-actions :deep(.ant-btn) {
+    width: 100%;
+  }
+
+  .type-select,
+  .trade-search {
+    width: 100%;
+  }
+
+}
+
+@media (max-width: 560px) {
+  .filter-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .primary-actions {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .primary-actions :deep(.ant-space-item:first-child) {
+    grid-column: 1 / -1;
+  }
+
+  .trades-table :deep(.ant-table-cell-fix-left) {
+    box-shadow: 8px 0 12px -12px rgba(19, 23, 34, 0.5);
+  }
 }
 </style>

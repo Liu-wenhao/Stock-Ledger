@@ -30,6 +30,24 @@ body,
   background: var(--bg);
 }
 
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  overflow-x: hidden;
+}
+
+::selection {
+  color: #fff;
+  background: var(--blue);
+}
+
+:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -135,6 +153,10 @@ a.symbol-cell--link:hover .code {
   gap: 12px;
   margin-bottom: 12px;
   flex-wrap: wrap;
+}
+
+.mobile-scroll-hint {
+  display: none;
 }
 
 .range-chips {
@@ -283,14 +305,206 @@ a.symbol-cell--link:hover .code {
 }
 
 @media (max-width: 800px) {
-  .movers,
-  .range-chips {
-    grid-template-columns: 1fr;
+  .page {
+    padding-inline: max(16px, env(safe-area-inset-left)) max(16px, env(safe-area-inset-right));
+  }
+
+  .toolbar {
+    align-items: stretch;
+  }
+
+  .page .ant-tabs-nav-wrap {
+    overflow-x: auto;
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .page .ant-tabs-nav-wrap::-webkit-scrollbar {
+    display: none;
+  }
+
+  .page .ant-tabs-nav-list {
+    min-width: max-content;
+  }
+
+  .page .ant-tabs-tab {
+    min-height: 44px;
+    padding: 10px 8px !important;
+  }
+
+  .mobile-scroll-hint {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: -2px 0 8px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .mobile-scroll-hint::before {
+    content: "↔";
+    color: var(--blue);
+    font-size: 14px;
+    font-weight: 700;
+  }
+
+  .mobile-data-table .ant-table-cell,
+  .cycle-inner-table .ant-table-cell {
+    padding: 10px 12px !important;
+    white-space: nowrap;
+  }
+
+  .mobile-data-table .ant-table-thead > tr > th,
+  .cycle-inner-table .ant-table-thead > tr > th {
+    font-size: 12px;
+  }
+
+  .mobile-data-table .ant-table-container,
+  .cycle-inner-table .ant-table-container {
+    overflow: hidden;
+  }
+
+  .mobile-data-table .ant-table-content,
+  .mobile-data-table .ant-table-body,
+  .cycle-inner-table .ant-table-content,
+  .cycle-inner-table .ant-table-body {
+    overscroll-behavior-x: contain;
+    scroll-behavior: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .mobile-data-table .ant-pagination {
+    justify-content: center;
+    gap: 4px 0;
+  }
+
+  .mobile-data-table .ant-pagination-total-text {
+    width: 100%;
+    height: auto;
+    margin: 0 0 4px;
+    text-align: center;
+    line-height: 1.4;
   }
 }
 
 @media (max-width: 560px) {
   .page {
-    padding: 12px 14px 32px;
+    padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+      max(28px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+  }
+
+  .page .ant-tabs-nav {
+    margin-bottom: 12px !important;
+  }
+
+  .page .ant-tabs-tab + .ant-tabs-tab {
+    margin-left: 12px !important;
+  }
+
+  .symbol-cell {
+    gap: 8px;
+  }
+
+  .symbol-logo {
+    width: 26px;
+    height: 26px;
+  }
+
+  .mobile-data-table .symbol-meta .name,
+  .cycle-inner-table .symbol-meta .name {
+    max-width: 78px;
+  }
+
+  .mobile-data-table .ant-table-cell,
+  .cycle-inner-table .ant-table-cell {
+    padding: 8px !important;
+    font-size: 12px;
+  }
+
+  .mobile-data-table .ant-table-thead > tr > th,
+  .cycle-inner-table .ant-table-thead > tr > th {
+    font-size: 11px;
+  }
+
+  .mobile-data-table .ant-table-cell-fix-left {
+    box-shadow: 7px 0 10px -12px rgba(19, 23, 34, 0.5);
+  }
+
+  .mobile-data-table .ant-table-content,
+  .mobile-data-table .ant-table-body,
+  .cycle-inner-table .ant-table-content,
+  .cycle-inner-table .ant-table-body {
+    max-width: 100%;
+    overflow-y: hidden !important;
+    overscroll-behavior: none;
+  }
+
+  .mobile-data-table .ant-table-sticky-scroll,
+  .cycle-inner-table .ant-table-sticky-scroll {
+    display: none;
+  }
+
+  .ant-modal-root .mobile-sheet-modal .ant-modal {
+    width: calc(100vw - 16px) !important;
+    max-width: none;
+    margin: 8px auto;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+  }
+
+  .ant-modal-root .mobile-sheet-modal {
+    overflow: hidden;
+  }
+
+  .ant-modal-root .mobile-sheet-modal .ant-modal-content {
+    max-height: calc(100dvh - 16px);
+    padding: 18px 16px 16px;
+    overflow-y: auto;
+    border-radius: 12px;
+  }
+
+  .ant-modal-root .mobile-sheet-modal .ant-modal-header {
+    margin-bottom: 14px;
+  }
+
+  .ant-modal-root .mobile-sheet-modal .ant-modal-close {
+    width: 44px;
+    height: 44px;
+  }
+
+  .ant-modal-root .mobile-sheet-modal .ant-form-item {
+    margin-bottom: 14px;
+  }
+
+  .ant-modal-root .mobile-sheet-modal .ant-segmented {
+    overflow: visible;
+  }
+
+  .ant-modal-root .trade-form-modal .trade-side-segmented .ant-segmented-group {
+    min-width: 0;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .ant-modal-root .trade-form-modal .trade-side-segmented .ant-segmented-item {
+    flex: 1 0 calc(20% - 4px);
+    min-height: 38px;
+  }
+
+  .ant-modal-root .trade-form-modal .trade-side-segmented .ant-segmented-item-label {
+    min-height: 38px;
+    padding-inline: 8px;
+    line-height: 38px;
+  }
+}
+
+@media (pointer: coarse) {
+  button,
+  [role="button"],
+  .ant-btn,
+  .ant-switch,
+  .ant-radio-button-wrapper {
+    touch-action: manipulation;
   }
 }

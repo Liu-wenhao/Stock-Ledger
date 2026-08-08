@@ -51,6 +51,7 @@ async function load() {
 function renderBar() {
   if (!barRef.value) return
   if (!barChart) barChart = echarts.init(barRef.value)
+  const compact = window.innerWidth <= 560
   const items = monthly.value.items || []
   const bench = monthly.value.benchmark || 'QQQ'
   barChart.setOption(
@@ -62,9 +63,9 @@ function renderBar() {
         itemWidth: 10,
         itemHeight: 10,
         textStyle: { color: '#131722', fontSize: 12 },
-        data: [`按投资组合 %`, `${bench} %`],
+        data: [`按投资组合`, `${bench}`],
       },
-      grid: { left: 8, right: 56, top: 16, bottom: 40 },
+      grid: { left: compact ? 2 : 8, right: compact ? 40 : 56, top: 16, bottom: 40 },
       tooltip: {
         trigger: 'axis',
         valueFormatter: (v) => pctAxisFormatter(v),
@@ -89,7 +90,7 @@ function renderBar() {
       },
       series: [
         {
-          name: '按投资组合 %',
+          name: '按投资组合',
           type: 'bar',
           barMaxWidth: 28,
           data: items.map((i) => Number(toNumber(i.portfolio_percent).toFixed(2))),
@@ -97,7 +98,7 @@ function renderBar() {
           markLine: zeroMarkLine,
         },
         {
-          name: `${bench} %`,
+          name: `${bench}`,
           type: 'bar',
           barMaxWidth: 28,
           data: items.map((i) => Number(toNumber(i.benchmark_percent).toFixed(2))),
@@ -112,6 +113,7 @@ function renderBar() {
 function renderLine() {
   if (!lineRef.value) return
   if (!lineChart) lineChart = echarts.init(lineRef.value)
+  const compact = window.innerWidth <= 560
   const points = profit.value.points || []
   const total = points.map((p) => toNumber(p.total_pnl))
   const realized = points.map((p) => toNumber(p.realized_pnl))
@@ -129,7 +131,7 @@ function renderLine() {
         textStyle: { color: '#131722', fontSize: 12 },
         data: ['累计盈亏', '清仓盈亏'],
       },
-      grid: { left: 8, right: 72, top: 36, bottom: 28 },
+      grid: { left: compact ? 2 : 8, right: compact ? 38 : 72, top: 36, bottom: compact ? 22 : 28 },
       tooltip: {
         trigger: 'axis',
         valueFormatter: (v) => moneyAxisFormatter(v),
@@ -143,7 +145,7 @@ function renderLine() {
         axisLabel: {
           ...axisLabelStyle,
           formatter: formatDateLabel,
-          interval: Math.max(Math.floor(points.length / 8), 0),
+          interval: Math.max(Math.floor(points.length / (compact ? 4 : 8)), 0),
         },
       },
       yAxis: {
@@ -175,7 +177,7 @@ function renderLine() {
           itemStyle: { color: '#2962ff' },
           markLine: zeroMarkLine,
           endLabel:
-            lastTotal == null
+            lastTotal == null || compact
               ? undefined
               : {
                   show: true,
@@ -197,7 +199,7 @@ function renderLine() {
           lineStyle: { color: '#22d3ee', width: 2 },
           itemStyle: { color: '#22d3ee' },
           endLabel:
-            lastRealized == null
+            lastRealized == null || compact
               ? undefined
               : {
                   show: true,
@@ -219,6 +221,8 @@ function renderLine() {
 function onResize() {
   barChart?.resize()
   lineChart?.resize()
+  renderBar()
+  renderLine()
 }
 
 watch(range, load)
@@ -347,6 +351,42 @@ onUnmounted(() => {
 @media (max-width: 800px) {
   .profit-ranges {
     grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .analysis {
+    padding-top: 0;
+  }
+
+  .section-title {
+    font-size: 16px;
+  }
+
+  .profit-title {
+    margin-top: 22px;
+  }
+
+  .bar-chart {
+    height: 250px;
+  }
+
+  .line-chart {
+    height: 270px;
+  }
+
+  .profit-ranges {
+    gap: 6px;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .profit-chip {
+    padding: 9px 6px;
+    border: 1px solid #e0e3eb;
+  }
+
+  .profit-chip.active {
+    border-color: #c7d2fe;
   }
 }
 </style>

@@ -67,4 +67,47 @@ onMounted(() => {
   max-height: none;
   padding-top: 4px;
 }
+
+@media (max-width: 800px) {
+  .page-header {
+    gap: 12px;
+  }
+
+  .page-header h1 {
+    font-size: 17px;
+  }
+
+  .page-header :deep(.ant-btn) {
+    min-height: 44px;
+    padding-inline: 14px;
+    white-space: normal;
+    line-height: 1.2;
+  }
+
+  .main-panel > :deep(.ant-tabs-nav) {
+    position: sticky;
+    z-index: 20;
+    top: 0;
+    margin-inline: -16px !important;
+    padding-inline: 16px;
+    background: rgba(255, 255, 255, 0.96);
+  }
+}
+
+@media (max-width: 560px) {
+  .page-header {
+    align-items: center;
+    margin-bottom: 12px;
+  }
+
+  .page-header :deep(.ant-btn) {
+    max-width: 156px;
+    font-size: 13px;
+  }
+
+  .main-panel > :deep(.ant-tabs-nav) {
+    margin-inline: calc(-1 * max(12px, env(safe-area-inset-left))) !important;
+    padding-inline: max(12px, env(safe-area-inset-left));
+  }
+}
 </style>

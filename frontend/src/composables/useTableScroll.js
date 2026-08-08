@@ -9,7 +9,12 @@ export function useTableScrollY(offset = 420, min = 420) {
   const y = ref(min)
 
   function update() {
-    y.value = Math.max(min, window.innerHeight - offset)
+    const compact = window.innerWidth <= 560
+    const compactMin = Math.min(min, 320)
+    const compactOffset = Math.min(offset, 360)
+    y.value = compact
+      ? Math.max(compactMin, window.innerHeight - compactOffset)
+      : Math.max(min, window.innerHeight - offset)
   }
 
   onMounted(() => {

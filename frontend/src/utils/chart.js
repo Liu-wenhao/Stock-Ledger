@@ -13,13 +13,13 @@ export const axisLineStyle = {
 export function moneyAxisFormatter(v) {
   const n = Number(v)
   if (!Number.isFinite(n)) return ''
-  return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })
 }
 
 export function pctAxisFormatter(v) {
   const n = Number(v)
   if (!Number.isFinite(n)) return ''
-  return `${n.toFixed(2)}%`
+  return `${n.toFixed(0)}%`
 }
 
 export const zeroMarkLine = {

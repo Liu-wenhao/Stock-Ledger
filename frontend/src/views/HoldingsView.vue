@@ -21,7 +21,20 @@ const loading = ref(false)
 const data = ref({ items: [], total_market_value: 0, cash: 0 })
 const chartRef = ref(null)
 const tableScrollY = useTableScrollY(420)
-const tableScroll = computed(() => ({ x: 1300, y: tableScrollY.value }))
+const viewportWidth = ref(window.innerWidth)
+const tableScroll = computed(() => ({
+  x:
+    viewportWidth.value > 560
+      ? 1300
+      : subTab.value === 'cumulative'
+        ? 760
+        : subTab.value === 'closed'
+          ? 820
+          : subTab.value === 'price'
+            ? 780
+            : 960,
+  y: viewportWidth.value <= 560 ? undefined : tableScrollY.value,
+}))
 const pagination = reactive({
   current: 1,
   pageSize: 20,
@@ -311,6 +324,8 @@ function renderPriceChart() {
   if (!priceChartRef.value) return
   if (!priceChart) priceChart = echarts.init(priceChartRef.value)
 
+  const compact = window.innerWidth <= 560
+
   const trades = priceTrades.value
   const lineData = trades.map((t) => [
     new Date(t.closing_time).getTime(),
@@ -438,7 +453,13 @@ function renderPriceChart() {
   priceChart.setOption(
     {
       animationDuration: 300,
-      grid: { left: 16, right: 48, top: 36, bottom: 40, containLabel: true },
+      grid: {
+        left: compact ? 2 : 16,
+        right: compact ? 18 : 48,
+        top: 36,
+        bottom: compact ? 30 : 40,
+        containLabel: true,
+      },
       tooltip: {
         trigger: 'item',
         backgroundColor: '#fff',
@@ -503,7 +524,7 @@ function renderPriceChart() {
         axisLabel: {
           color: '#787b86',
           fontSize: 11,
-          formatter: (v) => Number(v).toFixed(2),
+          formatter: (v) => Number(v).toFixed(0),
         },
       },
       series: [
@@ -532,7 +553,7 @@ function renderPriceChart() {
 }
 
 const positionColumns = [
-  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
+  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', minWidth: 160, fixed: 'left' },
   { title: '交易笔数', key: 'trade_count', dataIndex: 'trade_count', width: 100, align: 'right' },
   { title: '分配 %', dataIndex: 'allocation', key: 'allocation', align: 'right' },
   { title: '数量', dataIndex: 'quantity', key: 'quantity', align: 'right' },
@@ -563,7 +584,7 @@ const positionColumns = [
 ]
 
 const priceColumns = [
-  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
+  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', minWidth: 160, fixed: 'left' },
   { title: '价格', dataIndex: 'last_price', key: 'last_price', align: 'right' },
   { title: '日涨跌', dataIndex: 'day_change', key: 'day_change', align: 'right' },
   { title: '日涨跌 %', dataIndex: 'day_change_percent', key: 'day_change_percent', align: 'right' },
@@ -574,7 +595,7 @@ const priceColumns = [
 ]
 
 const closedColumns = [
-  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
+  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', minWidth: 160, fixed: 'left' },
   { title: '周期数', key: 'cycle_count', dataIndex: 'cycle_count', width: 90, align: 'right' },
   { title: '交易笔数', key: 'trade_count', dataIndex: 'trade_count', width: 100, align: 'right' },
   {
@@ -627,7 +648,7 @@ const cycleColumns = [
 ]
 
 const cumulativeColumns = [
-  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 220 },
+  { title: '商品代码', key: 'symbol', dataIndex: 'symbol', minWidth: 160, fixed: 'left' },
   { title: '周期数', key: 'cycle_count', dataIndex: 'cycle_count', width: 90, align: 'right' },
   { title: '交易笔数', key: 'trade_count', dataIndex: 'trade_count', width: 100, align: 'right' },
   { title: '平均价格', key: 'avg_price', dataIndex: 'avg_price', align: 'right' },
@@ -650,10 +671,57 @@ const cumulativeCycleColumns = [
   { title: '周期盈亏 %', key: 'pnl_percent', dataIndex: 'pnl_percent', align: 'right' },
 ]
 
+const compactColumnWidths = {
+  symbol: 136,
+  cycle_index: 54,
+  status: 62,
+  started_at: 132,
+  ended_at: 132,
+  trade_count: 72,
+  cycle_count: 64,
+  allocation: 72,
+  quantity: 76,
+  avg_price: 86,
+  last_price: 90,
+  price: 86,
+  cost_basis: 92,
+  cost: 92,
+  market_value: 92,
+  total_pnl: 94,
+  total_pnl_percent: 86,
+  day_change: 92,
+  day_change_percent: 86,
+  buy_amount: 94,
+  sell_amount: 94,
+  realized_cost: 94,
+  realized_pnl: 94,
+  realized_pnl_percent: 86,
+}
+
+function responsiveColumns(list) {
+  if (viewportWidth.value > 560) return list
+  return list.map((column) => {
+    const width = compactColumnWidths[column.key]
+    return width
+      ? {
+          ...column,
+          width,
+          minWidth: undefined,
+          fixed: column.key === 'symbol' ? undefined : column.fixed,
+        }
+      : column
+  })
+}
+
+const displayClosedColumns = computed(() => responsiveColumns(closedColumns))
+const displayCumulativeColumns = computed(() => responsiveColumns(cumulativeColumns))
+const displayCycleColumns = computed(() => responsiveColumns(cycleColumns))
+const displayCumulativeCycleColumns = computed(() => responsiveColumns(cumulativeCycleColumns))
+
 const columns = computed(() => {
-  if (subTab.value === 'price') return priceColumns
-  if (subTab.value === 'cumulative') return cumulativeColumns
-  return positionColumns
+  if (subTab.value === 'price') return responsiveColumns(priceColumns)
+  if (subTab.value === 'cumulative') return displayCumulativeColumns.value
+  return responsiveColumns(positionColumns)
 })
 
 function avgPriceClass(record) {
@@ -846,6 +914,14 @@ async function renderPerf() {
   )
 }
 
+function onViewportResize() {
+  viewportWidth.value = window.innerWidth
+  chart?.resize()
+  priceChart?.resize()
+  if (subTab.value === 'performance') renderPerf()
+  if (priceModalOpen.value) renderPriceChart()
+}
+
 watch([subTab, includeClosed], () => {
   pagination.current = 1
   load()
@@ -859,9 +935,11 @@ watch(priceModalOpen, (open) => {
 onMounted(() => {
   load()
   startQuoteRefreshTimer()
+  window.addEventListener('resize', onViewportResize)
 })
 onUnmounted(() => {
   stopQuoteRefreshTimer()
+  window.removeEventListener('resize', onViewportResize)
   disposePriceChart()
   if (chart) {
     chart.dispose()
@@ -871,7 +949,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div>
+  <div class="holdings-view">
     <a-tabs v-model:activeKey="subTab" size="small">
       <a-tab-pane key="positions" tab="持仓" />
       <a-tab-pane key="cumulative" tab="累计" />
@@ -931,8 +1009,10 @@ onUnmounted(() => {
           @search="load"
         />
       </div>
+      <div class="mobile-scroll-hint">左右滑动查看完整的周期数据</div>
       <a-table
-        :columns="cumulativeColumns"
+        class="mobile-data-table holdings-table cumulative-table"
+        :columns="displayCumulativeColumns"
         :data-source="data.items"
         :loading="loading"
         row-key="symbol"
@@ -945,7 +1025,7 @@ onUnmounted(() => {
         <template #expandedRowRender="{ record }">
           <a-table
             class="cycle-inner-table"
-            :columns="cumulativeCycleColumns"
+            :columns="displayCumulativeCycleColumns"
             :data-source="record.cycles || []"
             :pagination="false"
             size="small"
@@ -1058,8 +1138,10 @@ onUnmounted(() => {
           @search="load"
         />
       </div>
+      <div class="mobile-scroll-hint">左右滑动查看买入、卖出和盈亏</div>
       <a-table
-        :columns="closedColumns"
+        class="mobile-data-table holdings-table closed-table"
+        :columns="displayClosedColumns"
         :data-source="data.items"
         :loading="loading"
         row-key="symbol"
@@ -1072,7 +1154,7 @@ onUnmounted(() => {
         <template #expandedRowRender="{ record }">
           <a-table
             class="cycle-inner-table"
-            :columns="cycleColumns"
+            :columns="displayCycleColumns"
             :data-source="record.cycles || []"
             :pagination="false"
             size="small"
@@ -1165,7 +1247,9 @@ onUnmounted(() => {
           @search="load"
         />
       </div>
+      <div class="mobile-scroll-hint">左右滑动查看价格和盈亏</div>
       <a-table
+        class="mobile-data-table holdings-table positions-table"
         :columns="columns"
         :data-source="data.items"
         :loading="loading"
@@ -1276,6 +1360,7 @@ onUnmounted(() => {
       :title="`${tickerOf(tradeModalSymbol)} 交易记录`"
       :footer="null"
       width="560px"
+      wrap-class-name="mobile-sheet-modal holdings-trade-modal"
       centered
       destroy-on-close
     >
@@ -1311,6 +1396,7 @@ onUnmounted(() => {
       :title="`${tickerOf(priceModalSymbol)} 交易价格`"
       :footer="null"
       width="760px"
+      wrap-class-name="mobile-sheet-modal holdings-price-modal"
       centered
       destroy-on-close
       @afterOpenChange="(open) => open && nextTick(() => renderPriceChart())"
@@ -1448,5 +1534,101 @@ onUnmounted(() => {
 .avg-price-chart {
   width: 100%;
   height: 380px;
+}
+
+@media (max-width: 800px) {
+  .holdings-view :deep(.ant-radio-group) {
+    max-width: 100%;
+  }
+
+  .holdings-view :deep(.ant-radio-button-wrapper) {
+    min-height: 40px;
+    padding-inline: 11px;
+    line-height: 38px;
+  }
+
+  .holdings-view .toolbar :deep(.ant-input-search) {
+    width: 100% !important;
+  }
+
+  .perf-layout {
+    min-height: 280px;
+  }
+
+  .perf-symbols {
+    width: 150px;
+  }
+
+  .perf-symbol-row {
+    padding-right: 6px;
+  }
+
+  .perf-chart {
+    min-width: 190px;
+  }
+
+  .avg-price-chart {
+    height: 320px;
+  }
+
+  .holdings-view :deep(.ant-table-cell-fix-left) {
+    box-shadow: 8px 0 12px -12px rgba(19, 23, 34, 0.5);
+  }
+}
+
+@media (max-width: 560px) {
+  .holdings-view > .ant-tabs :deep(.ant-tabs-tab) {
+    padding-inline: 6px !important;
+  }
+
+  .holdings-view .toolbar {
+    margin-bottom: 10px;
+  }
+
+  .holdings-view .toolbar :deep(.ant-radio-group) {
+    display: flex;
+    width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .holdings-view .toolbar :deep(.ant-radio-group::-webkit-scrollbar) {
+    display: none;
+  }
+
+  .perf-layout {
+    min-height: 250px;
+  }
+
+  .perf-symbols {
+    width: 132px;
+  }
+
+  .perf-symbol-row {
+    padding-right: 4px;
+  }
+
+  .perf-symbol-row :deep(.symbol-cell) {
+    gap: 6px;
+  }
+
+  .perf-symbol-row :deep(.symbol-logo) {
+    width: 24px;
+    height: 24px;
+  }
+
+  .perf-symbol-row :deep(.symbol-meta .name) {
+    max-width: 82px;
+  }
+
+  .trade-steps {
+    max-height: calc(100dvh - 150px);
+    padding-right: 2px;
+  }
+
+  .avg-price-chart {
+    height: 280px;
+  }
 }
 </style>
