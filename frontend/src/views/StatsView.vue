@@ -1,12 +1,18 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import dayjs from 'dayjs'
+import updateLocale from 'dayjs/plugin/updateLocale'
 import 'dayjs/locale/zh-cn'
 import locale from 'ant-design-vue/es/calendar/locale/zh_CN'
 import { fetchDailyPnl } from '@/api/portfolio'
 import { formatMoney, formatPct, pnlClass, toNumber } from '@/utils/format'
 
+dayjs.extend(updateLocale)
+dayjs.updateLocale('zh-cn', { weekStart: 0 })
 dayjs.locale('zh-cn')
+
+// Weekday headers/grid follow dayjs weekStart (Sunday).
+const calendarLocale = locale
 
 const GRANULARITY = [
   { key: 'day', label: '日' },
@@ -116,6 +122,24 @@ function isOtherMonthDay(current) {
   return granularity.value === 'day' && !isActiveMonth(current)
 }
 
+function isWeekday(current) {
+  const day = current.day()
+  return day >= 1 && day <= 5
+}
+
+function isToday(current) {
+  return current.format('YYYY-MM-DD') === dayjs().format('YYYY-MM-DD')
+}
+
+function shouldShowDayPnl(current) {
+  return !isOtherMonthDay(current) && isWeekday(current) && !!getDayItem(current)
+}
+
+function dayCellBackground(current) {
+  if (!shouldShowDayPnl(current)) return {}
+  return cellBackground(getDayItem(current)?.pnl)
+}
+
 async function load() {
   loading.value = true
   try {
@@ -206,7 +230,7 @@ load()
         v-if="granularity !== 'year'"
         v-model:value="calendarValue"
         :mode="calendarMode"
-        :locale="locale"
+        :locale="calendarLocale"
         :fullscreen="false"
         class="pnl-calendar"
       >
@@ -224,12 +248,15 @@ load()
               class="cell-body"
               :class="{
                 'other-month': isOtherMonthDay(current),
-                'cell-body--empty': !isOtherMonthDay(current) && !getDayItem(current),
+                'cell-body--empty':
+                  !isOtherMonthDay(current) && (!isWeekday(current) || !getDayItem(current)),
               }"
-              :style="!isOtherMonthDay(current) && getDayItem(current) ? cellBackground(getDayItem(current)?.pnl) : {}"
+              :style="dayCellBackground(current)"
             >
-              <div class="cell-date">{{ current.date() }}</div>
-              <template v-if="!isOtherMonthDay(current) && getDayItem(current)">
+              <div class="cell-date" :class="{ 'cell-date--today': isToday(current) }">
+                {{ current.date() }}
+              </div>
+              <template v-if="shouldShowDayPnl(current)">
                 <div class="cell-pnl" :class="pnlClass(getDayItem(current)?.pnl)">
                   {{ formatCellPnl(getDayItem(current)?.pnl) }}
                 </div>
@@ -287,7 +314,7 @@ load()
     </a-spin>
 
     <p class="hint">
-      <template v-if="granularity === 'day'">按日查看：日历每格显示当日盈亏，默认展示当月。</template>
+      <template v-if="granularity === 'day'">按日查看：按美东交易日（周一至周五）统计盈亏，周末不展示。</template>
       <template v-else-if="granularity === 'month'">按月查看：切换至年面板，每格显示该月合计盈亏。</template>
       <template v-else>按年查看：各年度盈亏汇总。</template>
       绿色为盈利，红色为亏损。
@@ -474,6 +501,18 @@ load()
   line-height: 1.2;
 }
 
+.day-cell .cell-date--today {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: #fff;
+  color: #131722;
+  box-shadow: inset 0 0 0 1.5px #fff;
+}
+
 .month-cell {
   min-height: 104px;
   text-align: center;
@@ -556,16 +595,86 @@ load()
     font-size: 16px;
   }
 
+  .pnl-calendar {
+    padding: 0;
+  }
+
+  .pnl-calendar :deep(.ant-picker-cell) {
+    padding: 0;
+  }
+
+  .pnl-calendar :deep(.ant-picker-cell-inner) {
+    width: 100%;
+    height: 100%;
+  }
+
+  .pnl-calendar :deep(.ant-picker-content) {
+    border-collapse: collapse;
+  }
+
+  .pnl-calendar :deep(.ant-picker-calendar-month-panel .ant-picker-cell) {
+    padding: 0;
+  }
+
+  .pnl-calendar :deep(.ant-picker-content th) {
+    font-size: 10px;
+  }
+
   .pnl-calendar :deep(.ant-picker-calendar-date-content) {
-    min-height: 80px;
+    min-height: 56px;
+  }
+
+  .pnl-calendar :deep(.ant-picker-calendar-month-panel .ant-picker-calendar-date-content) {
+    min-height: 64px;
   }
 
   .calendar-cell {
-    min-height: 80px;
+    min-height: 56px;
+    height: 100%;
+    font-size: 10px;
+  }
+
+  .month-cell {
+    min-height: 64px;
+    font-size: 10px;
   }
 
   .cell-body {
-    padding: 4px 2px;
+    min-height: 56px;
+    height: 100%;
+    padding: 2px 1px;
+    border-radius: 0;
+    gap: 1px;
+  }
+
+  .month-cell .cell-body {
+    min-height: 64px;
+  }
+
+  .day-cell .cell-date,
+  .month-cell .cell-month,
+  .cell-year,
+  .cell-pnl,
+  .cell-pct,
+  .cell-empty {
+    font-size: 10px;
+  }
+
+  .day-cell .cell-date--today {
+    min-width: 18px;
+    height: 18px;
+  }
+
+  .year-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0;
+  }
+
+  .year-cell .cell-body {
+    min-height: 72px;
+    border-radius: 0;
+    border-left: none;
+    border-top: none;
   }
 }
 </style>

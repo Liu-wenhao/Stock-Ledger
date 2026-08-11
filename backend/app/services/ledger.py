@@ -287,6 +287,29 @@ def replay(trades: Iterable[Trade], until: datetime | None = None) -> PortfolioS
     return state
 
 
+def replay_until_session(trades: Iterable[Trade], session_day: date) -> PortfolioState:
+    """Replay trades through the end of a US equity session date."""
+    state = PortfolioState()
+    for trade in sorted(trades, key=lambda t: (t.closing_time, t.id or 0)):
+        if trade_us_session_date(trade.closing_time) <= session_day:
+            apply_trade(state, trade)
+    return state
+
+
+def _nav_series_needs_rebuild(existing: list[DailyNav]) -> bool:
+    if not existing:
+        return False
+    latest = existing[-1]
+    session_today = us_equity_session_date()
+    if any(r.nav_date.weekday() >= 5 for r in existing):
+        return True
+    if latest.nav_date > session_today:
+        return True
+    if _dec(latest.investment_total) == ZERO and _dec(latest.total_pnl) != ZERO:
+        return True
+    return False
+
+
 def load_trades(db: Session, portfolio_id: int = 1) -> list[Trade]:
     return (
         db.query(Trade)
@@ -798,8 +821,7 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
         .all()
     )
     if existing and not rebuild:
-        latest = existing[-1]
-        if _dec(latest.investment_total) == ZERO and _dec(latest.total_pnl) != ZERO:
+        if _nav_series_needs_rebuild(existing):
             rebuild = True
         else:
             return existing
@@ -808,8 +830,8 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
     if not trades:
         return []
 
-    start = trades[0].closing_time.date()
-    end = date.today()
+    start = trade_us_session_date(trades[0].closing_time)
+    end = us_equity_session_date()
     symbols = sorted(
         {
             t.symbol.upper()
@@ -827,10 +849,12 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
 
     rows: list[DailyNav] = []
     day = start
-    # Pre-index trades by date
     while day <= end:
-        until = datetime.combine(day, datetime.max.time())
-        state = replay(trades, until=until)
+        if day.weekday() >= 5:
+            day += timedelta(days=1)
+            continue
+
+        state = replay_until_session(trades, day)
         holdings_value = ZERO
         for sym, pos in state.positions.items():
             if pos.quantity <= 0:
@@ -881,44 +905,61 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
     )
 
 
-def nav_response(db: Session, range_key: str = "3M", mode: str = "value") -> dict:
-    rows = build_nav_series(db)
-    # Align today's point with live summary so chart end == KPI cards
-    summary = compute_summary(db)
-    live_investment_total = _live_investment_total(db)
+def _sync_live_today_nav(db: Session, rows: list[DailyNav], portfolio_id: int = 1) -> list[DailyNav]:
+    """Align the current US session NAV row with live holdings."""
+    summary = compute_summary(db, portfolio_id)
+    live_investment_total = _live_investment_total(db, portfolio_id)
     live_value = _dec(summary["portfolio_value"])
     live_cash = _dec(summary["cash"])
     live_pnl = _dec(summary["total_pnl"])
     live_realized = _dec(summary["realized_pnl"])
+    session_today = us_equity_session_date()
 
-    if rows:
-        last = rows[-1]
-        if last.nav_date == date.today():
-            last.total_value = live_value
-            last.cash = live_cash
-            last.total_pnl = live_pnl
-            last.realized_pnl = live_realized
-            last.holdings_value = live_value - live_cash
-            last.net_invested = _dec(summary.get("net_invested"))
-            last.investment_total = live_investment_total
-            db.add(last)
-            db.commit()
-            db.refresh(last)
-        else:
-            # Ensure today exists as a live tip point in the response series
-            rows = list(rows) + [
-                DailyNav(
-                    portfolio_id=last.portfolio_id,
-                    nav_date=date.today(),
-                    total_value=live_value,
-                    cash=live_cash,
-                    holdings_value=live_value - live_cash,
-                    realized_pnl=live_realized,
-                    total_pnl=live_pnl,
-                    net_invested=_dec(summary.get("net_invested")),
-                    investment_total=live_investment_total,
-                )
-            ]
+    if not rows:
+        return rows
+
+    last = rows[-1]
+    if last.nav_date == session_today:
+        last.total_value = live_value
+        last.cash = live_cash
+        last.total_pnl = live_pnl
+        last.realized_pnl = live_realized
+        last.holdings_value = live_value - live_cash
+        last.net_invested = _dec(summary.get("net_invested"))
+        last.investment_total = live_investment_total
+        db.add(last)
+        db.commit()
+        db.refresh(last)
+        return rows
+
+    if last.nav_date < session_today:
+        row = DailyNav(
+            portfolio_id=portfolio_id,
+            nav_date=session_today,
+            total_value=live_value,
+            cash=live_cash,
+            holdings_value=live_value - live_cash,
+            realized_pnl=live_realized,
+            total_pnl=live_pnl,
+            net_invested=_dec(summary.get("net_invested")),
+            investment_total=live_investment_total,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return [*rows, row]
+
+    return rows
+
+
+def nav_response(db: Session, range_key: str = "3M", mode: str = "value") -> dict:
+    rows = build_nav_series(db)
+    rows = _sync_live_today_nav(db, rows)
+    summary = compute_summary(db)
+    live_value = _dec(summary["portfolio_value"])
+    live_cash = _dec(summary["cash"])
+    live_pnl = _dec(summary["total_pnl"])
+    live_realized = _dec(summary["realized_pnl"])
 
     first = rows[0].nav_date if rows else date.today()
     start = range_start(range_key, first)
@@ -1111,14 +1152,25 @@ def monthly_returns(db: Session, range_key: str = "3M") -> dict:
 
 
 def _build_daily_pnl_items(rows: list[DailyNav]) -> list[dict]:
+    """Daily PnL by US equity session date (consecutive session deltas)."""
     all_items: list[dict] = []
-    prev_pnl = ZERO
-    for idx, row in enumerate(rows):
+    prev_pnl: Decimal | None = None
+    prev_value: Decimal | None = None
+
+    for row in rows:
+        if row.nav_date.weekday() >= 5:
+            continue
+
         pnl = _dec(row.total_pnl)
-        day_pnl = ZERO if idx == 0 else pnl - prev_pnl
-        prev_pnl = pnl
-        prev_value = _dec(rows[idx - 1].total_value) if idx > 0 else _dec(row.total_value)
-        day_pct = (day_pnl / prev_value * Decimal("100")) if prev_value > ZERO else ZERO
+        row_value = _dec(row.total_value)
+
+        if prev_pnl is None:
+            day_pnl = ZERO
+        else:
+            day_pnl = pnl - prev_pnl
+
+        base_value = prev_value if prev_value is not None else row_value
+        day_pct = (day_pnl / base_value * Decimal("100")) if base_value > ZERO else ZERO
         all_items.append(
             {
                 "date": row.nav_date,
@@ -1126,6 +1178,10 @@ def _build_daily_pnl_items(rows: list[DailyNav]) -> list[dict]:
                 "pnl_percent": day_pct.quantize(Decimal("0.01")),
             }
         )
+
+        prev_pnl = pnl
+        prev_value = row_value
+
     return all_items
 
 
@@ -1215,10 +1271,11 @@ def daily_pnl_calendar(
     year: int | None = None,
     month: int | None = None,
 ) -> dict:
-    today = date.today()
+    today = us_equity_session_date()
     granularity = granularity if granularity in {"day", "month", "year"} else "day"
 
     rows = build_nav_series(db, portfolio_id=portfolio_id)
+    rows = _sync_live_today_nav(db, rows, portfolio_id=portfolio_id)
     empty_year = year or today.year
     empty_month = month or today.month
     empty = {
