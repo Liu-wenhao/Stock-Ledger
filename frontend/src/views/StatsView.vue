@@ -64,11 +64,14 @@ const summaryCards = computed(() => {
   ]
 })
 
-const maxAbsPnl = computed(() => {
-  const vals = (data.value.items || []).map((i) => Math.abs(toNumber(i.pnl)))
-  const max = Math.max(...vals, 0)
-  return max > 0 ? max : 1
-})
+function cellBackground(pnl) {
+  if (pnl == null || pnl === '') return {}
+  const n = toNumber(pnl)
+  if (n === 0) return { background: '#f5f6fa' }
+  return {
+    background: n > 0 ? 'rgba(38, 166, 154, 0.35)' : 'rgba(239, 83, 80, 0.35)',
+  }
+}
 
 function pad2(n) {
   return String(n).padStart(2, '0')
@@ -94,17 +97,6 @@ function formatCellPnl(v) {
   return `${n > 0 ? '+' : '-'}${abs}`
 }
 
-function cellBackground(pnl) {
-  if (pnl == null || pnl === '') return {}
-  const n = toNumber(pnl)
-  if (n === 0) return { background: '#f5f6fa' }
-  const ratio = Math.min(Math.abs(n) / maxAbsPnl.value, 1)
-  const alpha = 0.18 + ratio * 0.52
-  return {
-    background: n > 0 ? `rgba(38, 166, 154, ${alpha})` : `rgba(239, 83, 80, ${alpha})`,
-  }
-}
-
 function getDayItem(current) {
   return pnlByDate.value.get(current.format('YYYY-MM-DD'))
 }
@@ -125,10 +117,6 @@ function isOtherMonthDay(current) {
 function isWeekday(current) {
   const day = current.day()
   return day >= 1 && day <= 5
-}
-
-function isToday(current) {
-  return current.format('YYYY-MM-DD') === dayjs().format('YYYY-MM-DD')
 }
 
 function shouldShowDayPnl(current) {
@@ -253,9 +241,7 @@ load()
               }"
               :style="dayCellBackground(current)"
             >
-              <div class="cell-date" :class="{ 'cell-date--today': isToday(current) }">
-                {{ current.date() }}
-              </div>
+              <div class="cell-date">{{ current.date() }}</div>
               <template v-if="shouldShowDayPnl(current)">
                 <div class="cell-pnl" :class="pnlClass(getDayItem(current)?.pnl)">
                   {{ formatCellPnl(getDayItem(current)?.pnl) }}
@@ -478,7 +464,7 @@ load()
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 2px;
+  gap: 6px;
   padding: 6px 4px;
   border-radius: 8px;
   text-align: center;
@@ -499,18 +485,6 @@ load()
   font-weight: 600;
   color: #131722;
   line-height: 1.2;
-}
-
-.day-cell .cell-date--today {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 26px;
-  height: 26px;
-  border-radius: 50%;
-  background: #fff;
-  color: #131722;
-  box-shadow: inset 0 0 0 1.5px #fff;
 }
 
 .month-cell {
@@ -534,7 +508,7 @@ load()
 }
 
 .cell-pnl {
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 700;
   line-height: 1.25;
   word-break: break-all;
@@ -644,7 +618,7 @@ load()
     height: 100%;
     padding: 2px 1px;
     border-radius: 0;
-    gap: 1px;
+    gap: 4px;
   }
 
   .month-cell .cell-body {
@@ -654,15 +628,16 @@ load()
   .day-cell .cell-date,
   .month-cell .cell-month,
   .cell-year,
-  .cell-pnl,
-  .cell-pct,
   .cell-empty {
     font-size: 10px;
   }
 
-  .day-cell .cell-date--today {
-    min-width: 18px;
-    height: 18px;
+  .cell-pnl {
+    font-size: 11px;
+  }
+
+  .cell-pct {
+    font-size: 9px;
   }
 
   .year-grid {
