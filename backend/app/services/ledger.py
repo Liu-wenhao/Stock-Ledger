@@ -636,7 +636,26 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
     open_pnl = sum((_dec(i["total_pnl"]) for i in open_items), ZERO)
     closed_pnl = sum((p.closed_cycles_pnl for p in state.positions.values()), ZERO)
     closed_cost = sum((p.closed_cycles_cost for p in state.positions.values()), ZERO)
-    open_pct = (open_pnl / holdings_value * Decimal("100")) if holdings_value > ZERO else ZERO
+    cost_open = sum((_dec(i["cost_basis"]) for i in open_items), ZERO)
+    investment_total = cost_open + closed_cost
+
+    # 累计盈亏不含手续费 = 持仓盈亏 + 清仓盈亏
+    total_pnl = open_pnl + closed_pnl
+
+    first_nav = _first_nav_row(db)
+    if first_nav:
+        initial_portfolio_base = _row_portfolio_base(first_nav)
+        initial_investment_base = _row_investment_base(first_nav)
+    else:
+        initial_portfolio_base = investment_total + cash
+        initial_investment_base = investment_total
+    if initial_portfolio_base <= ZERO:
+        initial_portfolio_base = Decimal("1")
+    if initial_investment_base <= ZERO:
+        initial_investment_base = Decimal("1")
+
+    total_pct = total_pnl / initial_portfolio_base * Decimal("100")
+    open_pct = open_pnl / initial_investment_base * Decimal("100")
     realized_pct = (closed_pnl / closed_cost * Decimal("100")) if closed_cost > ZERO else ZERO
 
     day_change = sum((_dec(i["day_change"]) for i in open_items if i["day_change"] is not None), ZERO)
@@ -655,18 +674,11 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
 
     net_invested = state.net_invested()
     if net_invested == ZERO:
-        # No Deposit rows: use gross buy notional as invested-capital proxy
         buy_notional = ZERO
         for t in trades:
             if t.side == "Buy":
                 buy_notional += _dec(t.qty) * _dec(t.fill_price)
-        cost_open = sum((_dec(i["cost_basis"]) for i in open_items), ZERO)
         net_invested = buy_notional if buy_notional > ZERO else (cost_open if cost_open > ZERO else Decimal("1"))
-
-    # 累计盈亏不含手续费 = 持仓盈亏 + 清仓盈亏
-    # 等价：现金 + 持仓市值 - 净入金 + 手续费（现金里已扣的手续费加回）
-    total_pnl = open_pnl + closed_pnl
-    total_pct = (total_pnl / abs(net_invested) * Decimal("100")) if net_invested != ZERO else ZERO
 
     day_change_pct = (day_change / prev_mv * Decimal("100")) if prev_mv > ZERO else ZERO
 
@@ -690,7 +702,7 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
         "holdings_value": holdings_value,
         "cash": cash,
         "unrealized_pnl": open_pnl,
-        "unrealized_pnl_percent": open_pct,
+        "unrealized_pnl_percent": open_pct.quantize(Decimal("0.01")),
         "day_change": day_change.quantize(Decimal("0.01")),
         "day_change_percent": day_change_pct.quantize(Decimal("0.01")),
         "realized_pnl": realized,
@@ -698,7 +710,7 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
         "dividends": state.dividends,
         "commissions": commissions,
         "total_pnl": total_pnl,
-        "total_pnl_percent": total_pct,
+        "total_pnl_percent": total_pct.quantize(Decimal("0.01")),
         "annualized_return": annualized,
         "currency": settings.base_currency,
         "as_of": datetime.utcnow(),
@@ -715,6 +727,54 @@ RANGE_DEFS = [
     ("1Y", "1年", 365),
     ("ALL", "全部", None),
 ]
+
+
+def _investment_total_from_state(state: PortfolioState, cost_open: Decimal) -> Decimal:
+    closed_cost = sum((p.closed_cycles_cost for p in state.positions.values()), ZERO)
+    total = cost_open + closed_cost
+    return total if total > ZERO else ZERO
+
+
+def _live_investment_total(db: Session, portfolio_id: int = 1) -> Decimal:
+    data = compute_holdings(db, portfolio_id, include_closed=True)
+    state: PortfolioState = data["state"]
+    cost_open = sum(
+        (_dec(i["cost_basis"]) for i in data["items"] if not i.get("closed")),
+        ZERO,
+    )
+    return _investment_total_from_state(state, cost_open)
+
+
+def _row_investment_total(row: DailyNav) -> Decimal:
+    investment_total = _dec(row.investment_total)
+    if investment_total <= ZERO:
+        holdings_val = _dec(row.holdings_value)
+        unrealized = _dec(row.total_pnl) - _dec(row.realized_pnl)
+        cost_open = holdings_val - unrealized
+        investment_total = cost_open if cost_open > ZERO else ZERO
+    return investment_total
+
+
+def _row_investment_base(row: DailyNav) -> Decimal:
+    inv = _row_investment_total(row)
+    if inv > ZERO:
+        return inv
+    # Pre-trade / cash-only start: use portfolio base so return stays meaningful
+    return _row_portfolio_base(row)
+
+
+def _row_portfolio_base(row: DailyNav) -> Decimal:
+    base = _row_investment_total(row) + _dec(row.cash)
+    return base if base > ZERO else Decimal("1")
+
+
+def _first_nav_row(db: Session, portfolio_id: int = 1) -> DailyNav | None:
+    return (
+        db.query(DailyNav)
+        .filter(DailyNav.portfolio_id == portfolio_id)
+        .order_by(DailyNav.nav_date.asc())
+        .first()
+    )
 
 
 def range_start(key: str, first_date: date | None) -> date:
@@ -738,7 +798,11 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
         .all()
     )
     if existing and not rebuild:
-        return existing
+        latest = existing[-1]
+        if _dec(latest.investment_total) == ZERO and _dec(latest.total_pnl) != ZERO:
+            rebuild = True
+        else:
+            return existing
 
     trades = load_trades(db, portfolio_id)
     if not trades:
@@ -788,6 +852,7 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
         cost_open = sum((p.cost_basis for p in state.positions.values() if p.quantity > 0), ZERO)
         unrealized = holdings_value - cost_open
         total_pnl = unrealized + state.realized_pnl
+        investment_total = _investment_total_from_state(state, cost_open)
         net_invested = state.net_invested()
         if net_invested == ZERO:
             net_invested = total_value - total_pnl
@@ -801,6 +866,7 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
             realized_pnl=state.realized_pnl,
             total_pnl=total_pnl,
             net_invested=net_invested,
+            investment_total=investment_total,
         )
         db.add(row)
         rows.append(row)
@@ -819,12 +885,11 @@ def nav_response(db: Session, range_key: str = "3M", mode: str = "value") -> dic
     rows = build_nav_series(db)
     # Align today's point with live summary so chart end == KPI cards
     summary = compute_summary(db)
-    net_invested = abs(_dec(summary.get("net_invested"))) or Decimal("1")
+    live_investment_total = _live_investment_total(db)
     live_value = _dec(summary["portfolio_value"])
     live_cash = _dec(summary["cash"])
     live_pnl = _dec(summary["total_pnl"])
     live_realized = _dec(summary["realized_pnl"])
-    live_return = _dec(summary["total_pnl_percent"])
 
     if rows:
         last = rows[-1]
@@ -835,6 +900,7 @@ def nav_response(db: Session, range_key: str = "3M", mode: str = "value") -> dic
             last.realized_pnl = live_realized
             last.holdings_value = live_value - live_cash
             last.net_invested = _dec(summary.get("net_invested"))
+            last.investment_total = live_investment_total
             db.add(last)
             db.commit()
             db.refresh(last)
@@ -850,6 +916,7 @@ def nav_response(db: Session, range_key: str = "3M", mode: str = "value") -> dic
                     realized_pnl=live_realized,
                     total_pnl=live_pnl,
                     net_invested=_dec(summary.get("net_invested")),
+                    investment_total=live_investment_total,
                 )
             ]
 
@@ -857,54 +924,121 @@ def nav_response(db: Session, range_key: str = "3M", mode: str = "value") -> dic
     start = range_start(range_key, first)
     filtered = [r for r in rows if r.nav_date >= start]
 
+    start_row = filtered[0] if filtered else None
+    start_pnl = _dec(start_row.total_pnl) if start_row else ZERO
+    start_portfolio_base = _row_portfolio_base(start_row) if start_row else Decimal("1")
+    start_investment_base = _row_investment_base(start_row) if start_row else Decimal("1")
+
+    first_row = rows[0] if rows else None
+    initial_pnl = _dec(first_row.total_pnl) if first_row else ZERO
+    initial_portfolio_base = _row_portfolio_base(first_row) if first_row else Decimal("1")
+    initial_investment_base = _row_investment_base(first_row) if first_row else Decimal("1")
+
+    live_period_pnl = live_pnl - start_pnl
+    live_all_pnl = live_pnl - initial_pnl
+    live_return = (live_period_pnl / start_portfolio_base * Decimal("100")).quantize(Decimal("0.01"))
+    live_holdings_return = (live_period_pnl / start_investment_base * Decimal("100")).quantize(
+        Decimal("0.01")
+    )
+    live_all_return = (live_all_pnl / initial_portfolio_base * Decimal("100")).quantize(Decimal("0.01"))
+    live_all_holdings_return = (live_all_pnl / initial_investment_base * Decimal("100")).quantize(
+        Decimal("0.01")
+    )
+
     points = []
     for r in filtered:
         value = _dec(r.total_value)
         cash = _dec(r.cash)
+        holdings_val = _dec(r.holdings_value)
         pnl = _dec(r.total_pnl)
-        # Portfolio return % (same definition as summary); cash return always 0
-        ret_pct = (pnl / net_invested * Decimal("100")) if net_invested != ZERO else ZERO
+        period_pnl = pnl - start_pnl
+        ret_pct = period_pnl / start_portfolio_base * Decimal("100")
+        holdings_pct = period_pnl / start_investment_base * Decimal("100")
         points.append(
             {
                 "date": r.nav_date,
                 "total_value": value,
                 "cash": cash,
+                "holdings_value": holdings_val,
                 "realized_pnl": r.realized_pnl,
                 "total_pnl": r.total_pnl,
                 "return_percent": ret_pct,
+                "holdings_percent": holdings_pct,
                 "cash_percent": ZERO,
             }
         )
 
     # Force last point to live summary (authoritative)
     if points:
+        live_holdings = live_value - live_cash
         points[-1]["total_value"] = live_value
         points[-1]["cash"] = live_cash
+        points[-1]["holdings_value"] = live_holdings
         points[-1]["total_pnl"] = live_pnl
         points[-1]["realized_pnl"] = live_realized
         points[-1]["return_percent"] = live_return
+        points[-1]["holdings_percent"] = live_holdings_return
         points[-1]["cash_percent"] = ZERO
 
+    empty_range = {
+        "return_percent": None,
+        "holdings_return_percent": None,
+        "cash_return_percent": None,
+        "pnl": None,
+        "holdings_pnl": None,
+        "cash_pnl": None,
+    }
     # Periods that require full window coverage (match TradingView empty dashes)
     strict_keys = {"6M", "YTD", "1Y"}
+    live_holdings = live_value - live_cash
     ranges = []
     for key, label, _ in RANGE_DEFS:
         rs = range_start(key, first)
         subset = [r for r in rows if r.nav_date >= rs]
         if len(subset) < 1:
-            ranges.append({"key": key, "label": label, "return_percent": None, "pnl": None})
+            ranges.append({"key": key, "label": label, **empty_range})
             continue
         # History shorter than requested window → show "—"
         if key in strict_keys and first > rs:
-            ranges.append({"key": key, "label": label, "return_percent": None, "pnl": None})
+            ranges.append({"key": key, "label": label, **empty_range})
             continue
-        first_ret = _dec(subset[0].total_pnl) / net_invested * Decimal("100")
-        last_ret = live_return
-        pnl = live_pnl - _dec(subset[0].total_pnl)
-        ret = last_ret - first_ret if key != "ALL" else live_return
+        start_row = subset[0]
+        start_investment = _row_investment_base(start_row)
+        start_cash = _dec(start_row.cash)
+        start_portfolio_base = _row_portfolio_base(start_row)
+        start_pnl_row = _dec(start_row.total_pnl)
+        period_pnl = live_pnl - start_pnl_row
         if key == "ALL":
             pnl = live_pnl
-        ranges.append({"key": key, "label": label, "return_percent": ret, "pnl": pnl})
+            ret = live_all_return
+            holdings_ret = live_all_holdings_return
+        else:
+            pnl = period_pnl
+            ret = (
+                period_pnl / start_portfolio_base * Decimal("100")
+                if start_portfolio_base > ZERO
+                else None
+            )
+            holdings_ret = (
+                period_pnl / start_investment * Decimal("100") if start_investment > ZERO else None
+            )
+        live_holdings = live_value - live_cash
+        start_holdings = _dec(start_row.holdings_value)
+        holdings_pnl = live_holdings - start_holdings
+        cash_pnl = live_cash - start_cash
+        cash_ret = ZERO
+        ranges.append(
+            {
+                "key": key,
+                "label": label,
+                "return_percent": ret,
+                "holdings_return_percent": holdings_ret,
+                "cash_return_percent": cash_ret,
+                "pnl": pnl,
+                "holdings_pnl": holdings_pnl,
+                "cash_pnl": cash_pnl,
+            }
+        )
 
     return {"mode": mode, "points": points, "ranges": ranges}
 
@@ -974,6 +1108,187 @@ def monthly_returns(db: Session, range_key: str = "3M") -> dict:
         )
 
     return {"items": items, "benchmark": settings.benchmark_symbol}
+
+
+def _build_daily_pnl_items(rows: list[DailyNav]) -> list[dict]:
+    all_items: list[dict] = []
+    prev_pnl = ZERO
+    for idx, row in enumerate(rows):
+        pnl = _dec(row.total_pnl)
+        day_pnl = ZERO if idx == 0 else pnl - prev_pnl
+        prev_pnl = pnl
+        prev_value = _dec(rows[idx - 1].total_value) if idx > 0 else _dec(row.total_value)
+        day_pct = (day_pnl / prev_value * Decimal("100")) if prev_value > ZERO else ZERO
+        all_items.append(
+            {
+                "date": row.nav_date,
+                "pnl": day_pnl.quantize(Decimal("0.01")),
+                "pnl_percent": day_pct.quantize(Decimal("0.01")),
+            }
+        )
+    return all_items
+
+
+def _pnl_period_summary(items: list[dict]) -> dict:
+    total = sum((item["pnl"] for item in items), ZERO)
+    profit_days = sum(1 for item in items if item["pnl"] > ZERO)
+    loss_days = sum(1 for item in items if item["pnl"] < ZERO)
+    flat_days = sum(1 for item in items if item["pnl"] == ZERO)
+    pnls = [item["pnl"] for item in items if item["pnl"] != ZERO]
+    best = max(pnls) if pnls else None
+    worst = min(pnls) if pnls else None
+    return {
+        "total_pnl": total.quantize(Decimal("0.01")),
+        "profit_days": profit_days,
+        "loss_days": loss_days,
+        "flat_days": flat_days,
+        "best_day_pnl": best.quantize(Decimal("0.01")) if best is not None else None,
+        "worst_day_pnl": worst.quantize(Decimal("0.01")) if worst is not None else None,
+    }
+
+
+def _aggregate_monthly(all_items: list[dict], rows_by_date: dict[date, DailyNav], year: int) -> list[dict]:
+    buckets: dict[int, Decimal] = {}
+    for item in all_items:
+        if item["date"].year != year:
+            continue
+        m = item["date"].month
+        buckets[m] = buckets.get(m, ZERO) + item["pnl"]
+    items = []
+    for m in sorted(buckets):
+        pnl = buckets[m]
+        base = _period_start_base(rows_by_date, date(year, m, 1))
+        pct = (pnl / base * Decimal("100")) if base > ZERO else ZERO
+        items.append(
+            {
+                "date": date(year, m, 1),
+                "pnl": pnl.quantize(Decimal("0.01")),
+                "pnl_percent": pct.quantize(Decimal("0.01")),
+            }
+        )
+    return items
+
+
+def _aggregate_yearly(all_items: list[dict], rows_by_date: dict[date, DailyNav]) -> list[dict]:
+    buckets: dict[int, Decimal] = {}
+    for item in all_items:
+        y = item["date"].year
+        buckets[y] = buckets.get(y, ZERO) + item["pnl"]
+    items = []
+    for y in sorted(buckets):
+        pnl = buckets[y]
+        base = _period_start_base(rows_by_date, date(y, 1, 1))
+        pct = (pnl / base * Decimal("100")) if base > ZERO else ZERO
+        items.append(
+            {
+                "date": date(y, 1, 1),
+                "pnl": pnl.quantize(Decimal("0.01")),
+                "pnl_percent": pct.quantize(Decimal("0.01")),
+            }
+        )
+    return items
+
+
+def _nav_row_at_or_before(rows_by_date: dict[date, DailyNav], target: date) -> DailyNav | None:
+    if target in rows_by_date:
+        return rows_by_date[target]
+    prior = [row for nav_date, row in rows_by_date.items() if nav_date <= target]
+    if not prior:
+        return None
+    return max(prior, key=lambda row: row.nav_date)
+
+
+def _period_start_base(rows_by_date: dict[date, DailyNav], period_start: date) -> Decimal:
+    row = _nav_row_at_or_before(rows_by_date, period_start)
+    if not row:
+        return ZERO
+    base = _row_investment_total(row) + _dec(row.cash)
+    if base <= ZERO:
+        base = _dec(row.total_value)
+    return base if base > ZERO else ZERO
+
+
+def daily_pnl_calendar(
+    db: Session,
+    portfolio_id: int = 1,
+    granularity: str = "day",
+    year: int | None = None,
+    month: int | None = None,
+) -> dict:
+    today = date.today()
+    granularity = granularity if granularity in {"day", "month", "year"} else "day"
+
+    rows = build_nav_series(db, portfolio_id=portfolio_id)
+    empty_year = year or today.year
+    empty_month = month or today.month
+    empty = {
+        "granularity": granularity,
+        "year": empty_year,
+        "month": empty_month if granularity == "day" else None,
+        "years": [empty_year],
+        "months": [empty_month],
+        "items": [],
+        "summary": _pnl_period_summary([]),
+    }
+    if not rows:
+        return empty
+
+    all_items = _build_daily_pnl_items(rows)
+    rows_by_date = {row.nav_date: row for row in rows}
+    years = sorted({item["date"].year for item in all_items})
+
+    if granularity == "day":
+        target_year = year if year is not None else today.year
+        if years and target_year not in years:
+            target_year = years[-1]
+        months = sorted({item["date"].month for item in all_items if item["date"].year == target_year})
+        if not months:
+            months = [today.month]
+        target_month = month if month is not None else today.month
+        if target_month not in months:
+            target_month = months[-1]
+        items = [
+            item
+            for item in all_items
+            if item["date"].year == target_year and item["date"].month == target_month
+        ]
+        return {
+            "granularity": granularity,
+            "year": target_year,
+            "month": target_month,
+            "years": years,
+            "months": months,
+            "items": items,
+            "summary": _pnl_period_summary(items),
+        }
+
+    if granularity == "month":
+        target_year = year if year is not None else today.year
+        if years and target_year not in years:
+            target_year = years[-1]
+        items = _aggregate_monthly(all_items, rows_by_date, target_year)
+        months = sorted({item["date"].month for item in all_items if item["date"].year == target_year})
+        return {
+            "granularity": granularity,
+            "year": target_year,
+            "month": None,
+            "years": years,
+            "months": months or [today.month],
+            "items": items,
+            "summary": _pnl_period_summary(items),
+        }
+
+    items = _aggregate_yearly(all_items, rows_by_date)
+    target_year = year if year is not None else (years[-1] if years else today.year)
+    return {
+        "granularity": granularity,
+        "year": target_year,
+        "month": None,
+        "years": years,
+        "months": [],
+        "items": items,
+        "summary": _pnl_period_summary(items),
+    }
 
 
 def daily_movers(db: Session, portfolio_id: int = 1) -> dict:

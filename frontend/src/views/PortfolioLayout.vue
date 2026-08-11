@@ -46,26 +46,49 @@ onMounted(() => {
       <a-button :loading="refreshing" @click="onRefresh()">刷新行情及盈亏</a-button>
     </div>
 
-    <SummaryCards :summary="store.summary" :loading="store.loading" />
-
-    <div class="panel main-panel">
-      <a-tabs v-model:activeKey="activeKey">
+    <div class="sticky-top">
+      <SummaryCards :summary="store.summary" :loading="store.loading" />
+      <a-tabs v-model:activeKey="activeKey" class="portfolio-tabs">
         <a-tab-pane key="overview" tab="概览" />
+        <a-tab-pane key="stats" tab="统计" />
         <a-tab-pane key="holdings" tab="持股" />
         <a-tab-pane key="trades" tab="交易" />
+        <a-tab-pane key="prices" tab="价格" />
         <a-tab-pane key="analysis" tab="分析" />
+        <a-tab-pane key="vibe" tab="AI 研究" />
       </a-tabs>
+    </div>
+
+    <div class="main-panel">
       <router-view :key="refreshVersion" @changed="store.loadSummary()" />
     </div>
   </div>
 </template>
 
 <style scoped>
+.sticky-top {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  margin-inline: -20px;
+  padding-inline: 20px;
+  background: rgba(255, 255, 255, 0.98);
+  backdrop-filter: blur(10px);
+}
+
+.sticky-top :deep(.portfolio-tabs .ant-tabs-content-holder) {
+  display: none;
+}
+
+.sticky-top :deep(.ant-tabs-nav) {
+  margin-bottom: 12px !important;
+}
+
 .main-panel {
   width: 100%;
   max-width: none;
   max-height: none;
-  padding-top: 4px;
+  padding-top: 16px;
 }
 
 @media (max-width: 800px) {
@@ -84,13 +107,10 @@ onMounted(() => {
     line-height: 1.2;
   }
 
-  .main-panel > :deep(.ant-tabs-nav) {
-    position: sticky;
-    z-index: 20;
-    top: 0;
-    margin-inline: -16px !important;
-    padding-inline: 16px;
-    background: rgba(255, 255, 255, 0.96);
+  .sticky-top {
+    margin-inline: calc(-1 * max(16px, env(safe-area-inset-left)))
+      calc(-1 * max(16px, env(safe-area-inset-right)));
+    padding-inline: max(16px, env(safe-area-inset-left)) max(16px, env(safe-area-inset-right));
   }
 }
 
@@ -105,9 +125,10 @@ onMounted(() => {
     font-size: 13px;
   }
 
-  .main-panel > :deep(.ant-tabs-nav) {
-    margin-inline: calc(-1 * max(12px, env(safe-area-inset-left))) !important;
-    padding-inline: max(12px, env(safe-area-inset-left));
+  .sticky-top {
+    margin-inline: calc(-1 * max(12px, env(safe-area-inset-left)))
+      calc(-1 * max(12px, env(safe-area-inset-right)));
+    padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right));
   }
 }
 </style>

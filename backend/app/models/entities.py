@@ -84,3 +84,4 @@ class DailyNav(Base):
     realized_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=0)
     total_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=0)
     net_invested: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=0)
+    investment_total: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=0)

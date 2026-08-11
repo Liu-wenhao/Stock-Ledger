@@ -9,6 +9,7 @@ from app.schemas.portfolio import (
     CumulativeHoldingRow,
     CumulativeHoldingsResponse,
     DailyMoversResponse,
+    DailyPnlCalendarResponse,
     HoldingRow,
     HoldingsResponse,
     MonthlyReturnsResponse,
@@ -42,6 +43,16 @@ def nav(
 @router.get("/portfolio/daily-movers", response_model=DailyMoversResponse)
 def movers(db: Session = Depends(get_db)):
     return ledger.daily_movers(db)
+
+
+@router.get("/portfolio/daily-pnl", response_model=DailyPnlCalendarResponse)
+def daily_pnl(
+    granularity: str = Query("day"),
+    year: int | None = None,
+    month: int | None = None,
+    db: Session = Depends(get_db),
+):
+    return ledger.daily_pnl_calendar(db, granularity=granularity, year=year, month=month)
 
 
 @router.get("/portfolio/total-movers", response_model=DailyMoversResponse)

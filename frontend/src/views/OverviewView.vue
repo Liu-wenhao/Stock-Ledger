@@ -1,8 +1,9 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
-import { fetchMovers, fetchNav, fetchPeriodPerformance } from '@/api/portfolio'
+import { fetchMovers, fetchNav, fetchPeriodPerformance, refreshMarket } from '@/api/portfolio'
 import { formatMoney, formatPct, pnlClass, toNumber } from '@/utils/format'
+import { isUsMarketOpen } from '@/utils/marketHours'
 import {
   axisLabelStyle,
   axisLineStyle,
@@ -14,10 +15,56 @@ import {
 import SymbolCell from '@/components/SymbolCell.vue'
 import { usePortfolioStore } from '@/stores/portfolio'
 
+const emit = defineEmits(['changed'])
 const store = usePortfolioStore()
 const mode = ref('value')
-const range = ref('3M')
+const range = ref('1W')
 const periodPerformance = ref(null)
+
+const CHART_SERIES = [
+  {
+    valueKey: 'total_value',
+    pctKey: 'return_percent',
+    labelValue: '组合',
+    labelPct: '组合',
+    color: '#2962ff',
+    z: 3,
+    area: true,
+    markLine: true,
+    endLabel: true,
+  },
+  {
+    valueKey: 'holdings_value',
+    pctKey: 'holdings_percent',
+    labelValue: '投资',
+    labelPct: '投资',
+    color: '#f59e0b',
+    z: 2,
+    area: false,
+    markLine: false,
+    endLabel: true,
+  },
+  {
+    valueKey: 'cash',
+    pctKey: 'cash_percent',
+    labelValue: '现金',
+    labelPct: '现金',
+    color: '#26a69a',
+    z: 1,
+    area: false,
+    markLine: false,
+    endLabel: true,
+  },
+  {
+    valueKey: 'period_pnl',
+    labelValue: '盈亏金额',
+    color: '#ef5350',
+    z: 2,
+    area: false,
+    zeroLine: true,
+    endLabel: true,
+  },
+]
 
 function formatPnlByMode(amount, percent) {
   if (mode.value === 'percent') return formatPct(percent)
@@ -64,6 +111,10 @@ const totalMovers = computed(() => periodPerformance.value?.cumulative || { winn
 const chartRef = ref(null)
 const DAILY_LIMIT = 5
 let chart
+let quoteRefreshTimer
+let quoteRefreshBusy = false
+
+const QUOTE_REFRESH_INTERVAL_MS = 10_000
 
 function moverMetric(item) {
   return mode.value === 'percent' ? toNumber(item.change_percent) : toNumber(item.change)
@@ -141,19 +192,106 @@ async function load() {
   renderChart()
 }
 
+async function autoRefreshQuotes() {
+  if (quoteRefreshBusy || !isUsMarketOpen()) return
+  quoteRefreshBusy = true
+  try {
+    await refreshMarket(true)
+    await load()
+    emit('changed')
+  } catch {
+    // Keep the timer alive; the next market-open interval can retry.
+  } finally {
+    quoteRefreshBusy = false
+  }
+}
+
+function startQuoteRefreshTimer() {
+  if (quoteRefreshTimer) return
+  quoteRefreshTimer = window.setInterval(autoRefreshQuotes, QUOTE_REFRESH_INTERVAL_MS)
+}
+
+function stopQuoteRefreshTimer() {
+  if (!quoteRefreshTimer) return
+  window.clearInterval(quoteRefreshTimer)
+  quoteRefreshTimer = undefined
+}
+
+function formatRangeChip(r) {
+  if (mode.value === 'percent') {
+    return r.return_percent == null ? '—' : formatPct(r.return_percent)
+  }
+  return r.pnl == null ? '—' : formatMoney(r.pnl).replace(' USD', '')
+}
+
+function rangeChipClass(r) {
+  return mode.value === 'percent' ? pnlClass(r.return_percent) : pnlClass(r.pnl)
+}
+
+function enrichChartPoints(points) {
+  const startPnl = points.length ? toNumber(points[0].total_pnl) : 0
+  return points.map((p) => ({
+    ...p,
+    period_pnl: toNumber(p.total_pnl) - startPnl,
+  }))
+}
+
+function activeChartSeries(isPct) {
+  if (isPct) return CHART_SERIES.filter((cfg) => cfg.pctKey)
+  return CHART_SERIES.filter((cfg) => cfg.valueKey)
+}
+
+function buildChartSeries(points, isPct, compact) {
+  const enriched = enrichChartPoints(points)
+  return activeChartSeries(isPct).map((cfg) => {
+    const dataKey = isPct ? cfg.pctKey : cfg.valueKey
+    const data = enriched.map((p) => toNumber(p[dataKey]))
+    const lastValue = data.length ? data[data.length - 1] : null
+    const name = isPct ? `${cfg.labelPct}收益率` : cfg.labelValue
+    return {
+      name,
+      type: 'line',
+      data,
+      smooth: 0.25,
+      showSymbol: false,
+      z: cfg.z,
+      areaStyle: cfg.area
+        ? {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: 'rgba(41,98,255,0.22)' },
+              { offset: 1, color: 'rgba(41,98,255,0.02)' },
+            ]),
+          }
+        : undefined,
+      lineStyle: { color: cfg.color, width: 2 },
+      itemStyle: { color: cfg.color },
+      markLine: (isPct && cfg.markLine) || (!isPct && cfg.zeroLine) ? zeroMarkLine : undefined,
+      endLabel:
+        lastValue == null || compact || !cfg.endLabel
+          ? undefined
+          : {
+              show: true,
+              formatter: () => (isPct ? formatPct(lastValue) : moneyAxisFormatter(lastValue)),
+              color: '#fff',
+              backgroundColor: cfg.color,
+              padding: [3, 6],
+              borderRadius: 3,
+              fontSize: 11,
+              fontWeight: 600,
+              distance: 6,
+            },
+    }
+  })
+}
+
 function renderChart() {
   if (!chartRef.value) return
   if (!chart) chart = echarts.init(chartRef.value)
 
   const compact = window.innerWidth <= 560
-
   const points = nav.value.points || []
   const isPct = mode.value === 'percent'
   const dates = points.map((p) => p.date)
-  const main = points.map((p) => toNumber(isPct ? p.return_percent : p.total_value))
-  const secondary = points.map((p) => toNumber(isPct ? p.cash_percent : p.cash))
-  const lastMain = main.length ? main[main.length - 1] : null
-  const lastSec = secondary.length ? secondary[secondary.length - 1] : null
 
   chart.setOption(
     {
@@ -190,61 +328,7 @@ function renderChart() {
           formatter: (v) => (isPct ? pctAxisFormatter(v) : moneyAxisFormatter(v)),
         },
       },
-      series: [
-        {
-          name: isPct ? '收益率' : '投资组合金额',
-          type: 'line',
-          data: main,
-          smooth: 0.25,
-          showSymbol: false,
-          z: 3,
-          areaStyle: {
-            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(41,98,255,0.22)' },
-              { offset: 1, color: 'rgba(41,98,255,0.02)' },
-            ]),
-          },
-          lineStyle: { color: '#2962ff', width: 2 },
-          itemStyle: { color: '#2962ff' },
-          markLine: zeroMarkLine,
-          endLabel: lastMain == null || compact
-            ? undefined
-            : {
-                show: true,
-                formatter: () => (isPct ? formatPct(lastMain) : moneyAxisFormatter(lastMain)),
-                color: '#fff',
-                backgroundColor: '#2962ff',
-                padding: [3, 6],
-                borderRadius: 3,
-                fontSize: 11,
-                fontWeight: 600,
-                distance: 6,
-              },
-        },
-        {
-          name: isPct ? '现金收益率' : '现金',
-          type: 'line',
-          data: secondary,
-          smooth: 0.25,
-          showSymbol: false,
-          z: 2,
-          lineStyle: { color: '#26a69a', width: 2 },
-          itemStyle: { color: '#26a69a' },
-          endLabel: lastSec == null || compact
-            ? undefined
-            : {
-                show: true,
-                formatter: () => (isPct ? formatPct(lastSec) : moneyAxisFormatter(lastSec)),
-                color: '#fff',
-                backgroundColor: '#26a69a',
-                padding: [3, 6],
-                borderRadius: 3,
-                fontSize: 11,
-                fontWeight: 600,
-                distance: 6,
-              },
-        },
-      ],
+      series: buildChartSeries(points, isPct, compact),
     },
     true,
   )
@@ -258,9 +342,11 @@ function onResize() {
 watch([mode, range], load)
 onMounted(() => {
   load()
+  startQuoteRefreshTimer()
   window.addEventListener('resize', onResize)
 })
 onUnmounted(() => {
+  stopQuoteRefreshTimer()
   window.removeEventListener('resize', onResize)
   chart?.dispose()
   chart = null
@@ -302,8 +388,8 @@ onUnmounted(() => {
           @click="range = r.key"
         >
           <div class="r-label">{{ r.label }}</div>
-          <div class="r-value" :class="pnlClass(r.return_percent)">
-            {{ r.return_percent == null ? '—' : formatPct(r.return_percent) }}
+          <div class="r-value" :class="rangeChipClass(r)">
+            {{ formatRangeChip(r) }}
           </div>
         </button>
       </div>

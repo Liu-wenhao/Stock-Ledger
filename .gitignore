@@ -8,5 +8,7 @@ __pycache__/
 *.log
 .idea/
 .vscode/
+.cursor/
+.venv-vibe
 frontend/dist/
 backend/.venv/

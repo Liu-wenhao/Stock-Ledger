@@ -153,9 +153,11 @@ class NavPoint(BaseModel):
     date: date
     total_value: Decimal
     cash: Decimal = Decimal("0")
+    holdings_value: Decimal = Decimal("0")
     realized_pnl: Decimal
     total_pnl: Decimal
     return_percent: Decimal | None = None
+    holdings_percent: Decimal | None = None
     cash_percent: Decimal | None = None
 
 
@@ -163,7 +165,11 @@ class RangeStat(BaseModel):
     key: str
     label: str
     return_percent: Decimal | None = None
+    holdings_return_percent: Decimal | None = None
+    cash_return_percent: Decimal | None = None
     pnl: Decimal | None = None
+    holdings_pnl: Decimal | None = None
+    cash_pnl: Decimal | None = None
 
 
 class NavSeriesResponse(BaseModel):
@@ -214,6 +220,31 @@ class MonthlyReturnsResponse(BaseModel):
 class ProfitSeriesResponse(BaseModel):
     points: list[NavPoint]
     ranges: list[RangeStat]
+
+
+class DailyPnlItem(BaseModel):
+    date: date
+    pnl: Decimal
+    pnl_percent: Decimal = Decimal("0")
+
+
+class DailyPnlSummary(BaseModel):
+    total_pnl: Decimal = Decimal("0")
+    profit_days: int = 0
+    loss_days: int = 0
+    flat_days: int = 0
+    best_day_pnl: Decimal | None = None
+    worst_day_pnl: Decimal | None = None
+
+
+class DailyPnlCalendarResponse(BaseModel):
+    granularity: str = "day"
+    year: int
+    month: int | None = None
+    years: list[int]
+    months: list[int] = Field(default_factory=list)
+    items: list[DailyPnlItem]
+    summary: DailyPnlSummary
 
 
 class PerformanceItem(BaseModel):

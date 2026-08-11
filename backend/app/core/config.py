@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     default_portfolio_id: int = 1
     default_portfolio_name: str = "我的投资组合"
     base_currency: str = "USD"
+    vibe_trading_url: str = "http://127.0.0.1:8899"
+    vibe_trading_api_key: str | None = None
+    vibe_trading_timeout_seconds: int = 300
 
     @property
     def cors_origin_list(self) -> list[str]:

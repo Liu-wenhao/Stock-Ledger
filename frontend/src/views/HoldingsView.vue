@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
 import { fetchHoldings, fetchTrades, refreshMarket } from '@/api/portfolio'
@@ -10,8 +10,10 @@ import { isUsMarketOpen } from '@/utils/marketHours'
 import { useTableScrollY } from '@/composables/useTableScroll'
 
 const router = useRouter()
+const route = useRoute()
 
 const emit = defineEmits(['changed'])
+const isPricePage = computed(() => route.name === 'prices')
 const subTab = ref('positions')
 const keyword = ref('')
 const includeClosed = ref(false)
@@ -101,8 +103,6 @@ function formatCloseDate(v) {
   return d.isValid() ? d.format('MM-DD HH:mm:ss') : ''
 }
 
-const reserved = ['financials', 'risk', 'technical']
-
 async function load({ silent = false } = {}) {
   if (!silent) loading.value = true
   try {
@@ -110,7 +110,6 @@ async function load({ silent = false } = {}) {
     const isCumulative = subTab.value === 'cumulative'
     data.value = await fetchHoldings({
       view: isClosed ? 'closed' : isCumulative ? 'cumulative' : 'positions',
-      // 持仓/价格始终只看当前持仓；表现页仍可用「显示已清仓」
       include_closed: subTab.value === 'performance' ? includeClosed.value : false,
       q: keyword.value || undefined,
     })
@@ -922,7 +921,17 @@ function onViewportResize() {
   if (priceModalOpen.value) renderPriceChart()
 }
 
+watch(
+  () => route.name,
+  (name) => {
+    subTab.value = name === 'prices' ? 'price' : subTab.value === 'price' ? 'positions' : subTab.value
+    pagination.current = 1
+    load()
+  },
+)
+
 watch([subTab, includeClosed], () => {
+  if (isPricePage.value) return
   pagination.current = 1
   load()
 })
@@ -933,6 +942,7 @@ watch(priceModalOpen, (open) => {
   if (!open) disposePriceChart()
 })
 onMounted(() => {
+  subTab.value = route.name === 'prices' ? 'price' : 'positions'
   load()
   startQuoteRefreshTimer()
   window.addEventListener('resize', onViewportResize)
@@ -950,22 +960,14 @@ onUnmounted(() => {
 
 <template>
   <div class="holdings-view">
-    <a-tabs v-model:activeKey="subTab" size="small">
+    <a-tabs v-if="!isPricePage" v-model:activeKey="subTab" size="small">
       <a-tab-pane key="positions" tab="持仓" />
       <a-tab-pane key="cumulative" tab="累计" />
       <a-tab-pane key="closed" tab="清仓" />
-      <a-tab-pane key="price" tab="价格" />
       <a-tab-pane key="performance" tab="表现" />
-      <a-tab-pane key="financials" tab="财务指标" />
-      <a-tab-pane key="risk" tab="风险" />
-      <a-tab-pane key="technical" tab="技术指标" />
     </a-tabs>
 
-    <div v-if="reserved.includes(subTab)" class="empty-tab">
-      <a-empty description="即将推出（二期）" />
-    </div>
-
-    <template v-else-if="subTab === 'performance'">
+    <template v-if="!isPricePage && subTab === 'performance'">
       <div class="toolbar">
         <a-radio-group v-model:value="perfFilter" button-style="solid">
           <a-radio-button value="all">全部</a-radio-button>
@@ -999,7 +1001,7 @@ onUnmounted(() => {
       </div>
     </template>
 
-    <template v-else-if="subTab === 'cumulative'">
+    <template v-else-if="!isPricePage && subTab === 'cumulative'">
       <div class="toolbar">
         <a-input-search
           v-model:value="keyword"
@@ -1128,7 +1130,7 @@ onUnmounted(() => {
       </a-table>
     </template>
 
-    <template v-else-if="subTab === 'closed'">
+    <template v-else-if="!isPricePage && subTab === 'closed'">
       <div class="toolbar">
         <a-input-search
           v-model:value="keyword"
