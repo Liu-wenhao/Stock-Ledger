@@ -109,7 +109,6 @@ const holdingMovers = computed(() => periodPerformance.value?.holding || { winne
 const closedMovers = computed(() => periodPerformance.value?.closed || { winners: [], losers: [] })
 const totalMovers = computed(() => periodPerformance.value?.cumulative || { winners: [], losers: [] })
 const chartRef = ref(null)
-const DAILY_LIMIT = 5
 let chart
 let quoteRefreshTimer
 let quoteRefreshBusy = false
@@ -137,7 +136,7 @@ function uniqueBySymbol(list) {
   return [...map.values()]
 }
 
-function rankMovers(list, direction, limit = null) {
+function rankMovers(list, direction) {
   const arr = uniqueBySymbol(list).filter((i) => {
     const v = moverMetric(i)
     return direction === 'up' ? v > 0 : v < 0
@@ -145,7 +144,7 @@ function rankMovers(list, direction, limit = null) {
   arr.sort((a, b) =>
     direction === 'up' ? moverMetric(b) - moverMetric(a) : moverMetric(a) - moverMetric(b),
   )
-  return limit == null ? arr : arr.slice(0, limit)
+  return arr
 }
 
 const dailyPool = computed(() =>
@@ -160,8 +159,10 @@ const closedPool = computed(() =>
 const totalPool = computed(() =>
   uniqueBySymbol([...(totalMovers.value.winners || []), ...(totalMovers.value.losers || [])]),
 )
-const dailyWinners = computed(() => rankMovers(dailyPool.value, 'up', DAILY_LIMIT))
-const dailyLosers = computed(() => rankMovers(dailyPool.value, 'down', DAILY_LIMIT))
+// 每日盈利 / 每日亏损：列出全部持仓（涨的进盈利、跌的进亏损），
+// 不再只截前 5 名 —— 那样持仓一多就看不到大部分股票。
+const dailyWinners = computed(() => rankMovers(dailyPool.value, 'up'))
+const dailyLosers = computed(() => rankMovers(dailyPool.value, 'down'))
 const holdingWinners = computed(() => rankMovers(holdingPool.value, 'up'))
 const holdingLosers = computed(() => rankMovers(holdingPool.value, 'down'))
 const closedWinners = computed(() => rankMovers(closedPool.value, 'up'))

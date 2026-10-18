@@ -360,6 +360,14 @@ def compute_holdings(
             invested = cost + pos.realized_cost
             trade_count = pos.cycle_trade_count
             cycle_started_at = pos.cycle_started_at
+            # Displayed 平均价格/成本值 use the break-even basis, so the row agrees
+            # with 总盈亏 (which already includes this cycle's realized P/L):
+            #   (last_price - display_avg) * quantity == total_pnl
+            # Realized losses raise the effective cost, realized gains lower it.
+            # The raw moving-average lot values stay on lot_avg_price/lot_cost_basis
+            # because 投资总额 and the NAV series must keep counting money actually in.
+            display_cost = cost - pos.realized_pnl
+            display_avg = display_cost / pos.quantity
             if invested > ZERO:
                 pnl_pct = pnl / invested * Decimal("100")
             elif pos.avg_price > ZERO and last is not None:
@@ -377,6 +385,9 @@ def compute_holdings(
                 pos.closed_cycles[0].started_at if pos.closed_cycles else pos.last_cycle_started_at
             )
             pnl_pct = (pnl / invested * Decimal("100")) if invested > ZERO else ZERO
+            # Fully closed: no open lot, so break-even collapses to the raw values.
+            display_cost = cost
+            display_avg = pos.avg_price
 
         day_chg, day_pct = (None, None)
         if not closed:
@@ -397,10 +408,12 @@ def compute_holdings(
             "logo_url": metas.get(sym).logo_url if metas.get(sym) else None,
             "exchange": exchange_of(sym),
             "quantity": pos.quantity,
-            "avg_price": pos.avg_price,
+            "avg_price": display_avg,
             "last_price": last,
             "price_as_of": q.get("price_as_of"),
-            "cost_basis": cost,
+            "cost_basis": display_cost,
+            "lot_avg_price": pos.avg_price,
+            "lot_cost_basis": cost,
             "market_value": mv,
             "invested": invested,
             "total_pnl": pnl,
@@ -484,6 +497,11 @@ def compute_closed_holdings(db: Session, portfolio_id: int = 1) -> dict:
                     "realized_pnl_percent": pct.quantize(Decimal("0.01")),
                     "buy_amount": cyc.buy_amount,
                     "sell_amount": cyc.sell_amount,
+                    "avg_price": (
+                        cyc.buy_amount / cyc.buy_quantity
+                        if cyc.buy_quantity > ZERO
+                        else ZERO
+                    ),
                 }
             )
         trade_count = sum(c["trade_count"] for c in cycles)
@@ -491,6 +509,7 @@ def compute_closed_holdings(db: Session, portfolio_id: int = 1) -> dict:
         realized_pnl = sum((c["realized_pnl"] for c in cycles), ZERO)
         buy_amount = sum((c["buy_amount"] for c in cycles), ZERO)
         sell_amount = sum((c["sell_amount"] for c in cycles), ZERO)
+        buy_quantity = sum((cyc.buy_quantity for cyc in pos.closed_cycles), ZERO)
         pnl_pct = (
             (realized_pnl / realized_cost * Decimal("100")) if realized_cost > ZERO else ZERO
         )
@@ -507,6 +526,7 @@ def compute_closed_holdings(db: Session, portfolio_id: int = 1) -> dict:
                 "realized_pnl_percent": pnl_pct.quantize(Decimal("0.01")),
                 "buy_amount": buy_amount,
                 "sell_amount": sell_amount,
+                "avg_price": buy_amount / buy_quantity if buy_quantity > ZERO else ZERO,
                 "currently_open": pos.quantity > ZERO,
                 "cycles": cycles,
             }
@@ -582,7 +602,7 @@ def compute_cumulative_holdings(db: Session, portfolio_id: int = 1) -> dict:
                 "started_at": pos.cycle_started_at,
                 "ended_at": None,
                 "trade_count": pos.cycle_trade_count,
-                "avg_price": pos.avg_price,
+                "avg_price": _dec(row["avg_price"]),
                 "price": row["last_price"],
                 "cost": open_cost,
                 "pnl": open_pnl,
@@ -590,23 +610,28 @@ def compute_cumulative_holdings(db: Session, portfolio_id: int = 1) -> dict:
             }
         )
 
-        # Lifetime break-even average for the remaining position. Realized
-        # losses raise the effective cost; realized profits lower it.
-        # Invariant:
-        #   (last_price - cumulative_avg_price) * current_quantity
-        #   == lifetime cumulative P/L (when last_price is available).
+        # Lifetime break-even ("diluted") basis for the remaining position.
+        # Realized losses raise the effective cost; realized profits lower it.
+        # Everything in this row is expressed on that one basis, so the row ties
+        # out:  cost = avg_price * quantity,  total_pnl = mv - cost,  pct = pnl / cost.
+        # It can go negative once banked profits exceed what is still at risk.
         lifetime_realized_pnl = pos.closed_cycles_pnl + pos.realized_pnl
         effective_cost_basis = pos.cost_basis - lifetime_realized_pnl
         cumulative_avg_price = (
             effective_cost_basis / pos.quantity if pos.quantity > ZERO else ZERO
         )
 
-        cumulative_cost = pos.closed_cycles_cost + open_cost
+        # cost is the diluted basis itself (= net cash still in this name:
+        # lifetime buys minus lifetime sells). The lifetime invested figure is
+        # deliberately NOT used here: pairing it with avg_price/total_pnl above
+        # would mix two bases in one row.
+        cumulative_cost = effective_cost_basis
         cumulative_pnl = pos.closed_cycles_pnl + open_pnl
+        # A paid-off position (net cash out <= 0) has no meaningful return rate.
         cumulative_pct = (
-            cumulative_pnl / cumulative_cost * Decimal("100")
+            (cumulative_pnl / cumulative_cost * Decimal("100")).quantize(Decimal("0.01"))
             if cumulative_cost > ZERO
-            else ZERO
+            else None
         )
         trade_count = sum(c["trade_count"] for c in cycles)
         items.append(
@@ -622,7 +647,7 @@ def compute_cumulative_holdings(db: Session, portfolio_id: int = 1) -> dict:
                 "price_as_of": row.get("price_as_of"),
                 "cost": cumulative_cost,
                 "total_pnl": cumulative_pnl,
-                "total_pnl_percent": cumulative_pct.quantize(Decimal("0.01")),
+                "total_pnl_percent": cumulative_pct,
                 "cycles": cycles,
             }
         )
@@ -659,26 +684,36 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
     open_pnl = sum((_dec(i["total_pnl"]) for i in open_items), ZERO)
     closed_pnl = sum((p.closed_cycles_pnl for p in state.positions.values()), ZERO)
     closed_cost = sum((p.closed_cycles_cost for p in state.positions.values()), ZERO)
-    cost_open = sum((_dec(i["cost_basis"]) for i in open_items), ZERO)
+    cost_open = sum((_dec(i["lot_cost_basis"]) for i in open_items), ZERO)
     investment_total = cost_open + closed_cost
 
-    # 累计盈亏不含手续费 = 持仓盈亏 + 清仓盈亏
-    total_pnl = open_pnl + closed_pnl
+    trades = load_trades(db, portfolio_id)
+    commissions = sum((_dec(t.commission) for t in trades), ZERO)
+
+    # 累计盈亏（账户口径）：期末总资产 - 累计净入金。
+    # 该口径与「投资组合金额」及累计本金直接对账，并自动包含股息与手续费。
+    net_invested = state.net_invested()
+    if state.deposits != ZERO or state.withdrawals != ZERO:
+        total_pnl = portfolio_value - net_invested
+    else:
+        # 缺少出入金流水时（例如仅导入买卖记录），退回交易口径。
+        total_pnl = open_pnl + closed_pnl - commissions
 
     first_nav = _first_nav_row(db)
     if first_nav:
         initial_portfolio_base = _row_portfolio_base(first_nav)
-        initial_investment_base = _row_investment_base(first_nav)
     else:
         initial_portfolio_base = investment_total + cash
-        initial_investment_base = investment_total
     if initial_portfolio_base <= ZERO:
         initial_portfolio_base = Decimal("1")
-    if initial_investment_base <= ZERO:
-        initial_investment_base = Decimal("1")
 
-    total_pct = total_pnl / initial_portfolio_base * Decimal("100")
-    open_pct = open_pnl / initial_investment_base * Decimal("100")
+    # 累计收益率分母：有出入金时用累计净入金（本金），否则沿用期初资产。
+    pct_base = net_invested if net_invested > ZERO else initial_portfolio_base
+    total_pct = total_pnl / pct_base * Decimal("100")
+    # 持仓盈亏比例与「投资组合金额」卡片使用同一分母：当前持仓市值。
+    open_pct = (
+        open_pnl / holdings_value * Decimal("100") if holdings_value > ZERO else ZERO
+    )
     realized_pct = (closed_pnl / closed_cost * Decimal("100")) if closed_cost > ZERO else ZERO
 
     day_change = sum((_dec(i["day_change"]) for i in open_items if i["day_change"] is not None), ZERO)
@@ -692,10 +727,6 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
 
     realized = closed_pnl
 
-    trades = load_trades(db, portfolio_id)
-    commissions = sum((_dec(t.commission) for t in trades), ZERO)
-
-    net_invested = state.net_invested()
     if net_invested == ZERO:
         buy_notional = ZERO
         for t in trades:
@@ -762,7 +793,7 @@ def _live_investment_total(db: Session, portfolio_id: int = 1) -> Decimal:
     data = compute_holdings(db, portfolio_id, include_closed=True)
     state: PortfolioState = data["state"]
     cost_open = sum(
-        (_dec(i["cost_basis"]) for i in data["items"] if not i.get("closed")),
+        (_dec(i["lot_cost_basis"]) for i in data["items"] if not i.get("closed")),
         ZERO,
     )
     return _investment_total_from_state(state, cost_open)

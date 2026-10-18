@@ -40,9 +40,14 @@ const router = createRouter({
           component: () => import('@/views/AnalysisView.vue'),
         },
         {
-          path: 'vibe',
-          name: 'vibe',
-          component: () => import('@/views/VibeTradingView.vue'),
+          path: 'review',
+          name: 'review',
+          component: () => import('@/views/ReviewView.vue'),
+        },
+        {
+          path: 'strategy',
+          name: 'strategy',
+          component: () => import('@/views/StrategyView.vue'),
         },
       ],
     },

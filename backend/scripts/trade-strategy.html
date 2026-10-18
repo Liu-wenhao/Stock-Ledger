@@ -1,0 +1,960 @@
+<title>交易复盘与买卖纪律</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+
+<style>
+/* Layout: single reading column with a full-bleed stat band; charts sit on a
+   quiet card surface, prose runs at ~68ch. */
+:root {
+  color-scheme: light;
+  --bg: #f7f6f2;
+  --surface: #fffefb;
+  --surface-sunk: #efeee8;
+  --ink: #141614;
+  --ink-2: #4a4f4b;
+  --ink-3: #7b817c;
+  --rule: #ddddd4;
+  --rule-strong: #c4c6bb;
+  --accent: #0f6b63;
+  --accent-soft: #d9ebe7;
+  --neg: #b4322c;
+  --neg-soft: #f4e0dd;
+  --pos: #2f6d3a;
+  --pos-soft: #e0eee0;
+  --warn: #9a6512;
+  --warn-soft: #f6ead2;
+  --shadow: 0 1px 2px rgba(20,22,20,.05), 0 8px 24px -18px rgba(20,22,20,.35);
+
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121413;
+    --surface: #191c1a;
+    --surface-sunk: #202422;
+    --ink: #eceee9;
+    --ink-2: #b3b8b1;
+    --ink-3: #868c85;
+    --rule: #2a2f2c;
+    --rule-strong: #3a403c;
+    --accent: #5fc0b0;
+    --accent-soft: #1d3833;
+    --neg: #e4837b;
+    --neg-soft: #3a2320;
+    --pos: #7cc488;
+    --pos-soft: #22331f;
+    --warn: #d9a63c;
+    --warn-soft: #332a17;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -18px rgba(0,0,0,.9);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121413;
+  --surface: #191c1a;
+  --surface-sunk: #202422;
+  --ink: #eceee9;
+  --ink-2: #b3b8b1;
+  --ink-3: #868c85;
+  --rule: #2a2f2c;
+  --rule-strong: #3a403c;
+  --accent: #5fc0b0;
+  --accent-soft: #1d3833;
+  --neg: #e4837b;
+  --neg-soft: #3a2320;
+  --pos: #7cc488;
+  --pos-soft: #22331f;
+  --warn: #d9a63c;
+  --warn-soft: #332a17;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -18px rgba(0,0,0,.9);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 1080px; margin-inline: auto; }
+
+/* ---------- masthead ---------- */
+.masthead {
+  padding-block: clamp(40px, 7vw, 76px) 0;
+  border-bottom: 1px solid var(--rule-strong);
+}
+.kicker {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 16px;
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: 20px;
+}
+.kicker .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; }
+h1 {
+  font-size: clamp(30px, 5.2vw, 52px); line-height: 1.08; letter-spacing: -.02em;
+  font-weight: 600; margin: 0 0 18px; text-wrap: balance; max-width: 20ch;
+}
+.lede { font-size: clamp(16px, 2vw, 18.5px); color: var(--ink-2); max-width: 62ch; margin: 0 0 36px; }
+.lede strong { color: var(--ink); font-weight: 600; }
+
+/* ---------- hero number ---------- */
+.hero-band {
+  display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 28px 48px; align-items: end;
+  padding-block: 30px 34px;
+}
+@media (max-width: 720px) { .hero-band { grid-template-columns: 1fr; gap: 20px; } }
+.hero-figure .val {
+  font-size: clamp(44px, 8vw, 68px); line-height: 1; font-weight: 600;
+  letter-spacing: -.03em; color: var(--neg); display: block;
+}
+.hero-figure .cap {
+  font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-3);
+  letter-spacing: .04em; margin-top: 12px; display: block;
+}
+.hero-side { display: grid; gap: 10px; }
+.hero-side p { margin: 0; color: var(--ink-2); font-size: 14.5px; }
+.hero-side .big { font-size: 15.5px; color: var(--ink); }
+
+/* ---------- KPI band ---------- */
+.kpis {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-top: 1px solid var(--rule-strong);
+}
+@media (max-width: 780px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.kpi { padding: 20px 20px 22px 0; border-right: 1px solid var(--rule); min-width: 0; }
+.kpi:last-child { border-right: 0; }
+@media (max-width: 780px) {
+  .kpi:nth-child(2n) { border-right: 0; }
+  .kpi:nth-child(n+3) { border-top: 1px solid var(--rule); }
+}
+.kpi .k-label {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--ink-3); display: block; margin-bottom: 8px;
+}
+.kpi .k-val { font-size: clamp(20px, 2.6vw, 26px); font-weight: 600; line-height: 1.15; letter-spacing: -.01em; display: block; }
+.kpi .k-val.neg { color: var(--neg); }
+.kpi .k-val.pos { color: var(--pos); }
+.kpi .k-sub { font-size: 12.5px; color: var(--ink-3); margin-top: 5px; display: block; }
+
+/* ---------- sections ---------- */
+section { padding-block: clamp(38px, 5.5vw, 60px) 0; }
+.sec-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 18px; margin-bottom: 22px; }
+.sec-num {
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: .1em;
+  color: var(--accent); font-weight: 500;
+}
+h2 {
+  font-size: clamp(21px, 3vw, 27px); font-weight: 600; letter-spacing: -.015em;
+  margin: 0; line-height: 1.25; text-wrap: balance;
+}
+.sec-sub { color: var(--ink-3); font-size: 14px; margin: -12px 0 24px; max-width: 66ch; }
+
+.card {
+  background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 4px; padding: clamp(18px, 2.6vw, 28px);
+  box-shadow: var(--shadow);
+}
+.card-title {
+  font-size: 14px; font-weight: 600; margin: 0 0 3px;
+}
+.card-note { font-size: 12.5px; color: var(--ink-3); margin: 0 0 20px; }
+.charts { display: grid; gap: 20px; }
+@media (min-width: 900px) { .charts { grid-template-columns: 1fr 1fr; } }
+
+/* chart internals */
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.axis-label { font-family: var(--font-mono); font-size: 10.5px; fill: var(--ink-3); }
+.bar-label { font-family: var(--font-mono); font-size: 10.5px; fill: var(--ink-2); }
+.zero-rule { stroke: var(--rule-strong); stroke-width: 1; }
+.grid-rule { stroke: var(--rule); stroke-width: 1; }
+.hit { fill: transparent; cursor: default; }
+.hit:hover + .hover-mark, .hit:hover ~ .hover-mark { opacity: 1; }
+
+/* tooltip */
+.tip {
+  position: absolute; pointer-events: none; opacity: 0; transition: opacity .12s;
+  background: var(--ink); color: var(--bg); font-size: 12px; line-height: 1.45;
+  padding: 7px 9px; border-radius: 3px; white-space: nowrap; z-index: 5;
+  font-variant-numeric: tabular-nums; transform: translate(-50%, -100%);
+}
+.tip.on { opacity: 1; }
+
+/* legend */
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-bottom: 16px; font-size: 12.5px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.swatch { width: 11px; height: 11px; border-radius: 2px; display: inline-block; flex: none; }
+
+/* ---------- findings ---------- */
+.findings { display: grid; gap: 0; border-top: 1px solid var(--rule-strong); }
+.finding {
+  display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 4px 20px;
+  padding-block: 24px; border-bottom: 1px solid var(--rule);
+}
+@media (max-width: 620px) { .finding { grid-template-columns: 1fr; } }
+.f-index {
+  font-family: var(--font-mono); font-size: 13px; color: var(--accent);
+  font-weight: 500; padding-top: 3px;
+}
+.f-body { min-width: 0; }
+.f-title { font-size: 17px; font-weight: 600; margin: 0 0 6px; letter-spacing: -.01em; }
+.f-title .tag {
+  font-family: var(--font-mono); font-size: 10.5px; font-weight: 500; letter-spacing: .05em;
+  padding: 2px 7px; border-radius: 2px; margin-left: 8px; vertical-align: 2px;
+  text-transform: uppercase;
+}
+.tag.crit { background: var(--neg-soft); color: var(--neg); }
+.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.ok   { background: var(--pos-soft); color: var(--pos); }
+.tag.info { background: var(--accent-soft); color: var(--accent); }
+.f-text { color: var(--ink-2); margin: 0; max-width: 72ch; }
+.f-text + .f-text { margin-top: 8px; }
+.evidence {
+  margin: 12px 0 0; padding: 12px 14px; background: var(--surface-sunk);
+  border-left: 2px solid var(--rule-strong); border-radius: 0 3px 3px 0;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.65;
+  color: var(--ink-2); overflow-x: auto;
+}
+.evidence b { color: var(--ink); font-weight: 500; }
+.evidence .loss { color: var(--neg); }
+.evidence .gain { color: var(--pos); }
+
+/* ---------- strategy ---------- */
+.strat-grid { display: grid; gap: 20px; }
+@media (min-width: 880px) { .strat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.strat {
+  background: var(--surface); border: 1px solid var(--rule); border-radius: 4px;
+  padding: 22px; display: flex; flex-direction: column; gap: 12px; min-width: 0;
+  box-shadow: var(--shadow);
+}
+.strat h3 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.005em; }
+.norm {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--accent);
+}
+.strat ol, .strat ul { margin: 0; padding-left: 18px; color: var(--ink-2); font-size: 14px; }
+.strat li { margin-bottom: 8px; }
+.strat li:last-child { margin-bottom: 0; }
+.strat li b { color: var(--ink); font-weight: 600; }
+.strat .foot {
+  margin-top: auto; padding-top: 12px; border-top: 1px solid var(--rule);
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-3); line-height: 1.6;
+}
+
+/* allocation bar */
+.alloc { margin-bottom: 24px; }
+.alloc-bar { display: flex; height: 34px; border-radius: 3px; overflow: hidden; gap: 2px; }
+.alloc-seg { display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); font-size: 11px; font-weight: 500; color: #fff; overflow: hidden; white-space: nowrap; }
+.alloc-seg.core { background: var(--accent); flex: 6; }
+.alloc-seg.sat  { background: #4a8fa6; flex: 3; }
+.alloc-seg.cash { background: var(--rule-strong); color: var(--ink-2); flex: 1; }
+.alloc-legend { display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 10px; font-size: 12.5px; color: var(--ink-2); }
+
+/* ---------- positions table ---------- */
+.table-scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 4px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 620px; }
+th {
+  text-align: left; font-family: var(--font-mono); font-size: 10.5px; font-weight: 500;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3);
+  padding: 12px 14px; border-bottom: 1px solid var(--rule-strong); white-space: nowrap;
+}
+td { padding: 12px 14px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--font-mono); font-size: 12.5px; }
+td.sym { font-weight: 600; font-family: var(--font-mono); font-size: 12.5px; letter-spacing: .02em; }
+td .muted { color: var(--ink-3); font-size: 12.5px; font-family: var(--font-sans); }
+.pill {
+  display: inline-block; font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .04em;
+  padding: 2px 7px; border-radius: 2px; white-space: nowrap;
+}
+.pill.cut { background: var(--neg-soft); color: var(--neg); }
+.pill.hold { background: var(--accent-soft); color: var(--accent); }
+.pill.trim { background: var(--warn-soft); color: var(--warn); }
+
+/* ---------- checklist ---------- */
+.checklist { display: grid; gap: 0; border-top: 1px solid var(--rule-strong); counter-reset: chk; }
+.checklist li {
+  list-style: none; display: grid; grid-template-columns: 34px minmax(0,1fr);
+  gap: 14px; padding-block: 15px; border-bottom: 1px solid var(--rule);
+  color: var(--ink-2); font-size: 14.5px;
+}
+.checklist li::before {
+  counter-increment: chk; content: counter(chk, decimal-leading-zero);
+  font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); padding-top: 2px;
+}
+.checklist li b { color: var(--ink); font-weight: 600; }
+
+footer {
+  margin-top: clamp(48px, 7vw, 80px); padding-block: 26px 40px;
+  border-top: 1px solid var(--rule-strong);
+  font-size: 12.5px; color: var(--ink-3); display: grid; gap: 6px;
+}
+footer code { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); }
+
+.toggle {
+  position: fixed; top: max(12px, env(safe-area-inset-top, 0px));
+  right: max(16px, env(safe-area-inset-right, 0px)); z-index: 20;
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .06em;
+  background: var(--surface); color: var(--ink-2); border: 1px solid var(--rule-strong);
+  border-radius: 3px; padding: 6px 10px; cursor: pointer;
+}
+.toggle:focus-visible, .hit:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<button class="toggle" id="theme-toggle" type="button" aria-label="切换深浅色">主题</button>
+
+<div class="wrap">
+
+<header class="masthead">
+  <div class="kicker">
+    <span class="dot"></span><span>交易复盘</span>
+    <span>2026-04-23 → 2026-10-09</span>
+    <span>274 条流水 · 38 个标的</span>
+  </div>
+  <h1>你的账户在替你做决定</h1>
+  <p class="lede">
+    四个月里做了 <strong>274 笔</strong>交易，周转了 <strong>3.6 倍</strong>本金。
+    结果是亏损集中在三只票上，而盈利集中在两只票上——这说明问题不在选股，
+    而在<strong>买入之后你怎么处理它</strong>。
+  </p>
+
+  <div class="hero-band">
+    <div class="hero-figure">
+      <span class="val">−4,199</span>
+      <span class="cap">已实现盈亏 · 对 29,000 本金为 −14.5%</span>
+    </div>
+    <div class="hero-side">
+      <p class="big">平均每笔赢 131 美元，输 275 美元。</p>
+      <p>赚钱的单子平均握 8 天，亏钱的握 21 天。赔率 0.48 意味着即使胜率过半也难赚钱，而你的胜率只有 36%。</p>
+    </div>
+  </div>
+</header>
+
+<div class="kpis">
+  <div class="kpi">
+    <span class="k-label">已实现盈亏</span>
+    <span class="k-val neg">−4,199</span>
+    <span class="k-sub">−14.5% 对入金</span>
+  </div>
+  <div class="kpi">
+    <span class="k-label">胜率</span>
+    <span class="k-val">36.4%</span>
+    <span class="k-sub">12 胜 / 33 个完整周期</span>
+  </div>
+  <div class="kpi">
+    <span class="k-label">盈亏比</span>
+    <span class="k-val neg">0.48</span>
+    <span class="k-sub">赢 131 : 输 275</span>
+  </div>
+  <div class="kpi">
+    <span class="k-label">Annualized 周转</span>
+    <span class="k-val">7.8×</span>
+    <span class="k-sub">手续费约 268</span>
+  </div>
+</div>
+
+<!-- ============ 01 月度 ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">01</span><h2>七月是分水岭</h2></div>
+  <p class="sec-sub">交易笔数在七月冲到 101 笔，同月亏掉约 2,198；八月把笔数砍到 19，反而赚回 1,731。频率和收益是反着走的。</p>
+
+  <div class="charts">
+    <div class="card">
+      <p class="card-title">每月已实现盈亏</p>
+      <p class="card-note">按清仓日归属，单位美元</p>
+      <div class="chart" id="chart-monthly"></div>
+    </div>
+    <div class="card">
+      <p class="card-title">每月交易笔数</p>
+      <p class="card-note">买入 + 卖出合计</p>
+      <div class="chart" id="chart-count"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 02 标的 ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">02</span><h2>亏损高度集中</h2></div>
+  <p class="sec-sub">CRCL、RKLB、XE 三只贡献了全部亏损的 88%，而且它们的共同点是同一个动作：价格跌破成本之后继续加仓。</p>
+
+  <div class="card">
+    <p class="card-title">各标的已实现盈亏</p>
+    <p class="card-note">只统计已清仓的完整周期；条宽按美元等比例，单位美元</p>
+    <div class="chart" id="chart-symbol"></div>
+  </div>
+</section>
+
+<!-- ============ 03 行为 ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">03</span><h2>七个可以量化的习惯</h2></div>
+  <p class="sec-sub">每一条都能从流水里数出来，也都对应一个具体的金额代价。</p>
+
+  <div class="findings">
+
+    <article class="finding">
+      <span class="f-index">01</span>
+      <div class="f-body">
+        <h3 class="f-title">逆势加仓<span class="tag crit">最大代价</span></h3>
+        <p class="f-text">在价格低于持仓均价时继续买入，全账户共 14 次，集中在 XE、RKLB、CRCL、CRCA。均价下移制造了“成本变便宜了”的错觉，实际是放大亏损敞口。</p>
+        <div class="evidence"><b>XE</b>  29.36 → 29.20 → 20.37 → 21.92 → 18.88 → 16.83 买入，14.08 卖出<br>亏损 <span class="loss">−1,772</span> · 周期内逆势加仓 <b>6 次</b><br><br><b>RKLB</b>  112.9 → 117 → 122.7 → 113.8 → 106.3 → 108.1 买入，24.5 卖出<br>亏损 <span class="loss">−1,913</span> · 逆势加仓 <b>5 次</b></div>
+      </div>
+    </article>
+
+    <article class="finding">
+      <span class="f-index">02</span>
+      <div class="f-body">
+        <h3 class="f-title">赢家跑得快，输家扛得久<span class="tag crit">结构性问题</span></h3>
+        <p class="f-text">盈利周期平均 8.4 天，亏损周期平均 21.3 天，是前者的 2.5 倍。赚钱时急着兑现，亏钱时等着回本，这个不对称直接决定了账户的期望值为负。</p>
+        <div class="evidence">盈利周期 <b>8.4 天</b> / 平均 <span class="gain">+131</span><br>亏损周期 <b>21.3 天</b> / 平均 <span class="loss">−275</span><br>持有超过 60 天的周期：<b>6 个，5 个亏损</b></div>
+      </div>
+    </article>
+
+    <article class="finding">
+      <span class="f-index">03</span>
+      <div class="f-body">
+        <h3 class="f-title">同日反手<span class="tag warn">无效交易</span></h3>
+        <p class="f-text">17 个交易日里同一标的既有买入又有卖出，涉及 12 个标的。这些操作大多在开盘后一小时内完成，付了两次手续费，方向却互相抵消。</p>
+        <div class="evidence">CRCL 07-17：买入 24 @62.00，三小时内分别于 60.80 / 59.90 / 60.175 卖出<br>RKLZ 07-14 → 07-18：200 → 365 → 530 股滚动，四个交易日内清仓<br>涉及标的：CRCD · CRCL · CRCA · NASA · NOK · OKLS · RKLX · RKLZ · SPCX · SSG · TSLA · XE</div>
+      </div>
+    </article>
+
+    <article class="finding">
+      <span class="f-index">04</span>
+      <div class="f-body">
+        <h3 class="f-title">多空互搏<span class="tag warn">净损耗</span></h3>
+        <p class="f-text">同时持有 TSLA 多单与 TSLQ（TSLA 两倍做空），也同时持有 PSQ 与多头仓位。两边看起来都“赚了几块”，实际承担了两次波动衰减，还占用了判断带宽。</p>
+        <div class="evidence">TSLA 多单（8.95 股）与 <b>TSLQ</b>（56 股）在 07-14 → 07-16 同时持有<br>杠杆 / 反向 ETF 合计（QID · PSQ · SOXS · SSG · TSLQ · RKLZ · CRCD）进出 20+ 次<br>净结果 <span class="gain">+约 250</span>，对 2 万美元级流水而言不值得</div>
+      </div>
+    </article>
+
+    <article class="finding">
+      <span class="f-index">05</span>
+      <div class="f-body">
+        <h3 class="f-title">仓位大小与确信度反着来<span class="tag warn">配置问题</span></h3>
+        <p class="f-text">单笔最大的几笔全在波动最大的标的上：CRCD 464 股约 3,270，CRCA 224 股约 2,700，RKLZ 330 股约 1,660。而唯一持续赚钱的 MRVL，最大单笔只有 8 股约 1,550。</p>
+        <div class="evidence">最大单笔占账户 <b>11.3%</b>（CRCD 满仓时）<br>MRVL 累计盈利 <span class="gain">+592</span>，最大单笔仓位仅 <b>5.3%</b><br>HIMX 盈利 <span class="gain">+263</span>（+20.4%），持仓仅 1,288，占 4.4%</div>
+      </div>
+    </article>
+
+    <article class="finding">
+      <span class="f-index">06</span>
+      <div class="f-body">
+        <h3 class="f-title">决策压缩在开盘后九十分钟<span class="tag info">节奏问题</span></h3>
+        <p class="f-text">绝大多数成交通道集中在北京时间 21:30–23:30，也就是美股开盘后的九十分钟。那正是噪音最大、滑点最高的时段，也是最容易临时起意的时段。</p>
+        <div class="evidence">07-14 单日 <b>10 笔</b> · 07-17 单日 <b>10 笔</b> · 07-18 单日 <b>6 笔</b><br>全部集中在 21:25 – 00:20（北京时间）<br>含“全部成交”标记的挂单大多在 <b>1–3 分钟</b>内被手动改价</div>
+      </div>
+    </article>
+
+    <article class="finding">
+      <span class="f-index">07</span>
+      <div class="f-body">
+        <h3 class="f-title">八月之后的转向是对的<span class="tag ok">应该保留</span></h3>
+        <p class="f-text">七月的高频在八月被你自己叫停：笔数从 101 降到 19，MSFT / RKLB / NOK 改为每周定投，并出现了“定投 · 部分成交已撤”的纪律性挂单。单月和已实现结果都转正。</p>
+        <div class="evidence">08 月 19 笔，已实现 <span class="gain">+1,731</span><br>09 月 1 笔（MRVL 止盈 <span class="gain">+577</span>）<br>10 月 4 笔，全部是 INTC 小额分批买入</div>
+      </div>
+    </article>
+
+  </div>
+</section>
+
+<!-- ============ 04 策略 ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">04</span><h2>四个模块的买卖纪律</h2></div>
+  <p class="sec-sub">下面每一条都直接针对上面某个具体的行为。数字按 29,000 本金设定，不需要额外入金。</p>
+
+  <div class="alloc">
+    <div class="alloc-bar" role="img" aria-label="资金分配：核心 60%，卫星 30%，现金 10%">
+      <div class="alloc-seg core">核心 60%</div>
+      <div class="alloc-seg sat">卫星 30%</div>
+      <div class="alloc-seg cash">10%</div>
+    </div>
+    <div class="alloc-legend">
+      <span><span class="swatch" style="background:var(--accent)"></span>核心：宽基 + 龙头，月度定投</span>
+      <span><span class="swatch" style="background:#4a8fa6"></span>卫星：主观选股，最多 5 只</span>
+      <span><span class="swatch" style="background:var(--rule-strong)"></span>现金：弹药，不是闲置</span>
+    </div>
+  </div>
+
+  <div class="strat-grid">
+
+    <article class="strat">
+      <span class="norm">模块 A</span>
+      <h3>仓位与资金分层</h3>
+      <ul>
+        <li><b>核心 60%</b>（约 17,400）：2–3 只宽基或龙头，按月定投，不择时、不主动止盈，只在偏离目标超过 20% 时再平衡。</li>
+        <li><b>卫星 30%</b>（约 8,700）：最多 5 只，单只上限 <b>2,300</b>，单笔新建仓 900–1,200，分三批。</li>
+        <li><b>现金 10%</b>（约 2,900）：用完即停手，不允许卖出持仓来凑钱。</li>
+      </ul>
+      <div class="foot">单笔最大亏损 = 1,200 × 12% ≈ 145，即账户的 0.5%。</div>
+    </article>
+
+    <article class="strat">
+      <span class="norm">模块 B</span>
+      <h3>建仓规则</h3>
+      <ol>
+        <li>下单前在备注写一句买入理由，写不出来就不买。</li>
+        <li>分三批：1/3 试仓 → 站稳再加 1/3 → 突破再加 1/3。<b>只有价格高于成本才允许加后两批。</b></li>
+        <li>价格低于成本时，<b>最多补一次</b>，补完不超过计划仓位。</li>
+        <li>同一标的清仓后，<b>强制间隔 5 个交易日</b>才能重新建仓。</li>
+      </ol>
+      <div class="foot">针对习惯 01 与 03。若从四月起执行，XE 和 RKLB 合计可少亏约 2,000。</div>
+    </article>
+
+    <article class="strat">
+      <span class="norm">模块 C</span>
+      <h3>卖出规则</h3>
+      <ol>
+        <li><b>止损 −12%</b>，或买入逻辑被破坏，触发即走，不找理由。</li>
+        <li><b>涨到 1.5R 卖 1/3，2.5R 再卖 1/3</b>，剩 1/3 用 8% 移动止损让它跑。</li>
+        <li>持仓 <b>40 天</b>且没有新逻辑，月度复盘时清掉。</li>
+        <li>禁止同日对同一标的一买一卖；禁止同一标的的多单与反向 ETF 并存。</li>
+      </ol>
+      <div class="foot">针对习惯 02 与 04。MRVL 若分批止盈，收益可从 +592 提到约 +850。</div>
+    </article>
+
+    <article class="strat">
+      <span class="norm">模块 D</span>
+      <h3>频率与时段</h3>
+      <ul>
+        <li>每天最多 <b>5 笔</b>，每周最多 <b>12 笔</b>。</li>
+        <li>只在 <b>22:30–23:10</b> 挂限价单，之后关掉软件。盘中的冲动单写进“待观察”，次日再评。</li>
+        <li>单日亏损到账户 <b>−2.5%</b> 即停手到下一交易日。</li>
+        <li>杠杆 / 反向 ETF 只在明确趋势下持有，最短 3 天，不做日内。</li>
+      </ul>
+      <div class="foot">针对习惯 06。七月 101 笔 → 目标水平约 25 笔/月。</div>
+    </article>
+
+    <article class="strat">
+      <span class="norm">模块 E</span>
+      <h3>复盘节奏</h3>
+      <ul>
+        <li><b>每周日</b>：看一遍本周成交，标出逆势加仓和同日反手，不做交易决策。</li>
+        <li><b>每月末</b>：算胜率、盈亏比、平均持仓天数三个数，只看趋势不看单月。</li>
+        <li><b>每季</b>：检查核心仓偏离度，执行再平衡。</li>
+      </ul>
+      <div class="foot">复盘用数据，不用记忆。账本里的月度视图已经够用。</div>
+    </article>
+
+    <article class="strat">
+      <span class="norm">模块 F</span>
+      <h3>一个月后看这两个数</h3>
+      <ul>
+        <li><b>盈亏比 &gt; 1.5</b>：从现在的 0.48 开始，先追求 1.0，再追求 1.5。</li>
+        <li><b>平均持仓天数：赢 &gt; 输</b>：现在 8.4 对 21.3，目标是让赢家握得比输家长。</li>
+      </ul>
+      <div class="foot">这两个数比收益率更能反映方法是否改变，也更早出现信号。</div>
+    </article>
+
+  </div>
+</section>
+
+<!-- ============ 05 持仓 ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">05</span><h2>当前六个持仓怎么处理</h2></div>
+  <p class="sec-sub">按 2026-10-09 的成交记录重放得出；浮动盈亏以最近一次成交价近似，仅作方向参考。</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>标的</th>
+          <th class="num">数量</th>
+          <th class="num">均价</th>
+          <th class="num">成本</th>
+          <th class="num">参考价</th>
+          <th>动作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="sym">XE</td>
+          <td class="num">174</td>
+          <td class="num">17.07</td>
+          <td class="num">2,970</td>
+          <td class="num">17.83</td>
+          <td><span class="pill cut">反弹到 18.5–19 清仓</span><br><span class="muted">最大伤口，不再补仓</span></td>
+        </tr>
+        <tr>
+          <td class="sym">RKLB</td>
+          <td class="num">54</td>
+          <td class="num">69.25</td>
+          <td class="num">3,740</td>
+          <td class="num">78.76</td>
+          <td><span class="pill hold">持有，设移动止损</span><br><span class="muted">8% 跟踪止损约 72.5 触发，不加仓</span></td>
+        </tr>
+        <tr>
+          <td class="sym">NOK</td>
+          <td class="num">173</td>
+          <td class="num">9.36</td>
+          <td class="num">1,619</td>
+          <td class="num">9.85</td>
+          <td><span class="pill hold">继续周定投</span><br><span class="muted">停止手动加仓</span></td>
+        </tr>
+        <tr>
+          <td class="sym">INTC</td>
+          <td class="num">13.54</td>
+          <td class="num">96.37</td>
+          <td class="num">1,305</td>
+          <td class="num">106.05</td>
+          <td><span class="pill hold">继续小额定投</span><br><span class="muted">不加主观仓位</span></td>
+        </tr>
+        <tr>
+          <td class="sym">TSLA</td>
+          <td class="num">8.95</td>
+          <td class="num">411.90</td>
+          <td class="num">3,686</td>
+          <td class="num">401.48</td>
+          <td><span class="pill trim">减到 4–5 股</span><br><span class="muted">与核心仓重叠过高</span></td>
+        </tr>
+        <tr>
+          <td class="sym">COHR</td>
+          <td class="num">2</td>
+          <td class="num">358.76</td>
+          <td class="num">718</td>
+          <td class="num">377.99</td>
+          <td><span class="pill trim">补到计划仓位或清掉</span><br><span class="muted">仓位过小，无统计意义</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 06 清单 ============ -->
+<section>
+  <div class="sec-head"><span class="sec-num">06</span><h2>每次下单前过一遍</h2></div>
+  <p class="sec-sub">五条，全部能在一分钟内回答。</p>
+  <ol class="checklist">
+    <li>这笔买入的理由能写成一句话吗？<b>写不出来就不买。</b></li>
+    <li>当前价格<b>高于</b>持仓成本吗？低于的话，这个周期已经补过一次了吗？</li>
+    <li>止损价是多少？<b>按 −12% 算，亏多少美元，占账户多少？</b></li>
+    <li>这个标的是不是已经有仓位，或持有反向 / 杠杆 ETF？</li>
+    <li>今天已经下了几笔？现在是不是 22:30–23:10 之外？</li>
+  </ol>
+</section>
+
+<footer>
+  <span>数据来源：<code>backend/trades_backup.csv</code>（274 条流水，2026-04-23 → 2026-10-09），按加权平均成本重放。</span>
+  <span>口径与 <code>backend/app/services/ledger.py</code> 一致：手续费不计入成本，卖出时按均价结转。已实现金额取整到美元。</span>
+  <span>浮动盈亏以最近一次成交价近似，未接入实时行情，仅供方向参考。</span>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+
+  /* ---------- theme toggle ---------- */
+  var root = document.documentElement;
+  var btn = document.getElementById('theme-toggle');
+  var stored = null;
+  try { stored = localStorage.getItem('theme'); } catch (e) {}
+  if (stored === 'dark' || stored === 'light') root.setAttribute('data-theme', stored);
+  btn.addEventListener('click', function () {
+    var cur = root.getAttribute('data-theme');
+    if (!cur) cur = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    var next = cur === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('theme', next); } catch (e) {}
+    redrawAll();
+  });
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', redrawAll);
+
+  /* ---------- data ---------- */
+  var MONTHLY = [
+    { m: '5月', v: -776, trades: 41 },
+    { m: '6月', v: 355, trades: 52 },
+    { m: '7月', v: -2198, trades: 101 },
+    { m: '8月', v: 1731, trades: 19 },
+    { m: '9月', v: 577, trades: 1 },
+    { m: '10月', v: 0, trades: 4 }
+  ];
+
+  var SYMBOLS = [
+    { s: 'RKLB', v: -1913, t: 10589 },
+    { s: 'CRCL', v: -1820, t: 10143 },
+    { s: 'XE', v: -1772, t: 11198 },
+    { s: 'CRCA', v: -865, t: 7676 },
+    { s: 'TSLA', v: -491, t: 8260 },
+    { s: 'OKLO', v: -422, t: 1950 },
+    { s: 'INTC', v: -359, t: 2419 },
+    { s: 'NASA', v: -356, t: 5987 },
+    { s: 'MU', v: -259, t: 4110 },
+    { s: 'NOK', v: -104, t: 6580 },
+    { s: 'SOXS', v: -100, t: 1874 },
+    { s: 'PSQ', v: -58, t: 8336 },
+    { s: 'UL', v: -18, t: 1176 },
+    { s: 'MSFT', v: -2, t: 3081 },
+    { s: 'TSLQ', v: 5, t: 1014 },
+    { s: 'NVDA', v: 6, t: 4387 },
+    { s: 'SOXX', v: 10, t: 396 },
+    { s: 'CRCD', v: 11, t: 3511 },
+    { s: 'QID', v: 31, t: 4500 },
+    { s: 'EWT', v: 33, t: 1072 },
+    { s: 'NRIX', v: 62, t: 1124 },
+    { s: 'SNDK', v: 69, t: 2412 },
+    { s: 'LLY', v: 265, t: 6218 },
+    { s: 'RKLX', v: 208, t: 4099 },
+    { s: 'RKLZ', v: 230, t: 3200 },
+    { s: 'HIMX', v: 263, t: 1288 },
+    { s: 'SSG', v: 302, t: 4107 },
+    { s: 'SPCX', v: 363, t: 1283 },
+    { s: 'MRVL', v: 592, t: 3341 }
+  ];
+
+  function cssVar(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+
+  function el(tag, attrs, parent) {
+    var n = document.createElementNS(SVG_NS, tag);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(n);
+    return n;
+  }
+
+  /* Rounded bar path. The flat end sits on the baseline (where the bar starts
+     growing from) and only the data end gets the 4px radius.
+     dir: 'up' | 'down' for columns, 'right' | 'left' for rows. */
+  function barPath(x, y, w, h, r, dir) {
+    r = Math.max(0, Math.min(r, Math.abs(w) / 2, Math.abs(h)));
+    if (dir === 'up') {
+      // flat bottom at y+h, rounded top at y
+      return 'M' + x + ',' + (y + h) + ' L' + x + ',' + (y + r) +
+             ' Q' + x + ',' + y + ' ' + (x + r) + ',' + y +
+             ' L' + (x + w - r) + ',' + y +
+             ' Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) +
+             ' L' + (x + w) + ',' + (y + h) + ' Z';
+    }
+    if (dir === 'down') {
+      // flat top at y, rounded bottom at y+h
+      return 'M' + x + ',' + y + ' L' + x + ',' + (y + h - r) +
+             ' Q' + x + ',' + (y + h) + ' ' + (x + r) + ',' + (y + h) +
+             ' L' + (x + w - r) + ',' + (y + h) +
+             ' Q' + (x + w) + ',' + (y + h) + ' ' + (x + w) + ',' + (y + h - r) +
+             ' L' + (x + w) + ',' + y + ' Z';
+    }
+    if (dir === 'right') {
+      // flat left edge at x, rounded right end at x+w
+      return 'M' + x + ',' + y + ' L' + (x + w - r) + ',' + y +
+             ' Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) +
+             ' L' + (x + w) + ',' + (y + h - r) +
+             ' Q' + (x + w) + ',' + (y + h) + ' ' + (x + w - r) + ',' + (y + h) +
+             ' L' + x + ',' + (y + h) + ' Z';
+    }
+    // 'left': flat right edge at x+w, rounded left end at x
+    return 'M' + (x + w) + ',' + y + ' L' + (x + r) + ',' + y +
+           ' Q' + x + ',' + y + ' ' + x + ',' + (y + r) +
+           ' L' + x + ',' + (y + h - r) +
+           ' Q' + x + ',' + (y + h) + ' ' + (x + r) + ',' + (y + h) +
+           ' L' + (x + w) + ',' + (y + h) + ' Z';
+  }
+
+  function fmt(n) {
+    var s = Math.abs(Math.round(n)).toLocaleString('en-US');
+    return (n < 0 ? '−' : '+') + s;
+  }
+
+  function niceTicks(min, max, count) {
+    var span = max - min || 1;
+    var step = Math.pow(10, Math.floor(Math.log10(span / count)));
+    var err = (span / count) / step;
+    if (err >= 7.5) step *= 10;
+    else if (err >= 3.5) step *= 5;
+    else if (err >= 1.5) step *= 2;
+    var out = [];
+    var start = Math.floor(min / step) * step;
+    var end = Math.ceil(max / step) * step;
+    if (start === end) end = start + step;
+    for (var v = start; v <= end + 1e-9; v += step) out.push(Math.round(v * 1e6) / 1e6);
+    return out;
+  }
+
+  /* ---------- column chart (monthly P&L) ---------- */
+  function drawColumns(host, data, getValue, getLabel, opts) {
+    host.innerHTML = '';
+    var W = 520, H = 260;
+    var M = { t: 22, r: 12, b: 30, l: 46 };
+    var iw = W - M.l - M.r, ih = H - M.t - M.b;
+
+    var vals = data.map(getValue);
+    var min = Math.min(0, Math.min.apply(null, vals));
+    var max = Math.max(0, Math.max.apply(null, vals));
+    var ticks = niceTicks(min, max, 4);
+    min = Math.min(min, ticks[0]);
+    max = Math.max(max, ticks[ticks.length - 1]);
+    var span = max - min || 1;
+
+    var y = function (v) { return M.t + ih - ((v - min) / span) * ih; };
+    var zeroY = y(0);
+
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img',
+                          'aria-label': opts.aria }, host);
+    var g = el('g', {}, svg);
+
+    ticks.forEach(function (t) {
+      el('line', { x1: M.l, x2: W - M.r, y1: y(t), y2: y(t),
+                   class: t === 0 ? 'zero-rule' : 'grid-rule' }, g);
+      var tx = el('text', { x: M.l - 8, y: y(t) + 3.5, 'text-anchor': 'end', class: 'axis-label' }, g);
+      tx.textContent = t.toLocaleString('en-US');
+    });
+
+    var band = iw / data.length;
+    var bw = Math.min(24, band * 0.46);
+
+    data.forEach(function (d, i) {
+      var v = getValue(d);
+      var cx = M.l + band * i + band / 2;
+      var top = v >= 0 ? y(v) : zeroY;
+      var h = Math.abs(y(v) - zeroY);
+      var color = v >= 0 ? cssVar('--accent') : cssVar('--neg');
+
+      el('path', { d: barPath(cx - bw / 2, top, bw, Math.max(h, 1), 4, v >= 0 ? 'up' : 'down'),
+                   fill: color, class: 'mark' }, g);
+
+      var lx = el('text', { x: cx, y: M.b + ih + 18, 'text-anchor': 'middle', class: 'axis-label' }, g);
+      lx.textContent = getLabel(d);
+
+      // selective direct label: only the extremes, and never a sign on counts
+      var isMax = v === Math.max.apply(null, vals);
+      var isMin = v === Math.min.apply(null, vals);
+      if ((isMax || isMin) && v !== 0) {
+        var vy = v >= 0 ? top - 7 : top + h + 13;
+        var vl = el('text', { x: cx, y: vy, 'text-anchor': 'middle', class: 'bar-label' }, g);
+        vl.textContent = opts.signed
+          ? fmt(v)
+          : Math.abs(Math.round(v)).toLocaleString('en-US');
+      }
+
+      var hit = el('rect', { x: M.l + band * i, y: M.t, width: band, height: ih,
+                             class: 'hit', tabindex: '0' }, g);
+      attachTip(hit, host, [
+        opts.tipTitle(d),
+        opts.signed
+          ? (v >= 0 ? '+' : '−') + Math.abs(v).toLocaleString('en-US') + ' 美元'
+          : Math.abs(Math.round(v)).toLocaleString('en-US') + ' 笔'
+      ]);
+    });
+  }
+
+  /* ---------- horizontal bars (per symbol) ---------- */
+  function drawSymbols(host, data) {
+    host.innerHTML = '';
+    var W = 660, rowH = 22, M = { t: 8, r: 64, b: 8, l: 60 };
+    var H = M.t + M.b + data.length * rowH;
+    var iw = W - M.l - M.r;
+
+    var maxAbs = Math.max.apply(null, data.map(function (d) { return Math.abs(d.v); }));
+    var zeroX = M.l + iw / 2;
+
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img',
+                          'aria-label': '各标的已实现盈亏横向条形图，左为亏损，右为盈利' }, host);
+    var g = el('g', {}, svg);
+
+    el('line', { x1: zeroX, x2: zeroX, y1: M.t - 2, y2: H - M.b + 2, class: 'zero-rule' }, g);
+
+    // half the inner width maps to maxAbs, leaving room for the value labels
+    var scale = function (v) { return (Math.abs(v) / maxAbs) * (iw / 2 - 22); };
+
+    data.forEach(function (d, i) {
+      var yTop = M.t + i * rowH;
+      var bh = 12;
+      var yMid = yTop + rowH / 2;
+      var len = Math.max(scale(d.v), 1.5);
+      var x = d.v >= 0 ? zeroX : zeroX - len;
+      var color = d.v >= 0 ? cssVar('--accent') : cssVar('--neg');
+
+      el('path', { d: barPath(x, yMid - bh / 2, len, bh, 3, d.v >= 0 ? 'right' : 'left'),
+                   fill: color, class: 'mark' }, g);
+
+      var lab = el('text', { x: M.l - 10, y: yMid + 3.5, 'text-anchor': 'end', class: 'axis-label' }, g);
+      lab.textContent = d.s;
+
+      var val = el('text', {
+        x: d.v >= 0 ? x + len + 7 : x - 7,
+        y: yMid + 3.5,
+        'text-anchor': d.v >= 0 ? 'start' : 'end',
+        class: 'bar-label'
+      }, g);
+      val.textContent = fmt(d.v);
+
+      var hit = el('rect', { x: 0, y: yTop, width: W, height: rowH, class: 'hit', tabindex: '0' }, g);
+      attachTip(hit, host, [
+        d.s + ' · 已实现 ' + (d.v >= 0 ? '+' : '−') + Math.abs(d.v).toLocaleString('en-US'),
+        '投入成本约 ' + Math.round(d.t).toLocaleString('en-US') + ' 美元'
+      ]);
+    });
+  }
+
+  /* ---------- tooltip ---------- */
+  function attachTip(node, host, lines) {
+    var tip = host.querySelector('.tip');
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.className = 'tip';
+      host.appendChild(tip);
+    }
+    function show(ev) {
+      tip.innerHTML = lines.map(function (l, i) {
+        return i === 0 ? '<b>' + l + '</b>' : l;
+      }).join('<br>');
+      tip.classList.add('on');
+      var rect = host.getBoundingClientRect();
+      var x, y;
+      if (ev && ev.clientX) { x = ev.clientX - rect.left; y = ev.clientY - rect.top - 10; }
+      else {
+        var nr = node.getBoundingClientRect();
+        x = nr.left - rect.left + nr.width / 2;
+        y = nr.top - rect.top;
+      }
+      tip.style.left = Math.max(60, Math.min(rect.width - 60, x)) + 'px';
+      tip.style.top = y + 'px';
+    }
+    function hide() { tip.classList.remove('on'); }
+    node.addEventListener('pointerenter', show);
+    node.addEventListener('pointermove', show);
+    node.addEventListener('pointerleave', hide);
+    node.addEventListener('focus', function () { show(null); });
+    node.addEventListener('blur', hide);
+  }
+
+  /* ---------- draw all ---------- */
+  var mHost = document.getElementById('chart-monthly');
+  var cHost = document.getElementById('chart-count');
+  var sHost = document.getElementById('chart-symbol');
+
+  function redrawAll() {
+    drawColumns(mHost, MONTHLY,
+      function (d) { return d.v; },
+      function (d) { return d.m; },
+      { aria: '每月已实现盈亏柱状图，7 月亏损最大', signed: true,
+        tipTitle: function (d) { return d.m + ' 已实现'; } });
+
+    drawColumns(cHost, MONTHLY,
+      function (d) { return d.trades; },
+      function (d) { return d.m; },
+      { aria: '每月交易笔数柱状图，7 月最多', signed: false,
+        tipTitle: function (d) { return d.m + ' 交易笔数'; } });
+
+    drawSymbols(sHost, SYMBOLS);
+  }
+
+  redrawAll();
+  var rt;
+  window.addEventListener('resize', function () {
+    clearTimeout(rt);
+    rt = setTimeout(redrawAll, 120);
+  });
+})();
+</script>

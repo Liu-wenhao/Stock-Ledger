@@ -14,6 +14,8 @@ export const fetchMonthlyReturns = (params) =>
   http.get('/api/analysis/monthly-returns', { params }).then((r) => r.data)
 export const fetchProfitSeries = (params) =>
   http.get('/api/analysis/profit-series', { params }).then((r) => r.data)
+export const fetchTradingReview = () => http.get('/api/analysis/review').then((r) => r.data)
+export const fetchTradingStrategy = () => http.get('/api/analysis/strategy').then((r) => r.data)
 export const fetchTrades = (params) => http.get('/api/trades', { params }).then((r) => r.data)
 export const createTrade = (data) => http.post('/api/trades', data).then((r) => r.data)
 export const updateTrade = (id, data) => http.put(`/api/trades/${id}`, data).then((r) => r.data)
@@ -28,12 +30,3 @@ export const searchSymbols = (q) =>
   http.get('/api/symbols/search', { params: { q } }).then((r) => r.data)
 export const refreshMarket = (force = true) =>
   http.post('/api/market/refresh', null, { params: { force } }).then((r) => r.data)
-export const fetchVibeStatus = () => http.get('/api/vibe/status').then((r) => r.data)
-export const startVibeAnalysis = (data) =>
-  http.post('/api/vibe/analyze', data, { timeout: 330000 }).then((r) => r.data)
-export const fetchVibeSession = (id) =>
-  http.get(`/api/vibe/sessions/${encodeURIComponent(id)}`).then((r) => r.data)
-export const fetchVibeMessages = (id) =>
-  http.get(`/api/vibe/sessions/${encodeURIComponent(id)}/messages`).then((r) => r.data)
-export const cancelVibeSession = (id) =>
-  http.post(`/api/vibe/sessions/${encodeURIComponent(id)}/cancel`).then((r) => r.data)

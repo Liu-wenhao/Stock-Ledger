@@ -44,7 +44,8 @@ onMounted(() => {
         <a-tab-pane key="trades" tab="交易" />
         <a-tab-pane key="prices" tab="价格" />
         <a-tab-pane key="analysis" tab="分析" />
-        <a-tab-pane key="vibe" tab="AI 研究" />
+        <a-tab-pane key="review" tab="复盘" />
+        <a-tab-pane key="strategy" tab="策略" />
       </a-tabs>
     </div>
 

@@ -3,19 +3,28 @@ import { computed, reactive, ref, watch } from 'vue'
 import dayjs from 'dayjs'
 import { message } from 'ant-design-vue'
 import { searchSymbols, createTrade, updateTrade } from '@/api/portfolio'
+import { tickerOf } from '@/utils/format'
 
 const props = defineProps({
   open: Boolean,
   editRecord: { type: Object, default: null },
+  initialValues: { type: Object, default: null },
 })
 const emit = defineEmits(['update:open', 'saved'])
 
 const saving = ref(false)
 const symbolOptions = ref([])
+let searchSeq = 0
+
+// 交易时间统一取 23:00:00：后端按该时刻换算美股交易日，
+// 若用 00:00:00 会被时区算成前一个交易日
+const withTradeTime = (d) => d.hour(23).minute(0).second(0).millisecond(0)
+const defaultClosingTime = () => withTradeTime(dayjs())
+
 const form = reactive({
   side: 'Buy',
   symbol: '',
-  closing_time: dayjs(),
+  closing_time: defaultClosingTime(),
   fill_price: null,
   qty: 1,
   commission: 0,
@@ -48,26 +57,42 @@ watch(
         notes: props.editRecord.notes || '',
       })
     } else {
+      const preset = props.initialValues || {}
+      const presetPrice = Number(preset.fill_price)
+      const presetQty = Number(preset.qty)
       Object.assign(form, {
-        side: 'Buy',
-        symbol: '',
-        closing_time: dayjs(),
-        fill_price: null,
-        qty: 1,
+        side: ['Buy', 'Sell'].includes(preset.side) ? preset.side : 'Buy',
+        symbol: preset.symbol || '',
+        closing_time: defaultClosingTime(),
+        fill_price: Number.isFinite(presetPrice) && presetPrice >= 0 ? presetPrice : null,
+        qty: Number.isFinite(presetQty) && presetQty > 0 ? presetQty : 1,
         commission: 0,
-        notes: '',
+        notes: preset.notes || '',
       })
     }
     await onSearch('')
   },
 )
 
+// 只选日期，时分秒固定为 23:00:00
+function onDateChange(v) {
+  form.closing_time = withTradeTime(v)
+}
+
 async function onSearch(q) {
+  const seq = ++searchSeq
   const rows = await searchSymbols(q || '')
-  symbolOptions.value = rows.map((r) => ({
-    value: r.symbol,
-    label: r.name ? `${r.symbol} · ${r.name}` : r.symbol,
-  }))
+  // 慢响应可能后到，丢弃过期结果，否则列表会被上一次搜索覆盖
+  if (seq !== searchSeq) return
+  symbolOptions.value = rows.map((r) => {
+    const ticker = tickerOf(r.symbol) || r.symbol
+    return { value: r.symbol, label: r.name ? `${ticker} · ${r.name}` : ticker }
+  })
+}
+
+// 展开下拉时恢复完整列表，避免只剩上一次搜索的那一条
+function onDropdownOpen(open) {
+  if (open) onSearch('')
 }
 
 async function save(addMore = false) {
@@ -139,11 +164,29 @@ async function save(addMore = false) {
           :options="symbolOptions"
           placeholder="选择商品，如 NASDAQ:AAPL"
           style="width: 100%"
+          popup-class-name="trade-symbol-dropdown"
           @search="onSearch"
-        />
+          @dropdown-visible-change="onDropdownOpen"
+        >
+          <!-- combobox 模式下组件自身不标记选中项，这里自己画 -->
+          <template #option="opt">
+            <div
+              class="symbol-option"
+              :class="{ 'symbol-option--current': opt.value === form.symbol }"
+            >
+              <span class="symbol-option__label">{{ opt.label }}</span>
+              <span v-if="opt.value === form.symbol" class="symbol-option__check">✓</span>
+            </div>
+          </template>
+        </a-auto-complete>
       </a-form-item>
       <a-form-item label="日期">
-        <a-date-picker v-model:value="form.closing_time" show-time style="width: 100%" />
+        <a-date-picker
+          :value="form.closing_time"
+          :allow-clear="false"
+          style="width: 100%"
+          @change="onDateChange"
+        />
       </a-form-item>
       <a-form-item :label="isCash ? '金额' : '价格'">
         <a-input-number v-model:value="form.fill_price" :min="0" :step="0.01" style="width: 100%" />
@@ -192,5 +235,32 @@ async function save(addMore = false) {
   .trade-form-actions :deep(.ant-btn:last-child:nth-child(3)) {
     grid-column: 1 / -1;
   }
+}
+</style>
+
+<style>
+/* 下拉挂在 body 上，scoped 命中不到，靠 popup-class-name 圈定作用域 */
+.trade-symbol-dropdown .symbol-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.trade-symbol-dropdown .symbol-option__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trade-symbol-dropdown .symbol-option--current {
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.trade-symbol-dropdown .symbol-option__check {
+  flex: none;
+  color: var(--blue);
 }
 </style>

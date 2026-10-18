@@ -31,6 +31,7 @@ const loading = ref(false)
 const rows = ref([])
 const modalOpen = ref(false)
 const editRecord = ref(null)
+const initialTradeValues = ref(null)
 const highlightId = ref(null)
 const tableScrollY = useTableScrollY(420)
 const viewportWidth = ref(window.innerWidth)
@@ -144,9 +145,48 @@ function onTableChange(pag) {
   pagination.pageSize = pag.pageSize
 }
 
-function openCreate() {
+function openCreate(values = null) {
   editRecord.value = null
+  initialTradeValues.value = values ? { ...values } : null
   modalOpen.value = true
+}
+
+function queryText(value) {
+  return Array.isArray(value) ? String(value[0] ?? '') : String(value ?? '')
+}
+
+async function openPrefilledTrade() {
+  const query = route.query
+  if (queryText(query.new) !== '1') return
+
+  const symbol = queryText(query.symbol)
+  const side = queryText(query.side) === 'Sell' ? 'Sell' : 'Buy'
+  const qty = Number(queryText(query.qty))
+  const price = Number(queryText(query.price))
+
+  if (sideGroup.value !== 'trades') {
+    sideGroup.value = 'trades'
+    await load()
+  }
+  sideType.value = ''
+  resetPage()
+
+  openCreate({
+    side,
+    symbol,
+    qty: Number.isFinite(qty) && qty > 0 ? qty : null,
+    fill_price: Number.isFinite(price) && price >= 0 ? price : null,
+    notes: queryText(query.notes),
+  })
+
+  const remaining = { ...query }
+  delete remaining.new
+  delete remaining.side
+  delete remaining.symbol
+  delete remaining.qty
+  delete remaining.price
+  delete remaining.notes
+  await router.replace({ name: 'trades', query: remaining })
 }
 
 function openEdit(record) {
@@ -243,10 +283,18 @@ watch(
   },
 )
 
+watch(
+  () => route.query.new,
+  async (showNew, previous) => {
+    if (queryText(showNew) === '1' && showNew !== previous) await openPrefilledTrade()
+  },
+)
+
 onMounted(async () => {
   window.addEventListener('resize', onViewportResize)
   await load()
   if (route.query.editId) await focusTradeById(route.query.editId)
+  else await openPrefilledTrade()
 })
 
 onUnmounted(() => {
@@ -283,7 +331,7 @@ onUnmounted(() => {
         />
       </a-space>
       <a-space class="primary-actions">
-        <a-button type="primary" @click="openCreate">
+        <a-button type="primary" @click="openCreate()">
           <PlusOutlined /> 添加交易
         </a-button>
         <a-upload :before-upload="onUpload" :show-upload-list="false" accept=".csv">
@@ -351,7 +399,12 @@ onUnmounted(() => {
       </template>
     </a-table>
 
-    <TradeFormModal v-model:open="modalOpen" :edit-record="editRecord" @saved="onSaved" />
+    <TradeFormModal
+      v-model:open="modalOpen"
+      :edit-record="editRecord"
+      :initial-values="initialTradeValues"
+      @saved="onSaved"
+    />
   </div>
 </template>
 

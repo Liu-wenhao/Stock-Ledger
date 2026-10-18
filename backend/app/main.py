@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.api import market_api, portfolio, trades, vibe
+from app.api import market_api, portfolio, trades
 from app.core.config import get_settings
 from app.core.database import Base, SessionLocal, engine
 from app.models.entities import Portfolio
@@ -78,7 +78,6 @@ app.add_middleware(
 app.include_router(trades.router)
 app.include_router(portfolio.router)
 app.include_router(market_api.router)
-app.include_router(vibe.router)
 
 
 @app.get("/api/health")

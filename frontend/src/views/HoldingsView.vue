@@ -3,10 +3,13 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { useRoute, useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
+import { message } from 'ant-design-vue'
+import { DownloadOutlined } from '@ant-design/icons-vue'
 import { fetchHoldings, fetchTrades, refreshMarket } from '@/api/portfolio'
 import SymbolCell from '@/components/SymbolCell.vue'
 import { formatMoney, formatPct, formatQty, pnlClass, tickerOf, toNumber } from '@/utils/format'
 import { isUsMarketOpen } from '@/utils/marketHours'
+import { downloadTableImage } from '@/utils/tableImage'
 import { useTableScrollY } from '@/composables/useTableScroll'
 
 const router = useRouter()
@@ -27,23 +30,24 @@ const viewportWidth = ref(window.innerWidth)
 const tableScroll = computed(() => ({
   x:
     viewportWidth.value > 560
-      ? 1300
+      ? 1500
       : subTab.value === 'cumulative'
         ? 760
         : subTab.value === 'closed'
           ? 820
           : subTab.value === 'price'
             ? 780
-            : 960,
+            : 1140,
   y: viewportWidth.value <= 560 ? undefined : tableScrollY.value,
 }))
 const pagination = reactive({
   current: 1,
-  pageSize: 20,
+  pageSize: 10,
   showSizeChanger: true,
   showTotal: (total) => `共 ${total} 条`,
   pageSizeOptions: ['10', '20', '50', '100'],
 })
+const sortState = reactive({ field: null, order: null })
 
 const tradeModalOpen = ref(false)
 const tradeModalLoading = ref(false)
@@ -85,11 +89,22 @@ let quoteRefreshBusy = false
 
 const QUOTE_REFRESH_INTERVAL_MS = 10_000
 
-function onTableChange(pag) {
+async function onTableChange(pag, _filters, sorter) {
   if (pag) {
     pagination.current = pag.current
     pagination.pageSize = pag.pageSize
   }
+  const field = sorter?.field
+  if (!['total_pnl', 'total_pnl_percent'].includes(field)) return
+
+  const order =
+    sorter?.order === 'ascend' ? 'asc' : sorter?.order === 'descend' ? 'desc' : null
+  if (sortState.field === field && sortState.order === order) return
+
+  sortState.field = order ? field : null
+  sortState.order = order
+  pagination.current = 1
+  await load()
 }
 
 function sortByNumber(key) {
@@ -112,6 +127,8 @@ async function load({ silent = false } = {}) {
       view: isClosed ? 'closed' : isCumulative ? 'cumulative' : 'positions',
       include_closed: subTab.value === 'performance' ? includeClosed.value : false,
       q: keyword.value || undefined,
+      sort_by: sortState.field || undefined,
+      sort_order: sortState.order || undefined,
     })
     if (subTab.value === 'performance') renderPerf()
   } finally {
@@ -558,6 +575,8 @@ const positionColumns = [
   { title: '数量', dataIndex: 'quantity', key: 'quantity', align: 'right' },
   { title: '平均价格', dataIndex: 'avg_price', key: 'avg_price', align: 'right' },
   { title: '价格', dataIndex: 'last_price', key: 'last_price', align: 'right' },
+  { title: '建议止损', dataIndex: 'suggested_stop_price', key: 'suggested_stop_price', align: 'right' },
+  { title: '必须止损', dataIndex: 'mandatory_stop_price', key: 'mandatory_stop_price', align: 'right' },
   { title: '成本值', dataIndex: 'cost_basis', key: 'cost_basis', align: 'right' },
   {
     title: '值',
@@ -571,14 +590,14 @@ const positionColumns = [
     dataIndex: 'total_pnl',
     key: 'total_pnl',
     align: 'right',
-    sorter: sortByNumber('total_pnl'),
+    sorter: true,
   },
   {
     title: '累计盈亏 %',
     dataIndex: 'total_pnl_percent',
     key: 'total_pnl_percent',
     align: 'right',
-    sorter: sortByNumber('total_pnl_percent'),
+    sorter: true,
   },
 ]
 
@@ -612,11 +631,11 @@ const closedColumns = [
     sorter: sortByNumber('sell_amount'),
   },
   {
-    title: '成本值',
-    key: 'realized_cost',
-    dataIndex: 'realized_cost',
+    title: '平均价格',
+    key: 'avg_price',
+    dataIndex: 'avg_price',
     align: 'right',
-    sorter: sortByNumber('realized_cost'),
+    sorter: sortByNumber('avg_price'),
   },
   {
     title: '清仓盈亏',
@@ -641,7 +660,7 @@ const cycleColumns = [
   { title: '交易笔数', key: 'trade_count', dataIndex: 'trade_count', width: 100, align: 'right' },
   { title: '买入金额', key: 'buy_amount', dataIndex: 'buy_amount', align: 'right' },
   { title: '卖出金额', key: 'sell_amount', dataIndex: 'sell_amount', align: 'right' },
-  { title: '成本值', key: 'realized_cost', dataIndex: 'realized_cost', align: 'right' },
+  { title: '平均价格', key: 'avg_price', dataIndex: 'avg_price', align: 'right' },
   { title: '清仓盈亏', key: 'realized_pnl', dataIndex: 'realized_pnl', align: 'right' },
   { title: '清仓盈亏 %', key: 'realized_pnl_percent', dataIndex: 'realized_pnl_percent', align: 'right' },
 ]
@@ -653,8 +672,20 @@ const cumulativeColumns = [
   { title: '平均价格', key: 'avg_price', dataIndex: 'avg_price', align: 'right' },
   { title: '价格', key: 'last_price', dataIndex: 'last_price', align: 'right' },
   { title: '成本值', key: 'cost', dataIndex: 'cost', align: 'right' },
-  { title: '累计盈亏', key: 'total_pnl', dataIndex: 'total_pnl', align: 'right' },
-  { title: '累计盈亏 %', key: 'total_pnl_percent', dataIndex: 'total_pnl_percent', align: 'right' },
+  {
+    title: '累计盈亏',
+    key: 'total_pnl',
+    dataIndex: 'total_pnl',
+    align: 'right',
+    sorter: true,
+  },
+  {
+    title: '累计盈亏 %',
+    key: 'total_pnl_percent',
+    dataIndex: 'total_pnl_percent',
+    align: 'right',
+    sorter: true,
+  },
 ]
 
 const cumulativeCycleColumns = [
@@ -682,6 +713,8 @@ const compactColumnWidths = {
   quantity: 76,
   avg_price: 86,
   last_price: 90,
+  suggested_stop_price: 94,
+  mandatory_stop_price: 94,
   price: 86,
   cost_basis: 92,
   cost: 92,
@@ -692,7 +725,6 @@ const compactColumnWidths = {
   day_change_percent: 86,
   buy_amount: 94,
   sell_amount: 94,
-  realized_cost: 94,
   realized_pnl: 94,
   realized_pnl_percent: 86,
 }
@@ -732,6 +764,19 @@ function avgPriceClass(record) {
   return ''
 }
 
+function holdingStopHit(record, stopKey) {
+  if (record?.last_price == null || record?.[stopKey] == null) return false
+  return toNumber(record.last_price) <= toNumber(record[stopKey])
+}
+
+function holdingStopTone(record, stopKey) {
+  const mandatoryHit = holdingStopHit(record, 'mandatory_stop_price')
+  if (stopKey === 'mandatory_stop_price') return mandatoryHit ? 'stop-danger' : ''
+  return !mandatoryHit && holdingStopHit(record, 'suggested_stop_price')
+    ? 'stop-warning'
+    : ''
+}
+
 const positionsSummary = computed(() => {
   // 当前持仓行合计；% = 盈亏合计 / 市值合计
   const items = data.value.items || []
@@ -750,27 +795,198 @@ const positionsSummary = computed(() => {
 })
 
 const closedSummary = computed(() => {
-  const d = data.value || {}
-  const cost = toNumber(d.total_realized_cost)
-  const pnl = toNumber(d.total_realized_pnl)
+  // 汇总行只汇总它下面的行（搜索过滤后同理，与持仓表一致）。
+  // % = 清仓盈亏合计 / 成本值合计，和每一行的 盈亏/成本 同口径，
+  // 也就是各行的成本加权平均；不能用后端全量合计，否则一搜索就对不上行。
+  const items = data.value.items || []
+  const sumKey = (key) => items.reduce((acc, row) => acc + toNumber(row[key]), 0)
+  const cost = sumKey('realized_cost')
+  const pnl = sumKey('realized_pnl')
   return {
-    cycle_count: (d.items || []).reduce((acc, row) => acc + toNumber(row.cycle_count), 0),
-    trade_count: toNumber(d.total_trade_count),
-    buy_amount: toNumber(d.total_buy_amount),
-    sell_amount: toNumber(d.total_sell_amount),
+    cycle_count: sumKey('cycle_count'),
+    trade_count: sumKey('trade_count'),
+    buy_amount: sumKey('buy_amount'),
+    sell_amount: sumKey('sell_amount'),
     realized_cost: cost,
     realized_pnl: pnl,
     realized_pnl_percent: cost > 0 ? (pnl / cost) * 100 : 0,
   }
 })
 
-const cumulativeSummary = computed(() => ({
-  cycle_count: (data.value.items || []).reduce((acc, row) => acc + toNumber(row.cycle_count), 0),
-  trade_count: toNumber(data.value.total_trade_count),
-  cost: toNumber(data.value.total_cost),
-  total_pnl: toNumber(data.value.total_pnl),
-  total_pnl_percent: toNumber(data.value.total_pnl_percent),
-}))
+const cumulativeSummary = computed(() => {
+  // 同上：只汇总当前返回的行
+  const items = data.value.items || []
+  const sumKey = (key) => items.reduce((acc, row) => acc + toNumber(row[key]), 0)
+  const cost = sumKey('cost')
+  const pnl = sumKey('total_pnl')
+  return {
+    cycle_count: sumKey('cycle_count'),
+    trade_count: sumKey('trade_count'),
+    cost,
+    total_pnl: pnl,
+    total_pnl_percent: cost > 0 ? (pnl / cost) * 100 : 0,
+  }
+})
+
+// ── 汇总行 ──────────────────────────────────────────────────────────────
+// 每张表的汇总行只有这一份定义：表格的 #summary 和"下载图片"都读它，
+// 省得两边各写一遍再走岔（单元格顺序必须严格等于上面列数组的顺序，
+// 展开列占位不在这里，由模板自己补）。
+const positionsSummaryCells = computed(() => [
+  { text: '汇总', strong: true }, // 商品代码
+  { text: String(positionsSummary.value.trade_count), align: 'right' }, // 交易笔数
+  { text: formatPct(positionsSummary.value.allocation).replace('+', ''), align: 'right' }, // 分配 %
+  { text: formatQty(positionsSummary.value.quantity), align: 'right' }, // 数量
+  { text: '—', align: 'right' }, // 平均价格是各标的自己的价格，合计无意义
+  { text: '—', align: 'right' }, // 价格同上
+  { text: '—', align: 'right' }, // 建议止损按个股计算
+  { text: '—', align: 'right' }, // 必须止损按个股成本计算
+  { text: formatMoney(positionsSummary.value.cost_basis), align: 'right' }, // 成本值
+  { text: formatMoney(positionsSummary.value.market_value), align: 'right' }, // 值
+  // 累计盈亏
+  {
+    text: formatMoney(positionsSummary.value.total_pnl),
+    tone: pnlClass(positionsSummary.value.total_pnl),
+    align: 'right',
+  },
+  // 累计盈亏 %
+  {
+    text: formatPct(positionsSummary.value.total_pnl_percent),
+    tone: pnlClass(positionsSummary.value.total_pnl_percent),
+    align: 'right',
+  },
+])
+
+const cumulativeSummaryCells = computed(() => [
+  { text: '汇总', strong: true }, // 商品代码
+  { text: String(cumulativeSummary.value.cycle_count), align: 'right' }, // 周期数
+  { text: String(cumulativeSummary.value.trade_count), align: 'right' }, // 交易笔数
+  { text: '—', align: 'right' }, // 平均价格
+  { text: '—', align: 'right' }, // 价格
+  { text: formatMoney(cumulativeSummary.value.cost), align: 'right' }, // 成本值
+  // 累计盈亏
+  {
+    text: formatMoney(cumulativeSummary.value.total_pnl),
+    tone: pnlClass(cumulativeSummary.value.total_pnl),
+    align: 'right',
+  },
+  // 累计盈亏 %
+  {
+    text: formatPct(cumulativeSummary.value.total_pnl_percent),
+    tone: pnlClass(cumulativeSummary.value.total_pnl_percent),
+    align: 'right',
+  },
+])
+
+const closedSummaryCells = computed(() => [
+  { text: '汇总', strong: true }, // 商品代码
+  { text: String(closedSummary.value.cycle_count), align: 'right' }, // 周期数
+  { text: String(closedSummary.value.trade_count), align: 'right' }, // 交易笔数
+  { text: formatMoney(closedSummary.value.buy_amount), align: 'right' }, // 买入金额
+  { text: formatMoney(closedSummary.value.sell_amount), align: 'right' }, // 卖出金额
+  { text: '—', align: 'right' }, // 平均价格
+  // 清仓盈亏
+  {
+    text: formatMoney(closedSummary.value.realized_pnl),
+    tone: pnlClass(closedSummary.value.realized_pnl),
+    align: 'right',
+  },
+  // 清仓盈亏 %
+  {
+    text: formatPct(closedSummary.value.realized_pnl_percent),
+    tone: pnlClass(closedSummary.value.realized_pnl_percent),
+    align: 'right',
+  },
+])
+
+// ── 下载图片 ────────────────────────────────────────────────────────────
+// 单元格值和表格里的渲染保持一致（包括 null 显示 —、金额带 USD、红绿配色）。
+const isBlank = (v) => v == null || v === ''
+const imageMoney = (v) => (isBlank(v) ? '—' : formatMoney(v))
+const imagePrice = (v) => (isBlank(v) ? '—' : formatMoney(v).replace(' USD', ''))
+const imagePct = (v) => (isBlank(v) ? '—' : formatPct(v))
+const imageSymbol = (r) => ({ text: tickerOf(r.symbol), secondary: r.name || '' })
+const imagePnl = (v) => ({ text: imageMoney(v), tone: pnlClass(v) })
+const imagePriceCell = (v, asOf) => {
+  if (isBlank(v)) return { text: '—' }
+  const at = formatCloseDate(asOf)
+  return { text: imagePrice(v), secondary: at ? `(${at})` : '' }
+}
+
+const positionImageCells = {
+  symbol: imageSymbol,
+  trade_count: (r) => String(r.trade_count ?? 0),
+  allocation: (r) => formatPct(r.allocation).replace('+', ''),
+  quantity: (r) => formatQty(r.quantity),
+  avg_price: (r) => imagePrice(r.avg_price),
+  last_price: (r) => imagePriceCell(r.last_price, r.price_as_of),
+  suggested_stop_price: (r) => imagePrice(r.suggested_stop_price),
+  mandatory_stop_price: (r) => imagePrice(r.mandatory_stop_price),
+  cost_basis: (r) => imageMoney(r.cost_basis),
+  market_value: (r) => imageMoney(r.market_value),
+  total_pnl: (r) => imagePnl(r.total_pnl),
+  total_pnl_percent: (r) => ({ text: imagePct(r.total_pnl_percent), tone: pnlClass(r.total_pnl_percent) }),
+}
+
+const cumulativeImageCells = {
+  symbol: imageSymbol,
+  cycle_count: (r) => String(r.cycle_count ?? 0),
+  trade_count: (r) => String(r.trade_count ?? 0),
+  avg_price: (r) => imagePrice(r.avg_price),
+  last_price: (r) => imagePriceCell(r.last_price, r.price_as_of),
+  cost: (r) => imageMoney(r.cost),
+  total_pnl: (r) => imagePnl(r.total_pnl),
+  total_pnl_percent: (r) => ({ text: imagePct(r.total_pnl_percent), tone: pnlClass(r.total_pnl_percent) }),
+}
+
+const closedImageCells = {
+  symbol: imageSymbol,
+  cycle_count: (r) => String(r.cycle_count ?? 0),
+  trade_count: (r) => String(r.trade_count ?? 0),
+  buy_amount: (r) => imageMoney(r.buy_amount),
+  sell_amount: (r) => imageMoney(r.sell_amount),
+  avg_price: (r) => imagePrice(r.avg_price),
+  realized_pnl: (r) => imagePnl(r.realized_pnl),
+  realized_pnl_percent: (r) => ({ text: imagePct(r.realized_pnl_percent), tone: pnlClass(r.realized_pnl_percent) }),
+}
+
+const imageTabs = {
+  positions: { title: '持仓', columns: positionColumns, cells: positionImageCells, summary: positionsSummaryCells },
+  cumulative: {
+    title: '累计',
+    columns: cumulativeColumns,
+    cells: cumulativeImageCells,
+    summary: cumulativeSummaryCells,
+  },
+  closed: { title: '清仓', columns: closedColumns, cells: closedImageCells, summary: closedSummaryCells },
+}
+
+const imageExporting = ref(false)
+
+async function handleDownloadImage(tab) {
+  const spec = imageTabs[tab]
+  const items = data.value.items || []
+  if (!spec || !items.length || imageExporting.value) return
+  imageExporting.value = true
+  try {
+    const search = keyword.value ? ` · 搜索「${keyword.value}」` : ''
+    const ok = await downloadTableImage({
+      title: spec.title,
+      subtitle: `${dayjs().format('YYYY-MM-DD HH:mm')} · 共 ${items.length} 行${search}`,
+      columns: spec.columns,
+      // 直接铺全部行：分页是前端做的，图片不受当前页码限制
+      rows: items.map((row) => spec.columns.map((column) => spec.cells[column.key](row))),
+      summary: spec.summary.value.map((cell) => ({ text: cell.text, tone: cell.tone })),
+      filename: `${spec.title}-${dayjs().format('YYYYMMDD-HHmmss')}`,
+    })
+    if (ok) message.success('图片已开始下载')
+    else message.error('生成图片失败')
+  } catch {
+    message.error('生成图片失败')
+  } finally {
+    imageExporting.value = false
+  }
+}
 
 const perfItems = computed(() => {
   let items = [...(data.value.items || [])]
@@ -925,6 +1141,8 @@ watch(
   () => route.name,
   (name) => {
     subTab.value = name === 'prices' ? 'price' : subTab.value === 'price' ? 'positions' : subTab.value
+    sortState.field = null
+    sortState.order = null
     pagination.current = 1
     load()
   },
@@ -932,6 +1150,8 @@ watch(
 
 watch([subTab, includeClosed], () => {
   if (isPricePage.value) return
+  sortState.field = null
+  sortState.order = null
   pagination.current = 1
   load()
 })
@@ -1010,6 +1230,13 @@ onUnmounted(() => {
           allow-clear
           @search="load"
         />
+        <a-button
+          :loading="imageExporting"
+          :disabled="!data.items.length"
+          @click="handleDownloadImage('cumulative')"
+        >
+          <DownloadOutlined /> 下载图片
+        </a-button>
       </div>
       <div class="mobile-scroll-hint">左右滑动查看完整的周期数据</div>
       <a-table
@@ -1106,23 +1333,24 @@ onUnmounted(() => {
             <span :class="pnlClass(record.total_pnl)">{{ formatMoney(record.total_pnl) }}</span>
           </template>
           <template v-else-if="column.key === 'total_pnl_percent'">
-            <span :class="pnlClass(record.total_pnl_percent)">{{ formatPct(record.total_pnl_percent) }}</span>
+            <span v-if="record.total_pnl_percent == null">—</span>
+            <span v-else :class="pnlClass(record.total_pnl_percent)">{{ formatPct(record.total_pnl_percent) }}</span>
           </template>
         </template>
         <template #summary>
           <a-table-summary fixed>
             <a-table-summary-row class="holdings-summary-row">
-              <a-table-summary-cell :index="0"><strong>汇总</strong></a-table-summary-cell>
-              <a-table-summary-cell :index="1" align="right">—</a-table-summary-cell>
-              <a-table-summary-cell :index="2" align="right">{{ cumulativeSummary.cycle_count }}</a-table-summary-cell>
-              <a-table-summary-cell :index="3" align="right">{{ cumulativeSummary.trade_count }}</a-table-summary-cell>
-              <a-table-summary-cell :index="4" align="right">—</a-table-summary-cell>
-              <a-table-summary-cell :index="5" align="right">{{ formatMoney(cumulativeSummary.cost) }}</a-table-summary-cell>
-              <a-table-summary-cell :index="6" align="right">
-                <span :class="pnlClass(cumulativeSummary.total_pnl)">{{ formatMoney(cumulativeSummary.total_pnl) }}</span>
-              </a-table-summary-cell>
-              <a-table-summary-cell :index="7" align="right">
-                <span :class="pnlClass(cumulativeSummary.total_pnl_percent)">{{ formatPct(cumulativeSummary.total_pnl_percent) }}</span>
+              <!-- expandedRowRender 会让 ant-design-vue 在最前面插一个展开列，
+                   所以先补一格占位，汇总内容按 cumulativeSummaryCells 的顺序铺 -->
+              <a-table-summary-cell :index="0" />
+              <a-table-summary-cell
+                v-for="(cell, i) in cumulativeSummaryCells"
+                :key="i"
+                :index="i + 1"
+                :align="cell.align"
+              >
+                <strong v-if="cell.strong">{{ cell.text }}</strong>
+                <span v-else :class="cell.tone">{{ cell.text }}</span>
               </a-table-summary-cell>
             </a-table-summary-row>
           </a-table-summary>
@@ -1139,6 +1367,13 @@ onUnmounted(() => {
           allow-clear
           @search="load"
         />
+        <a-button
+          :loading="imageExporting"
+          :disabled="!data.items.length"
+          @click="handleDownloadImage('closed')"
+        >
+          <DownloadOutlined /> 下载图片
+        </a-button>
       </div>
       <div class="mobile-scroll-hint">左右滑动查看买入、卖出和盈亏</div>
       <a-table
@@ -1179,7 +1414,7 @@ onUnmounted(() => {
                 </a>
                 <span v-else>0</span>
               </template>
-              <template v-else-if="['buy_amount', 'sell_amount', 'realized_cost'].includes(column.key)">
+              <template v-else-if="['buy_amount', 'sell_amount', 'avg_price'].includes(column.key)">
                 {{ formatMoney(cycle[column.key]) }}
               </template>
               <template v-else-if="column.key === 'realized_pnl'">
@@ -1205,7 +1440,7 @@ onUnmounted(() => {
             </a>
             <span v-else>0</span>
           </template>
-          <template v-else-if="['buy_amount', 'sell_amount', 'realized_cost'].includes(column.key)">
+          <template v-else-if="['buy_amount', 'sell_amount', 'avg_price'].includes(column.key)">
             {{ formatMoney(record[column.key]) }}
           </template>
           <template v-else-if="column.key === 'realized_pnl'">
@@ -1220,18 +1455,16 @@ onUnmounted(() => {
         <template #summary>
           <a-table-summary fixed>
             <a-table-summary-row class="holdings-summary-row">
+              <!-- 同累计表：展开列占位一格，其余按 closedSummaryCells 的顺序铺 -->
               <a-table-summary-cell :index="0" />
-              <a-table-summary-cell :index="1"><strong>汇总</strong></a-table-summary-cell>
-              <a-table-summary-cell :index="2" align="right">{{ closedSummary.cycle_count }}</a-table-summary-cell>
-              <a-table-summary-cell :index="3" align="right">{{ closedSummary.trade_count }}</a-table-summary-cell>
-              <a-table-summary-cell :index="4" align="right">{{ formatMoney(closedSummary.buy_amount) }}</a-table-summary-cell>
-              <a-table-summary-cell :index="5" align="right">{{ formatMoney(closedSummary.sell_amount) }}</a-table-summary-cell>
-              <a-table-summary-cell :index="6" align="right">{{ formatMoney(closedSummary.realized_cost) }}</a-table-summary-cell>
-              <a-table-summary-cell :index="7" align="right">
-                <span :class="pnlClass(closedSummary.realized_pnl)">{{ formatMoney(closedSummary.realized_pnl) }}</span>
-              </a-table-summary-cell>
-              <a-table-summary-cell :index="8" align="right">
-                <span :class="pnlClass(closedSummary.realized_pnl_percent)">{{ formatPct(closedSummary.realized_pnl_percent) }}</span>
+              <a-table-summary-cell
+                v-for="(cell, i) in closedSummaryCells"
+                :key="i"
+                :index="i + 1"
+                :align="cell.align"
+              >
+                <strong v-if="cell.strong">{{ cell.text }}</strong>
+                <span v-else :class="cell.tone">{{ cell.text }}</span>
               </a-table-summary-cell>
             </a-table-summary-row>
           </a-table-summary>
@@ -1248,8 +1481,15 @@ onUnmounted(() => {
           allow-clear
           @search="load"
         />
+        <a-button
+          :loading="imageExporting"
+          :disabled="!data.items.length"
+          @click="handleDownloadImage('positions')"
+        >
+          <DownloadOutlined /> 下载图片
+        </a-button>
       </div>
-      <div class="mobile-scroll-hint">左右滑动查看价格和盈亏</div>
+      <div class="mobile-scroll-hint">左右滑动查看价格、止损和盈亏</div>
       <a-table
         class="mobile-data-table holdings-table positions-table"
         :columns="columns"
@@ -1288,6 +1528,11 @@ onUnmounted(() => {
               >({{ formatCloseDate(record.price_as_of) }})</span>
             </span>
           </template>
+          <template v-else-if="['suggested_stop_price', 'mandatory_stop_price'].includes(column.key)">
+            <span class="holding-stop-price" :class="holdingStopTone(record, column.key)">
+              {{ record[column.key] == null ? '—' : formatMoney(record[column.key]).replace(' USD', '') }}
+            </span>
+          </template>
           <template v-else-if="column.key === 'avg_price'">
             <a
               v-if="record.avg_price != null && subTab === 'positions'"
@@ -1321,35 +1566,15 @@ onUnmounted(() => {
         <template v-if="subTab === 'positions'" #summary>
           <a-table-summary fixed>
             <a-table-summary-row class="holdings-summary-row">
-              <a-table-summary-cell :index="0">
-                <strong>汇总</strong>
-              </a-table-summary-cell>
-              <a-table-summary-cell :index="1" align="right">
-                {{ positionsSummary.trade_count }}
-              </a-table-summary-cell>
-              <a-table-summary-cell :index="2" align="right">
-                {{ formatPct(positionsSummary.allocation).replace('+', '') }}
-              </a-table-summary-cell>
-              <a-table-summary-cell :index="3" align="right">
-                {{ formatQty(positionsSummary.quantity) }}
-              </a-table-summary-cell>
-              <a-table-summary-cell :index="4" align="right">—</a-table-summary-cell>
-              <a-table-summary-cell :index="5" align="right">—</a-table-summary-cell>
-              <a-table-summary-cell :index="6" align="right">
-                {{ formatMoney(positionsSummary.cost_basis) }}
-              </a-table-summary-cell>
-              <a-table-summary-cell :index="7" align="right">
-                {{ formatMoney(positionsSummary.market_value) }}
-              </a-table-summary-cell>
-              <a-table-summary-cell :index="8" align="right">
-                <span :class="pnlClass(positionsSummary.total_pnl)">
-                  {{ formatMoney(positionsSummary.total_pnl) }}
-                </span>
-              </a-table-summary-cell>
-              <a-table-summary-cell :index="9" align="right">
-                <span :class="pnlClass(positionsSummary.total_pnl_percent)">
-                  {{ formatPct(positionsSummary.total_pnl_percent) }}
-                </span>
+              <!-- 持仓表没有展开列，汇总内容按 positionsSummaryCells 的顺序直接铺 -->
+              <a-table-summary-cell
+                v-for="(cell, i) in positionsSummaryCells"
+                :key="i"
+                :index="i"
+                :align="cell.align"
+              >
+                <strong v-if="cell.strong">{{ cell.text }}</strong>
+                <span v-else :class="cell.tone">{{ cell.text }}</span>
               </a-table-summary-cell>
             </a-table-summary-row>
           </a-table-summary>
@@ -1632,5 +1857,18 @@ onUnmounted(() => {
   .avg-price-chart {
     height: 280px;
   }
+}
+
+/* 持仓表：仅在价格触及相关止损位时着色，必须止损优先。 */
+.holding-stop-price {
+  font-variant-numeric: tabular-nums;
+}
+.holding-stop-price.stop-warning {
+  color: #a96b00;
+  font-weight: 650;
+}
+.holding-stop-price.stop-danger {
+  color: #b52f27;
+  font-weight: 750;
 }
 </style>

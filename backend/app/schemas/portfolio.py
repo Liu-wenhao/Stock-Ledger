@@ -40,11 +40,20 @@ class HoldingRow(BaseModel):
     logo_url: str | None = None
     exchange: str | None = None
     quantity: Decimal
+    # Break-even basis: includes this cycle's realized P/L, so that
+    # (last_price - avg_price) * quantity == total_pnl
     avg_price: Decimal
     last_price: Decimal | None = None
+    # Strategy stop levels for the open lot: trailing high-water -8% and cost -12%.
+    suggested_stop_price: Decimal | None = None
+    mandatory_stop_price: Decimal | None = None
     # US market quote/bar time for last_price / 价格; omit/null when unknown
     price_as_of: datetime | None = None
     cost_basis: Decimal
+    # Raw moving-average cost of the open lot (money actually still in it),
+    # before realized P/L is folded in. Used for 投资总额.
+    lot_avg_price: Decimal = Decimal("0")
+    lot_cost_basis: Decimal = Decimal("0")
     market_value: Decimal
     invested: Decimal = Decimal("0")
     allocation: Decimal
@@ -74,6 +83,8 @@ class ClosedCycleRow(BaseModel):
     realized_pnl_percent: Decimal = Decimal("0")
     buy_amount: Decimal = Decimal("0")
     sell_amount: Decimal = Decimal("0")
+    # Weighted average buy price over the cycle: buy_amount / buy_quantity
+    avg_price: Decimal = Decimal("0")
 
 
 class ClosedHoldingRow(BaseModel):
@@ -88,6 +99,8 @@ class ClosedHoldingRow(BaseModel):
     realized_pnl_percent: Decimal = Decimal("0")
     buy_amount: Decimal = Decimal("0")
     sell_amount: Decimal = Decimal("0")
+    # Weighted average buy price across all closed cycles of this symbol
+    avg_price: Decimal = Decimal("0")
     currently_open: bool = False
     # Named cycles (not children) so ant-design-vue won't treat rows as tree data
     cycles: list[ClosedCycleRow] = Field(default_factory=list)
@@ -135,7 +148,8 @@ class CumulativeHoldingRow(BaseModel):
     price_as_of: datetime | None = None
     cost: Decimal = Decimal("0")
     total_pnl: Decimal = Decimal("0")
-    total_pnl_percent: Decimal = Decimal("0")
+    # None when the diluted cost basis is <= 0 (nothing left at risk)
+    total_pnl_percent: Decimal | None = None
     cycles: list[CumulativeCycleRow] = Field(default_factory=list)
 
 
@@ -267,3 +281,135 @@ class SymbolSearchItem(BaseModel):
     symbol: str
     name: str | None = None
     logo_url: str | None = None
+
+
+class ReviewMeta(BaseModel):
+    trades: int = 0
+    symbols: int = 0
+    first_trade_at: datetime | None = None
+    last_trade_at: datetime | None = None
+
+
+class ReviewCapital(BaseModel):
+    deposits: Decimal = Decimal("0")
+    buy_notional: Decimal = Decimal("0")
+    sell_notional: Decimal = Decimal("0")
+    turnover_x: Decimal = Decimal("0")
+    commissions: Decimal = Decimal("0")
+    realized: Decimal = Decimal("0")
+    realized_pct: Decimal = Decimal("0")
+
+
+class ReviewBehavior(BaseModel):
+    closed_cycles: int = 0
+    wins: int = 0
+    losses: int = 0
+    win_rate: Decimal = Decimal("0")
+    avg_win: Decimal = Decimal("0")
+    avg_loss: Decimal = Decimal("0")
+    payoff: Decimal = Decimal("0")
+    profit_factor: Decimal = Decimal("0")
+    avg_win_days: Decimal = Decimal("0")
+    avg_loss_days: Decimal = Decimal("0")
+    addon_below_avg: int = 0
+    same_day_flips: int = 0
+    t_trades: int = 0
+    t_wins: int = 0
+    t_losses: int = 0
+    t_win_rate: Decimal = Decimal("0")
+    t_pnl: Decimal = Decimal("0")
+
+
+class ReviewSymbolRow(BaseModel):
+    symbol: str
+    realized: Decimal = Decimal("0")
+    cost: Decimal = Decimal("0")
+    return_pct: Decimal = Decimal("0")
+    cycles: int = 0
+    trades: int = 0
+    avg_holding_days: Decimal = Decimal("0")
+    addon_below_avg: int = 0
+
+
+class ReviewMonthRow(BaseModel):
+    month: str
+    trades: int = 0
+    realized: Decimal = Decimal("0")
+    wins: int = 0
+    losses: int = 0
+
+
+class ReviewCycleRow(BaseModel):
+    symbol: str
+    started_at: datetime
+    ended_at: datetime
+    holding_days: int = 0
+    realized: Decimal = Decimal("0")
+    cost: Decimal = Decimal("0")
+    return_pct: Decimal = Decimal("0")
+    trades: int = 0
+    addon_below_avg: int = 0
+
+
+class ReviewOpenPosition(BaseModel):
+    symbol: str
+    qty: Decimal = Decimal("0")
+    avg_price: Decimal = Decimal("0")
+    cost: Decimal = Decimal("0")
+    cycle_started_at: datetime | None = None
+
+
+class ReviewResponse(BaseModel):
+    meta: ReviewMeta
+    capital: ReviewCapital
+    behavior: ReviewBehavior
+    symbols: list[ReviewSymbolRow] = Field(default_factory=list)
+    monthly: list[ReviewMonthRow] = Field(default_factory=list)
+    cycles: list[ReviewCycleRow] = Field(default_factory=list)
+    open_positions: list[ReviewOpenPosition] = Field(default_factory=list)
+
+
+class StrategyOpenPosition(ReviewOpenPosition):
+    current_price: Decimal | None = None
+    market_value: Decimal | None = None
+    pnl: Decimal | None = None
+    pnl_pct: Decimal | None = None
+    holding_days: int = 0
+    time_stop_due: bool = False
+    hard_stop_price: Decimal | None = None
+    trailing_stop_price: Decimal | None = None
+    high_water_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    stop_source: str = "硬止损"
+    action: str = "hold"
+    action_tone: str = "hold"
+    action_label: str = ""
+    action_note: str = ""
+
+
+class ReentryCandidate(BaseModel):
+    symbol: str
+    exited_at: datetime
+    sessions_since_exit: int = 0
+    sessions_estimated: bool = False
+    cooldown_sessions: int = 5
+    cooldown_met: bool = False
+    cooldown_remaining: int = 5
+    current_price: Decimal | None = None
+    ma10: Decimal | None = None
+    previous_20_high: Decimal | None = None
+    stabilized: bool = False
+    breakout: bool = False
+    technical_signal: str = ""
+    technical_ready: bool = False
+    prior_realized: Decimal = Decimal("0")
+    prior_return_pct: Decimal = Decimal("0")
+    status: str = "watching"
+    status_label: str = ""
+    status_note: str = ""
+
+
+class StrategyResponse(ReviewResponse):
+    open_positions: list[StrategyOpenPosition] = Field(default_factory=list)
+    reentry_candidates: list[ReentryCandidate] = Field(default_factory=list)
+    reentry_screened: int = 0
