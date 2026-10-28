@@ -5,10 +5,12 @@
 // 顺带能把 pnl-up / pnl-down 的红绿配色和"代码 + 名称"两段式单元格还原出来。
 //
 // 单元格结构：每行是一个与 columns 等长的数组，元素可以是
-//   { text, secondary?, tone? }
-//   - text      主文本（必填）
-//   - secondary 紧跟其后的灰色小字，用于股票名称、行情时间这类附属信息
-//   - tone      直接传 pnlClass() 的返回值（'pnl-up' / 'pnl-down' / ''）
+//   { text, suffix?, suffixTone?, secondary?, tone? }
+//   - text       主文本（必填）
+//   - suffix     紧跟主文本的小字，用于今日涨跌幅这类紧贴价格的附属信息
+//   - suffixTone suffix 的颜色，同样传 pnlClass() 的返回值
+//   - secondary  再往后的灰色小字，用于股票名称、行情时间这类附属信息
+//   - tone       主文本颜色，直接传 pnlClass() 的返回值（'pnl-up' / 'pnl-down' / ''）
 // 也可以直接传字符串，等价于只填 text 的简写。
 
 const FONT_STACK = '"Trebuchet MS", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif'
@@ -60,6 +62,7 @@ function textWidth(ctx, text, font) {
 
 function cellWidth(ctx, cell) {
   let w = textWidth(ctx, cell.text, CELL_FONT)
+  if (cell.suffix) w += SECONDARY_GAP + textWidth(ctx, cell.suffix, SECONDARY_FONT)
   if (cell.secondary) w += SECONDARY_GAP + textWidth(ctx, cell.secondary, SECONDARY_FONT)
   return w
 }
@@ -72,19 +75,32 @@ function drawCell(ctx, cell, left, colWidth, centerY, align, font, color) {
   ctx.textBaseline = 'middle'
 
   const mainW = textWidth(ctx, cell.text, font)
+  const suffixW = cell.suffix
+    ? SECONDARY_GAP + textWidth(ctx, cell.suffix, SECONDARY_FONT)
+    : 0
   const secondaryW = cell.secondary
     ? SECONDARY_GAP + textWidth(ctx, cell.secondary, SECONDARY_FONT)
     : 0
-  const x = align === 'right' ? right - CELL_PAD - (mainW + secondaryW) : left + CELL_PAD
+  const x = align === 'right'
+    ? right - CELL_PAD - (mainW + suffixW + secondaryW)
+    : left + CELL_PAD
+  let cursorX = x + mainW
 
   ctx.font = font
   ctx.fillStyle = toneColor(cell.tone) || color
   ctx.fillText(cell.text, x, centerY)
 
+  if (cell.suffix) {
+    ctx.font = SECONDARY_FONT
+    ctx.fillStyle = toneColor(cell.suffixTone) || COLORS.muted
+    ctx.fillText(cell.suffix, cursorX + SECONDARY_GAP, centerY)
+    cursorX += suffixW
+  }
+
   if (cell.secondary) {
     ctx.font = SECONDARY_FONT
     ctx.fillStyle = COLORS.muted
-    ctx.fillText(cell.secondary, x + mainW + SECONDARY_GAP, centerY)
+    ctx.fillText(cell.secondary, cursorX + SECONDARY_GAP, centerY)
   }
 }
 

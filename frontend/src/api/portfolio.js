@@ -5,11 +5,23 @@ export const fetchNav = (params) => http.get('/api/portfolio/nav', { params }).t
 export const fetchMovers = () => http.get('/api/portfolio/daily-movers').then((r) => r.data)
 export const fetchDailyPnl = (params) =>
   http.get('/api/portfolio/daily-pnl', { params }).then((r) => r.data)
+export const fetchDailyHoldings = (date) =>
+  http.get('/api/portfolio/daily-holdings', { params: { date } }).then((r) => r.data)
+export const fetchPeriodHoldings = (startDate, endDate) =>
+  http.get('/api/portfolio/period-holdings', { params: { start_date: startDate, end_date: endDate } }).then((r) => r.data)
 export const fetchTotalMovers = (params) =>
   http.get('/api/portfolio/total-movers', { params }).then((r) => r.data)
 export const fetchPeriodPerformance = (params) =>
   http.get('/api/portfolio/period-performance', { params }).then((r) => r.data)
 export const fetchHoldings = (params) => http.get('/api/holdings', { params }).then((r) => r.data)
+export const fetchHoldingsAdvice = () => http.get('/api/holdings/advice').then((r) => r.data)
+export const fetchIndicatorHistory = (symbol, days = 30) =>
+  http.get('/api/holdings/indicator-history', { params: { symbol, days } }).then((r) => r.data)
+export const fetchMarketSentiment = () => http.get('/api/market/sentiment').then((r) => r.data)
+export const updateHoldingStop = (data) =>
+  http.put('/api/holdings/stop', data).then((r) => r.data)
+export const updateHoldingLimit = (data) =>
+  http.put('/api/holdings/limit', data).then((r) => r.data)
 export const fetchMonthlyReturns = (params) =>
   http.get('/api/analysis/monthly-returns', { params }).then((r) => r.data)
 export const fetchProfitSeries = (params) =>

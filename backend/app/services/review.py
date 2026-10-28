@@ -47,6 +47,7 @@ class Cycle:
     sell_qty: Decimal = ZERO
     buy_amount: Decimal = ZERO
     sell_amount: Decimal = ZERO
+    exit_price: Decimal | None = None
     realized: Decimal = ZERO
     cost: Decimal = ZERO
     trades: int = 0
@@ -157,6 +158,7 @@ def _replay(trades: list[Trade]) -> dict:
         pos.qty -= sell_qty
         pos.cost = pos.avg * pos.qty
         if pos.qty <= _EPS:
+            cyc.exit_price = price
             pos.qty = pos.cost = pos.avg = ZERO
             closed.append(cyc)
             open_cycles.pop(symbol, None)
@@ -182,11 +184,22 @@ def _replay(trades: list[Trade]) -> dict:
         )
     same_day_flips.sort(key=lambda r: (r["date"], r["symbol"]))
 
-    open_positions = [
-        {"symbol": sym, "qty": p.qty, "avg_price": p.avg, "cost": p.cost}
-        for sym, p in positions.items()
-        if p.qty > _EPS
-    ]
+    open_positions = []
+    for sym, p in positions.items():
+        if p.qty <= _EPS:
+            continue
+        cycle = open_cycles.get(sym)
+        open_positions.append(
+            {
+                "symbol": sym,
+                "qty": p.qty,
+                "avg_price": p.avg,
+                "cost": p.cost,
+                # Holdings reports the current cycle's total P/L: the open lot's
+                # unrealized P/L plus realized P/L from partial sells in this cycle.
+                "realized_pnl": cycle.realized if cycle else ZERO,
+            }
+        )
     open_positions.sort(key=lambda r: r["cost"], reverse=True)
 
     return {
@@ -300,6 +313,7 @@ def build_review(db: Session, portfolio_id: int = 1) -> dict:
             "realized": _q(c.realized),
             "cost": _q(c.cost),
             "return_pct": _q(c.return_pct),
+            "exit_price": _q(c.exit_price) if c.exit_price is not None else None,
             "trades": c.trades,
             "addon_below_avg": c.addon_below_avg,
         }
@@ -359,6 +373,7 @@ def build_review(db: Session, portfolio_id: int = 1) -> dict:
                 "qty": _q(p["qty"], "0.0001"),
                 "avg_price": _q(p["avg_price"], "0.0001"),
                 "cost": _q(p["cost"]),
+                "realized_pnl": _q(p["realized_pnl"]),
                 "cycle_started_at": next(
                     (
                         c.started_at
@@ -592,6 +607,16 @@ def _enrich_open_positions(
             (current / avg_price - Decimal("1")) * Decimal("100")
             if current is not None and avg_price > ZERO else None
         )
+        realized_pnl = Decimal(row.get("realized_pnl") or 0)
+        total_pnl = pnl + realized_pnl if pnl is not None else None
+        # Match the holdings page: current-cycle P/L is measured against the
+        # break-even cost (open-lot cost less realized P/L from this cycle).
+        total_cost = Decimal(row["cost"])
+        pnl_base = total_cost - realized_pnl
+        total_pnl_pct = (
+            (total_pnl / pnl_base) * Decimal("100")
+            if total_pnl is not None and pnl_base > ZERO else None
+        )
         holding_days = max((today - cycle_day).days, 0) if cycle_day else 0
         plan = _position_plan(avg_price, current, relevant, holding_days)
         enriched.append(
@@ -603,6 +628,9 @@ def _enrich_open_positions(
                 "market_value": _q(market_value) if market_value is not None else None,
                 "pnl": _q(pnl) if pnl is not None else None,
                 "pnl_pct": _q(pnl_pct) if pnl_pct is not None else None,
+                "realized_pnl": _q(realized_pnl),
+                "total_pnl": _q(total_pnl) if total_pnl is not None else None,
+                "total_pnl_percent": _q(total_pnl_pct) if total_pnl_pct is not None else None,
                 **plan,
             }
         )
@@ -703,6 +731,10 @@ def _build_reentry_candidates(
         current = _decimal_or_none(quotes.get(symbol, {}).get("price"))
         if current is None and closes:
             current = closes[sorted(closes)[-1]]
+        exit_price = cycle.get("exit_price")
+        change_since_exit_pct = None
+        if current is not None and exit_price is not None and exit_price > ZERO:
+            change_since_exit_pct = _q((current - exit_price) / exit_price * Decimal("100"))
         technical = _technical_snapshot(closes, current)
 
         if not cooldown_met:
@@ -732,6 +764,8 @@ def _build_reentry_candidates(
                 "cooldown_met": cooldown_met,
                 "cooldown_remaining": max(REENTRY_COOLDOWN_SESSIONS - sessions, 0),
                 "current_price": _q(current) if current is not None else None,
+                "exit_price": _q(exit_price) if exit_price is not None else None,
+                "change_since_exit_pct": change_since_exit_pct,
                 "ma10": technical["ma10"],
                 "previous_20_high": technical["previous_20_high"],
                 "stabilized": technical["stabilized"],

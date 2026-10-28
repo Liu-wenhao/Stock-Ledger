@@ -47,6 +47,12 @@ class HoldingRow(BaseModel):
     # Strategy stop levels for the open lot: trailing high-water -8% and cost -12%.
     suggested_stop_price: Decimal | None = None
     mandatory_stop_price: Decimal | None = None
+    # User-set stop on the holdings page; quantity is how many shares to sell.
+    stop_price: Decimal | None = None
+    stop_qty: Decimal | None = None
+    # Planned position: share count and/or max cash still in this name.
+    target_qty: Decimal | None = None
+    max_buy_amount: Decimal | None = None
     # US market quote/bar time for last_price / 价格; omit/null when unknown
     price_as_of: datetime | None = None
     cost_basis: Decimal
@@ -110,6 +116,26 @@ class HoldingsResponse(BaseModel):
     items: list[HoldingRow]
     total_market_value: Decimal
     cash: Decimal
+
+
+class PositionStopUpdate(BaseModel):
+    symbol: str
+    stop_price: Decimal | None = None
+    stop_qty: Decimal | None = None
+
+
+class PositionLimitUpdate(BaseModel):
+    symbol: str
+    target_qty: Decimal | None = None
+    max_buy_amount: Decimal | None = None
+
+
+class PositionStopOut(BaseModel):
+    symbol: str
+    stop_price: Decimal | None = None
+    stop_qty: Decimal | None = None
+    target_qty: Decimal | None = None
+    max_buy_amount: Decimal | None = None
 
 
 class ClosedHoldingsResponse(BaseModel):
@@ -261,6 +287,37 @@ class DailyPnlCalendarResponse(BaseModel):
     summary: DailyPnlSummary
 
 
+class DailyHoldingPnlRow(BaseModel):
+    symbol: str
+    name: str | None = None
+    logo_url: str | None = None
+    exchange: str | None = None
+    opening_quantity: Decimal = Decimal("0")
+    quantity: Decimal = Decimal("0")
+    prev_close: Decimal | None = None
+    close_price: Decimal | None = None
+    buy_amount: Decimal = Decimal("0")
+    sell_amount: Decimal = Decimal("0")
+    commission: Decimal = Decimal("0")
+    gross_pnl: Decimal | None = None
+    gross_pnl_percent: Decimal | None = None
+    day_pnl: Decimal | None = None
+    day_pnl_percent: Decimal | None = None
+    status: str
+    trade_count: int = 0
+    pricing_complete: bool = False
+
+
+class DailyHoldingsPnlResponse(BaseModel):
+    date: date
+    start_date: date | None = None
+    end_date: date | None = None
+    total_gross_pnl: Decimal = Decimal("0")
+    total_commission: Decimal = Decimal("0")
+    total_pnl: Decimal = Decimal("0")
+    items: list[DailyHoldingPnlRow] = Field(default_factory=list)
+
+
 class PerformanceItem(BaseModel):
     symbol: str
     name: str | None = None
@@ -356,6 +413,7 @@ class ReviewOpenPosition(BaseModel):
     qty: Decimal = Decimal("0")
     avg_price: Decimal = Decimal("0")
     cost: Decimal = Decimal("0")
+    realized_pnl: Decimal = Decimal("0")
     cycle_started_at: datetime | None = None
 
 
@@ -372,8 +430,12 @@ class ReviewResponse(BaseModel):
 class StrategyOpenPosition(ReviewOpenPosition):
     current_price: Decimal | None = None
     market_value: Decimal | None = None
+    # Open-lot P/L remains available for stop-sensitive displays.
     pnl: Decimal | None = None
     pnl_pct: Decimal | None = None
+    # Current cycle total P/L, matching the holdings page's cumulative P/L.
+    total_pnl: Decimal | None = None
+    total_pnl_percent: Decimal | None = None
     holding_days: int = 0
     time_stop_due: bool = False
     hard_stop_price: Decimal | None = None
@@ -396,6 +458,8 @@ class ReentryCandidate(BaseModel):
     cooldown_met: bool = False
     cooldown_remaining: int = 5
     current_price: Decimal | None = None
+    exit_price: Decimal | None = None
+    change_since_exit_pct: Decimal | None = None
     ma10: Decimal | None = None
     previous_20_high: Decimal | None = None
     stabilized: bool = False
@@ -407,6 +471,120 @@ class ReentryCandidate(BaseModel):
     status: str = "watching"
     status_label: str = ""
     status_note: str = ""
+
+
+class AdviceMetrics(BaseModel):
+    illiq: float | None = None
+    illiq_date: str | None = None
+    volume: float | None = None
+    turnover: float | None = None
+    anchor_date: str | None = None
+    anchor_vwap: float | None = None
+    vs_anchor: float | None = None
+    ma20: float | None = None
+    bandwidth: float | None = None
+    vol: float | None = None
+    mom: float | None = None
+    vol_cap: float | None = None
+    rp_weight: float | None = None
+    pe: float | None = None
+    erp: float | None = None
+
+
+class AdviceItem(BaseModel):
+    symbol: str
+    ticker: str
+    name: str | None = None
+    last: float | None = None
+    stage: str
+    tone: str = "neutral"
+    lines: list[str] = Field(default_factory=list)
+    metrics: AdviceMetrics = Field(default_factory=AdviceMetrics)
+
+
+class HoldingsAdvice(BaseModel):
+    as_of: str | None = None
+    us10y: float | None = None
+    target_vol: float = 0.20
+    headline: str
+    points: list[str] = Field(default_factory=list)
+    account_vol: float | None = None
+    book_vol: float | None = None
+    equity_weight: float | None = None
+    equity_cap: float | None = None
+    cash_weight: float | None = None
+    items: list[AdviceItem] = Field(default_factory=list)
+
+
+class IndicatorPoint(BaseModel):
+    date: str
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    close: float | None = None
+    volume: float | None = None
+    turnover: float | None = None
+    illiq: float | None = None
+    ma20: float | None = None
+    vs_ma20: float | None = None
+    anchor_date: str | None = None
+    anchor_vwap: float | None = None
+    vs_anchor: float | None = None
+    bandwidth: float | None = None
+    vol: float | None = None
+    mom: float | None = None
+    signal: str | None = None
+    vol_squeeze: bool = False
+
+
+class IndicatorHistory(BaseModel):
+    symbol: str
+    ticker: str
+    days: int = 30
+    points: list[IndicatorPoint] = Field(default_factory=list)
+
+
+class SentimentBreadth(BaseModel):
+    universe: str
+    count: int = 0
+    advancers: int = 0
+    decliners: int = 0
+    unchanged: int = 0
+    up_ratio: float | None = None
+    median_change: float | None = None
+    strong_up: int = 0
+    strong_down: int = 0
+
+
+class SentimentSeriesPoint(BaseModel):
+    date: str
+    close: float
+
+
+class SentimentVix(BaseModel):
+    last: float | None = None
+    day_change: float | None = None
+    ma20: float | None = None
+    vs_ma20: float | None = None
+    history: list[SentimentSeriesPoint] = Field(default_factory=list)
+
+
+class SentimentIndex(BaseModel):
+    name: str
+    last: float | None = None
+    day_change: float | None = None
+    ret_5d: float | None = None
+    history: list[SentimentSeriesPoint] = Field(default_factory=list)
+
+
+class MarketSentiment(BaseModel):
+    as_of: str | None = None
+    label: str
+    tone: str = "info"
+    note: str
+    breadth: SentimentBreadth | None = None
+    vix: SentimentVix | None = None
+    indexes: list[SentimentIndex] = Field(default_factory=list)
 
 
 class StrategyResponse(ReviewResponse):

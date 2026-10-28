@@ -71,6 +71,61 @@ class PriceCache(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class PositionStop(Base):
+    __tablename__ = "position_stop"
+    __table_args__ = (
+        UniqueConstraint("portfolio_id", "symbol", name="uq_position_stop_portfolio_symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    portfolio_id: Mapped[int] = mapped_column(ForeignKey("portfolio.id"), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    stop_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    stop_qty: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    # Planned size: share count and/or max cash still allowed in this name.
+    target_qty: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    max_buy_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DailyBar(Base):
+    """Completed daily OHLCV. Rows are written once and never updated."""
+
+    __tablename__ = "daily_bar"
+    __table_args__ = (
+        UniqueConstraint("symbol", "bar_date", name="uq_daily_bar_symbol_date"),
+        Index("ix_daily_bar_symbol_date", "symbol", "bar_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    bar_date: Mapped[date] = mapped_column(Date, nullable=False)
+    open: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    high: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    low: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    close: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    volume: Mapped[Decimal] = mapped_column(Numeric(24, 2), nullable=False, default=0)
+    dollar: Mapped[Decimal] = mapped_column(Numeric(24, 2), nullable=False, default=0)
+
+
+class MarketBreadth(Base):
+    """Large-cap advance/decline after the US cash session has closed."""
+
+    __tablename__ = "market_breadth"
+
+    session_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    count: Mapped[int] = mapped_column(nullable=False, default=0)
+    advancers: Mapped[int] = mapped_column(nullable=False, default=0)
+    decliners: Mapped[int] = mapped_column(nullable=False, default=0)
+    unchanged: Mapped[int] = mapped_column(nullable=False, default=0)
+    up_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    median_change: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    strong_up: Mapped[int] = mapped_column(nullable=False, default=0)
+    strong_down: Mapped[int] = mapped_column(nullable=False, default=0)
+
+
 class DailyNav(Base):
     __tablename__ = "daily_nav"
     __table_args__ = (UniqueConstraint("portfolio_id", "nav_date", name="uq_daily_nav"),)

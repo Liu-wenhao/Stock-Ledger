@@ -63,6 +63,7 @@ class PortfolioState:
     dividends: Decimal = ZERO
     deposits: Decimal = ZERO
     withdrawals: Decimal = ZERO
+    commissions: Decimal = ZERO
     first_cash_date: datetime | None = None
 
     def net_invested(self) -> Decimal:
@@ -77,47 +78,52 @@ def _dec(v) -> Decimal:
     return Decimal(str(v))
 
 
-def us_equity_session_date(now: datetime | None = None) -> date:
-    """US equity session date (weekends roll back to Friday)."""
+def _as_et(dt: datetime, naive_tz: str) -> datetime:
     try:
         from zoneinfo import ZoneInfo
 
-        now = now or datetime.now(ZoneInfo("America/New_York"))
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=ZoneInfo("America/New_York"))
-        else:
-            now = now.astimezone(ZoneInfo("America/New_York"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo(naive_tz))
+        return dt.astimezone(ZoneInfo("America/New_York"))
     except Exception:
-        now = now or datetime.utcnow()
-    d = now.date()
-    # Early morning ET: still attribute to previous session
-    if getattr(now, "hour", 12) < 4:
+        return dt
+
+
+def _us_session_date_from_et(et: datetime) -> date:
+    """US equity session date: pre-4am ET stays on the previous session; weekends roll to Friday."""
+    d = et.date()
+    if getattr(et, "hour", 12) < 4:
         d -= timedelta(days=1)
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
 
 
+def previous_us_session_date(day: date) -> date:
+    d = day - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def us_equity_session_date(now: datetime | None = None) -> date:
+    """US equity session date (weekends roll back to Friday)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = now or datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now = now or datetime.utcnow()
+    return _us_session_date_from_et(_as_et(now, "America/New_York"))
+
+
 def trade_us_session_date(dt: datetime) -> date:
     """
     Map a trade's closing_time to the US equity session date.
     Naive timestamps are treated as China local (CSV / broker export convention).
+    Uses the same pre-4am ET / weekend rules as us_equity_session_date.
     """
-    try:
-        from zoneinfo import ZoneInfo
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
-        et = dt.astimezone(ZoneInfo("America/New_York"))
-        d = et.date()
-        while d.weekday() >= 5:
-            d -= timedelta(days=1)
-        return d
-    except Exception:
-        d = dt.date()
-        while d.weekday() >= 5:
-            d -= timedelta(days=1)
-        return d
+    return _us_session_date_from_et(_as_et(dt, "Asia/Shanghai"))
 
 
 def position_day_pnl(
@@ -127,37 +133,42 @@ def position_day_pnl(
     prev_close: Decimal | None,
     end_qty: Decimal,
     session_date: date | None = None,
-) -> tuple[Decimal | None, Decimal | None]:
+) -> tuple[Decimal | None, Decimal | None, Decimal]:
     """
-    Day P/L for a symbol:
-      end_qty * last - start_qty * prev_close - today_buys + today_sells
-    Overnight shares use prev_close; same-session buys use fill price.
+    较前一天 / 日涨跌: shares held yesterday that are still held, marked
+    last vs prev_close. Same-session buys and sells do not enter this figure
+    — a new lot has no prior day, and a sale's fill vs yesterday belongs to
+    realized trading P/L, not remaining 持仓.
     Trade times are bucketed by US session date (CN naive → ET).
+    Returns (amount, percent, overnight_qty).
     """
-    if last is None or prev_close is None or end_qty < ZERO:
-        return None, None
     session_date = session_date or us_equity_session_date()
+    prev_session = previous_us_session_date(session_date)
     sym = symbol.upper()
+    held_qty = end_qty if end_qty > ZERO else ZERO
 
     start_state = PortfolioState()
-    today_buy = ZERO
-    today_sell = ZERO
     for t in sorted(symbol_trades, key=lambda x: (x.closing_time, x.id or 0)):
         tday = trade_us_session_date(t.closing_time)
-        if tday < session_date:
+        if tday <= prev_session:
             apply_trade(start_state, t)
-        elif tday == session_date and t.side == "Buy":
-            today_buy += _dec(t.qty) * _dec(t.fill_price)
-        elif tday == session_date and t.side == "Sell":
-            today_sell += _dec(t.qty) * _dec(t.fill_price)
 
     start_qty = start_state.positions.get(sym, PositionState()).quantity
-    day_pnl = end_qty * last - start_qty * prev_close - today_buy + today_sell
-    denom = start_qty * prev_close + today_buy
+    overnight_qty = min(start_qty, held_qty)
+
+    if overnight_qty <= ZERO:
+        if last is None:
+            return None, None, ZERO
+        return Decimal("0.00"), None, ZERO
+    if last is None or prev_close is None:
+        return None, None, overnight_qty
+
+    day_pnl = overnight_qty * (last - _dec(prev_close))
+    denom = overnight_qty * _dec(prev_close)
     day_pct = (day_pnl / denom * Decimal("100")) if denom > ZERO else None
     return day_pnl.quantize(Decimal("0.01")), (
         day_pct.quantize(Decimal("0.01")) if day_pct is not None else None
-    )
+    ), overnight_qty
 
 
 def apply_trade(state: PortfolioState, trade: Trade) -> None:
@@ -215,6 +226,7 @@ def apply_trade(state: PortfolioState, trade: Trade) -> None:
         # Position cost ignores commission; cash still pays the fee (手续费另算)
         notional = qty * price
         state.cash -= notional + commission
+        state.commissions += commission
         new_qty = pos.quantity + qty
         if new_qty > 0:
             pos.cost_basis = pos.cost_basis + notional
@@ -228,6 +240,7 @@ def apply_trade(state: PortfolioState, trade: Trade) -> None:
     if side == "Sell":
         notional = qty * price
         state.cash += notional - commission
+        state.commissions += commission
         sell_qty = min(qty, pos.quantity) if pos.quantity > 0 else qty
         cost_removed = pos.avg_price * sell_qty
         # Realized PnL ignores commission (手续费另算)
@@ -307,6 +320,17 @@ def _nav_series_needs_rebuild(existing: list[DailyNav]) -> bool:
         return True
     if _dec(latest.investment_total) == ZERO and _dec(latest.total_pnl) != ZERO:
         return True
+
+    # Older NAV rows omitted commissions from cumulative P/L. Detect that cache
+    # shape so the next request rebuilds history once using the account口径.
+    tolerance = Decimal("0.01")
+    for row in existing:
+        net_invested = _dec(row.net_invested)
+        if net_invested <= ZERO:
+            continue
+        expected_pnl = _dec(row.total_value) - net_invested
+        if abs(expected_pnl - _dec(row.total_pnl)) > tolerance:
+            return True
     return False
 
 
@@ -368,12 +392,10 @@ def compute_holdings(
             # because 投资总额 and the NAV series must keep counting money actually in.
             display_cost = cost - pos.realized_pnl
             display_avg = display_cost / pos.quantity
-            if invested > ZERO:
-                pnl_pct = pnl / invested * Decimal("100")
-            elif pos.avg_price > ZERO and last is not None:
-                pnl_pct = (last / pos.avg_price - Decimal("1")) * Decimal("100")
-            else:
-                pnl_pct = ZERO
+            # Keep the displayed rate on the same denominator as the displayed
+            # 成本值. Realized P/L from this cycle is already included in total
+            # P/L, so adding the sold lot cost again understates the percentage.
+            pnl_pct = (pnl / display_cost * Decimal("100")) if display_cost > ZERO else ZERO
         else:
             # Closed: all completed cycles (lifetime). last_cycle_* kept for trade-history UX.
             mv = ZERO
@@ -390,8 +412,9 @@ def compute_holdings(
             display_avg = pos.avg_price
 
         day_chg, day_pct = (None, None)
+        overnight_qty = ZERO
         if not closed:
-            day_chg, day_pct = position_day_pnl(
+            day_chg, day_pct, overnight_qty = position_day_pnl(
                 sym,
                 trades_by_symbol.get(sym, []),
                 last,
@@ -399,8 +422,13 @@ def compute_holdings(
                 pos.quantity,
                 session_date=session_date,
             )
-            if day_pct is None and q.get("change_percent") is not None:
+            if day_pct is None and overnight_qty > ZERO and q.get("change_percent") is not None:
                 day_pct = _dec(q.get("change_percent"))
+        day_change_base = (
+            overnight_qty * prev_close
+            if overnight_qty > ZERO and prev_close is not None
+            else None
+        )
 
         row = {
             "symbol": sym,
@@ -420,6 +448,7 @@ def compute_holdings(
             "total_pnl_percent": pnl_pct.quantize(Decimal("0.01")),
             "day_change": day_chg,
             "day_change_percent": day_pct,
+            "day_change_base": day_change_base,
             "open_price": q.get("open"),
             "high_price": q.get("high"),
             "low_price": q.get("low"),
@@ -707,18 +736,38 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
     if initial_portfolio_base <= ZERO:
         initial_portfolio_base = Decimal("1")
 
-    # 累计收益率分母：有出入金时用累计净入金（本金），否则沿用期初资产。
-    pct_base = net_invested if net_invested > ZERO else initial_portfolio_base
-    total_pct = total_pnl / pct_base * Decimal("100")
-    # 持仓盈亏比例与「投资组合金额」卡片使用同一分母：当前持仓市值。
+    # 累计收益率使用累计盈亏的绝对值作为规模项，避免亏损时负分母放大比例；
+    # 分子保留累计盈亏的正负号。持仓收益率仍以当前持仓市值为分母。
+    # 现金不进入累计收益率公式。
+    holdings_base = holdings_value if holdings_value > ZERO else initial_portfolio_base
+    cumulative_base = abs(total_pnl) + holdings_value
+    total_pct = (
+        total_pnl / cumulative_base * Decimal("100")
+        if cumulative_base > ZERO
+        else ZERO
+    )
     open_pct = (
-        open_pnl / holdings_value * Decimal("100") if holdings_value > ZERO else ZERO
+        open_pnl / holdings_base * Decimal("100")
+        if holdings_base > ZERO
+        else ZERO
     )
     realized_pct = (closed_pnl / closed_cost * Decimal("100")) if closed_cost > ZERO else ZERO
 
     day_change = sum((_dec(i["day_change"]) for i in open_items if i["day_change"] is not None), ZERO)
     prev_mv = ZERO
     for i in open_items:
+        base = i.get("day_change_base")
+        if base is not None and _dec(base) > ZERO:
+            prev_mv += _dec(base)
+            continue
+        # Same-session new lots have no yesterday book; skip them.
+        if i.get("day_change_percent") is None:
+            continue
+        chg = i.get("day_change")
+        pct = i.get("day_change_percent")
+        if chg is not None and pct is not None and _dec(pct) != ZERO:
+            prev_mv += _dec(chg) / (_dec(pct) / Decimal("100"))
+            continue
         prev = _dec(i["prev_close"])
         if prev > 0:
             prev_mv += prev * i["quantity"]
@@ -727,19 +776,15 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
 
     realized = closed_pnl
 
-    if net_invested == ZERO:
-        buy_notional = ZERO
-        for t in trades:
-            if t.side == "Buy":
-                buy_notional += _dec(t.qty) * _dec(t.fill_price)
-        net_invested = buy_notional if buy_notional > ZERO else (cost_open if cost_open > ZERO else Decimal("1"))
 
     day_change_pct = (day_change / prev_mv * Decimal("100")) if prev_mv > ZERO else ZERO
 
+    # 年化收益率仍按投入本金口径，与指定的累计盈亏百分比公式分开计算。
+    annualized_base = investment_total + holdings_value
     annualized = ZERO
-    if state.first_cash_date and net_invested != ZERO:
+    if state.first_cash_date and annualized_base > ZERO:
         days = max((datetime.utcnow() - state.first_cash_date).days, 1)
-        r = total_pnl / abs(net_invested)
+        r = total_pnl / annualized_base
         # Guard extreme values when r <= -1
         if r <= Decimal("-0.9999"):
             annualized = Decimal("-100")
@@ -906,9 +951,14 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
         total_value = holdings_value + state.cash
         cost_open = sum((p.cost_basis for p in state.positions.values() if p.quantity > 0), ZERO)
         unrealized = holdings_value - cost_open
-        total_pnl = unrealized + state.realized_pnl
-        investment_total = _investment_total_from_state(state, cost_open)
         net_invested = state.net_invested()
+        if state.deposits != ZERO or state.withdrawals != ZERO:
+            # Account口径: cumulative P/L is NAV minus net cash flows. This
+            # attributes commissions and dividends to the session incurring them.
+            total_pnl = total_value - net_invested
+        else:
+            total_pnl = unrealized + state.realized_pnl - state.commissions
+        investment_total = _investment_total_from_state(state, cost_open)
         if net_invested == ZERO:
             net_invested = total_value - total_pnl
 
@@ -1196,11 +1246,15 @@ def _build_daily_pnl_items(rows: list[DailyNav]) -> list[dict]:
         row_value = _dec(row.total_value)
 
         if prev_pnl is None:
-            day_pnl = ZERO
+            # Opening session: cumulative P/L is that day's P/L. Capital already
+            # in the account (deposits, before the day's result) is the base.
+            day_pnl = pnl
+            base_value = row_value - day_pnl
+            if base_value <= ZERO:
+                base_value = row_value
         else:
             day_pnl = pnl - prev_pnl
-
-        base_value = prev_value if prev_value is not None else row_value
+            base_value = prev_value if prev_value is not None else row_value
         day_pct = (day_pnl / base_value * Decimal("100")) if base_value > ZERO else ZERO
         all_items.append(
             {
@@ -1256,6 +1310,29 @@ def _aggregate_monthly(all_items: list[dict], rows_by_date: dict[date, DailyNav]
     return items
 
 
+def _aggregate_quarterly(all_items: list[dict], rows_by_date: dict[date, DailyNav], year: int) -> list[dict]:
+    buckets: dict[int, Decimal] = {}
+    for item in all_items:
+        if item["date"].year != year:
+            continue
+        quarter = (item["date"].month - 1) // 3 + 1
+        buckets[quarter] = buckets.get(quarter, ZERO) + item["pnl"]
+    items = []
+    for quarter in sorted(buckets):
+        pnl = buckets[quarter]
+        start_month = (quarter - 1) * 3 + 1
+        base = _period_start_base(rows_by_date, date(year, start_month, 1))
+        pct = (pnl / base * Decimal("100")) if base > ZERO else ZERO
+        items.append(
+            {
+                "date": date(year, start_month, 1),
+                "pnl": pnl.quantize(Decimal("0.01")),
+                "pnl_percent": pct.quantize(Decimal("0.01")),
+            }
+        )
+    return items
+
+
 def _aggregate_yearly(all_items: list[dict], rows_by_date: dict[date, DailyNav]) -> list[dict]:
     buckets: dict[int, Decimal] = {}
     for item in all_items:
@@ -1276,22 +1353,26 @@ def _aggregate_yearly(all_items: list[dict], rows_by_date: dict[date, DailyNav])
     return items
 
 
-def _nav_row_at_or_before(rows_by_date: dict[date, DailyNav], target: date) -> DailyNav | None:
-    if target in rows_by_date:
-        return rows_by_date[target]
-    prior = [row for nav_date, row in rows_by_date.items() if nav_date <= target]
-    if not prior:
-        return None
-    return max(prior, key=lambda row: row.nav_date)
-
-
 def _period_start_base(rows_by_date: dict[date, DailyNav], period_start: date) -> Decimal:
-    row = _nav_row_at_or_before(rows_by_date, period_start)
-    if not row:
+    """Portfolio value the period's P/L is measured against.
+
+    Same idea as the daily rate (that day's P/L / previous session's portfolio
+    value): the last session before the period. Cumulative cost is not used —
+    closed trades would keep inflating it. If the account opens during the
+    period, use the capital already in on that first session.
+    """
+    prior_dates = [nav_date for nav_date in rows_by_date if nav_date < period_start]
+    if prior_dates:
+        base = _dec(rows_by_date[max(prior_dates)].total_value)
+        return base if base > ZERO else ZERO
+
+    inside = [nav_date for nav_date in rows_by_date if nav_date >= period_start]
+    if not inside:
         return ZERO
-    base = _row_investment_total(row) + _dec(row.cash)
+    first = rows_by_date[min(inside)]
+    base = _dec(first.total_value) - _dec(first.total_pnl)
     if base <= ZERO:
-        base = _dec(row.total_value)
+        base = _dec(first.total_value)
     return base if base > ZERO else ZERO
 
 
@@ -1303,7 +1384,7 @@ def daily_pnl_calendar(
     month: int | None = None,
 ) -> dict:
     today = us_equity_session_date()
-    granularity = granularity if granularity in {"day", "month", "year"} else "day"
+    granularity = granularity if granularity in {"day", "month", "quarter", "year"} else "day"
 
     rows = build_nav_series(db, portfolio_id=portfolio_id)
     rows = _sync_live_today_nav(db, rows, portfolio_id=portfolio_id)
@@ -1366,6 +1447,21 @@ def daily_pnl_calendar(
             "summary": _pnl_period_summary(items),
         }
 
+    if granularity == "quarter":
+        target_year = year if year is not None else today.year
+        if years and target_year not in years:
+            target_year = years[-1]
+        items = _aggregate_quarterly(all_items, rows_by_date, target_year)
+        return {
+            "granularity": granularity,
+            "year": target_year,
+            "month": None,
+            "years": years,
+            "months": [],
+            "items": items,
+            "summary": _pnl_period_summary(items),
+        }
+
     items = _aggregate_yearly(all_items, rows_by_date)
     target_year = year if year is not None else (years[-1] if years else today.year)
     return {
@@ -1376,6 +1472,379 @@ def daily_pnl_calendar(
         "months": [],
         "items": items,
         "summary": _pnl_period_summary(items),
+    }
+
+def _close_on_or_before(closes: dict[str, Decimal], day: date) -> Decimal | None:
+    if not closes:
+        return None
+    day_key = day.isoformat()
+    candidates = [key for key in closes if key <= day_key]
+    if not candidates:
+        return None
+    return closes[max(candidates)]
+
+
+def period_holdings(db: Session, start: date, end: date, portfolio_id: int = 1) -> dict:
+    """Per-symbol P/L from the session before `start` through `end`.
+
+    Same mark as a single day: ending shares at the period's last price, minus
+    shares held at the previous close, minus buys, plus sells.
+    """
+    if end < start:
+        start, end = end, start
+    today = us_equity_session_date()
+    period_end = min(end, today)
+    while period_end.weekday() >= 5:
+        period_end -= timedelta(days=1)
+    period_start = start
+    while period_start.weekday() >= 5:
+        period_start += timedelta(days=1)
+
+    empty_totals = {
+        "total_gross_pnl": ZERO,
+        "total_commission": ZERO,
+        "total_pnl": ZERO,
+    }
+    empty = {
+        "date": period_end,
+        "start_date": start,
+        "end_date": period_end,
+        **empty_totals,
+        "items": [],
+    }
+    if period_start > period_end:
+        return empty
+
+    trades = load_trades(db, portfolio_id)
+    trade_symbols = sorted(
+        {
+            t.symbol.upper()
+            for t in trades
+            if t.symbol and t.side in {"Buy", "Sell"}
+        }
+    )
+    if not trade_symbols:
+        return empty
+
+    prior = previous_us_session_date(period_start)
+    opening_state = replay_until_session(trades, prior)
+    closing_state = replay_until_session(trades, period_end)
+    trades_by_symbol: dict[str, list[Trade]] = {}
+    for trade in trades:
+        if trade.symbol and trade.side in {"Buy", "Sell"}:
+            trades_by_symbol.setdefault(trade.symbol.upper(), []).append(trade)
+
+    relevant: list[str] = []
+    window_trades: dict[str, list[Trade]] = {}
+    for symbol in trade_symbols:
+        opening_qty = opening_state.positions.get(symbol, PositionState()).quantity
+        closing_qty = closing_state.positions.get(symbol, PositionState()).quantity
+        symbol_trades = [
+            trade
+            for trade in trades_by_symbol.get(symbol, [])
+            if period_start <= trade_us_session_date(trade.closing_time) <= period_end
+        ]
+        if opening_qty > ZERO or closing_qty > ZERO or symbol_trades:
+            relevant.append(symbol)
+            window_trades[symbol] = symbol_trades
+
+    if not relevant:
+        return empty
+
+    include_live = period_end == today
+    quotes = get_quotes(db, relevant) if include_live else {}
+    histories = get_history_closes(
+        relevant,
+        start=datetime.combine(prior - timedelta(days=14), datetime.min.time()),
+        end=datetime.combine(period_end, datetime.max.time()),
+    )
+    metas = {
+        meta.symbol: meta
+        for meta in db.query(SymbolMeta).filter(SymbolMeta.symbol.in_(relevant)).all()
+    }
+
+    items: list[dict] = []
+    total_gross_pnl = ZERO
+    total_commission = ZERO
+    total_pnl = ZERO
+    for symbol in relevant:
+        opening_qty = opening_state.positions.get(symbol, PositionState()).quantity
+        closing_qty = closing_state.positions.get(symbol, PositionState()).quantity
+        symbol_trades = window_trades.get(symbol, [])
+        buy_amount = sum(
+            (_dec(trade.qty) * _dec(trade.fill_price) for trade in symbol_trades if trade.side == "Buy"),
+            ZERO,
+        )
+        sell_amount = sum(
+            (_dec(trade.qty) * _dec(trade.fill_price) for trade in symbol_trades if trade.side == "Sell"),
+            ZERO,
+        )
+        commission = sum((_dec(trade.commission) for trade in symbol_trades), ZERO)
+
+        closes = histories.get(symbol, {})
+        prev_close = _close_on_or_before(closes, prior)
+        close_price = _close_on_or_before(closes, period_end)
+        if include_live:
+            quote = quotes.get(symbol, {})
+            if quote.get("price") is not None:
+                close_price = _dec(quote.get("price"))
+
+        gross_pnl = None
+        if close_price is not None and prev_close is not None:
+            gross_pnl = closing_qty * close_price - opening_qty * prev_close - buy_amount + sell_amount
+        elif close_price is not None and opening_qty == ZERO:
+            gross_pnl = closing_qty * close_price - buy_amount + sell_amount
+        elif opening_qty == ZERO and closing_qty == ZERO and (buy_amount or sell_amount):
+            gross_pnl = sell_amount - buy_amount
+
+        day_pnl = gross_pnl - commission if gross_pnl is not None else None
+        denominator = opening_qty * prev_close + buy_amount if prev_close is not None else buy_amount
+        gross_pct = (
+            gross_pnl / denominator * Decimal("100")
+            if gross_pnl is not None and denominator > ZERO
+            else None
+        )
+        day_pct = (
+            day_pnl / denominator * Decimal("100")
+            if day_pnl is not None and denominator > ZERO
+            else None
+        )
+        if gross_pnl is not None:
+            total_gross_pnl += gross_pnl
+            total_pnl += day_pnl
+        total_commission += commission
+
+        if closing_qty > ZERO:
+            status = "持仓"
+        elif opening_qty > ZERO:
+            status = "已清仓"
+        elif buy_amount > ZERO and sell_amount > ZERO:
+            status = "日内交易"
+        else:
+            status = "已平仓"
+
+        meta = metas.get(symbol)
+        items.append(
+            {
+                "symbol": symbol,
+                "name": meta.name if meta else None,
+                "logo_url": meta.logo_url if meta else None,
+                "exchange": exchange_of(symbol),
+                "opening_quantity": opening_qty,
+                "quantity": closing_qty,
+                "prev_close": prev_close,
+                "close_price": close_price,
+                "buy_amount": buy_amount,
+                "sell_amount": sell_amount,
+                "commission": commission.quantize(Decimal("0.01")),
+                "gross_pnl": gross_pnl.quantize(Decimal("0.01")) if gross_pnl is not None else None,
+                "gross_pnl_percent": gross_pct.quantize(Decimal("0.01")) if gross_pct is not None else None,
+                "day_pnl": day_pnl.quantize(Decimal("0.01")) if day_pnl is not None else None,
+                "day_pnl_percent": day_pct.quantize(Decimal("0.01")) if day_pct is not None else None,
+                "status": status,
+                "trade_count": len(symbol_trades),
+                "pricing_complete": gross_pnl is not None,
+            }
+        )
+
+    items.sort(key=lambda item: item["symbol"])
+    return {
+        "date": period_end,
+        "start_date": start,
+        "end_date": period_end,
+        "total_gross_pnl": total_gross_pnl.quantize(Decimal("0.01")),
+        "total_commission": total_commission.quantize(Decimal("0.01")),
+        "total_pnl": total_pnl.quantize(Decimal("0.01")),
+        "items": items,
+    }
+
+
+def daily_holdings(db: Session, session_day: date, portfolio_id: int = 1) -> dict:
+    """Return per-symbol P/L for every stock held or traded on a session date."""
+    target_day = session_day
+    while target_day.weekday() >= 5:
+        target_day -= timedelta(days=1)
+
+    trades = load_trades(db, portfolio_id)
+    trade_symbols = sorted(
+        {
+            t.symbol.upper()
+            for t in trades
+            if t.symbol and t.side in {"Buy", "Sell"}
+        }
+    )
+    empty_totals = {
+        "total_gross_pnl": ZERO,
+        "total_commission": ZERO,
+        "total_pnl": ZERO,
+    }
+    if not trade_symbols:
+        return {"date": target_day, **empty_totals, "items": []}
+
+    opening_state = replay_until_session(trades, previous_us_session_date(target_day))
+    closing_state = replay_until_session(trades, target_day)
+    trades_by_symbol: dict[str, list[Trade]] = {}
+    for trade in trades:
+        if trade.symbol and trade.side in {"Buy", "Sell"}:
+            trades_by_symbol.setdefault(trade.symbol.upper(), []).append(trade)
+
+    relevant: list[str] = []
+    day_trades: dict[str, list[Trade]] = {}
+    for symbol in trade_symbols:
+        opening_qty = opening_state.positions.get(symbol, PositionState()).quantity
+        closing_qty = closing_state.positions.get(symbol, PositionState()).quantity
+        symbol_day_trades = [
+            trade
+            for trade in trades_by_symbol.get(symbol, [])
+            if trade_us_session_date(trade.closing_time) == target_day
+        ]
+        if opening_qty > ZERO or closing_qty > ZERO or symbol_day_trades:
+            relevant.append(symbol)
+            day_trades[symbol] = symbol_day_trades
+
+    if not relevant:
+        return {"date": target_day, **empty_totals, "items": []}
+
+    quotes: dict[str, dict] = {}
+    histories: dict[str, dict[str, Decimal]] = {}
+    today = us_equity_session_date()
+    if target_day == today:
+        quotes = get_quotes(db, relevant)
+    else:
+        histories = get_history_closes(
+            relevant,
+            start=datetime.combine(target_day - timedelta(days=14), datetime.min.time()),
+            end=datetime.combine(target_day, datetime.max.time()),
+        )
+
+    metas = {
+        meta.symbol: meta
+        for meta in db.query(SymbolMeta).filter(SymbolMeta.symbol.in_(relevant)).all()
+    }
+
+    items: list[dict] = []
+    total_gross_pnl = ZERO
+    total_commission = ZERO
+    total_pnl = ZERO
+    for symbol in relevant:
+        opening_qty = opening_state.positions.get(symbol, PositionState()).quantity
+        closing_qty = closing_state.positions.get(symbol, PositionState()).quantity
+        symbol_trades = day_trades.get(symbol, [])
+        buy_amount = sum(
+            (
+                _dec(trade.qty) * _dec(trade.fill_price)
+                for trade in symbol_trades
+                if trade.side == "Buy"
+            ),
+            ZERO,
+        )
+        sell_amount = sum(
+            (
+                _dec(trade.qty) * _dec(trade.fill_price)
+                for trade in symbol_trades
+                if trade.side == "Sell"
+            ),
+            ZERO,
+        )
+        commission = sum((_dec(trade.commission) for trade in symbol_trades), ZERO)
+
+        close_price = None
+        prev_close = None
+        if target_day == today:
+            quote = quotes.get(symbol, {})
+            close_price = _dec(quote.get("price")) if quote.get("price") is not None else None
+            prev_close = (
+                _dec(quote.get("prev_close")) if quote.get("prev_close") is not None else None
+            )
+        else:
+            closes = histories.get(symbol, {})
+            close_price = closes.get(target_day.isoformat())
+            prior_dates = [
+                date.fromisoformat(day_key)
+                for day_key in closes
+                if day_key < target_day.isoformat()
+            ]
+            if prior_dates:
+                prev_close = closes.get(max(prior_dates).isoformat())
+
+        gross_pnl = None
+        if close_price is not None and prev_close is not None:
+            gross_pnl = (
+                closing_qty * close_price
+                - opening_qty * prev_close
+                - buy_amount
+                + sell_amount
+            )
+        elif close_price is not None and opening_qty == ZERO:
+            # New same-session position: cost is today's fills, not yesterday's close.
+            gross_pnl = closing_qty * close_price - buy_amount + sell_amount
+        elif opening_qty == ZERO and closing_qty == ZERO and (buy_amount or sell_amount):
+            # A same-day round trip is fully determined by its fills.
+            gross_pnl = sell_amount - buy_amount
+
+        day_pnl = gross_pnl - commission if gross_pnl is not None else None
+        day_denominator = opening_qty * prev_close + buy_amount if prev_close is not None else buy_amount
+        gross_pct = (
+            gross_pnl / day_denominator * Decimal("100")
+            if gross_pnl is not None and day_denominator > ZERO
+            else None
+        )
+        day_pct = (
+            day_pnl / day_denominator * Decimal("100")
+            if day_pnl is not None and day_denominator > ZERO
+            else None
+        )
+        if gross_pnl is not None:
+            total_gross_pnl += gross_pnl
+            total_pnl += day_pnl
+        total_commission += commission
+
+        if closing_qty > ZERO:
+            status = "持仓"
+        elif opening_qty > ZERO:
+            status = "已清仓"
+        elif buy_amount > ZERO and sell_amount > ZERO:
+            status = "日内交易"
+        else:
+            status = "已平仓"
+
+        meta = metas.get(symbol)
+        items.append(
+            {
+                "symbol": symbol,
+                "name": meta.name if meta else None,
+                "logo_url": meta.logo_url if meta else None,
+                "exchange": exchange_of(symbol),
+                "opening_quantity": opening_qty,
+                "quantity": closing_qty,
+                "prev_close": prev_close,
+                "close_price": close_price,
+                "buy_amount": buy_amount,
+                "sell_amount": sell_amount,
+                "commission": commission.quantize(Decimal("0.01")),
+                "gross_pnl": (
+                    gross_pnl.quantize(Decimal("0.01")) if gross_pnl is not None else None
+                ),
+                "gross_pnl_percent": (
+                    gross_pct.quantize(Decimal("0.01")) if gross_pct is not None else None
+                ),
+                "day_pnl": day_pnl.quantize(Decimal("0.01")) if day_pnl is not None else None,
+                "day_pnl_percent": (
+                    day_pct.quantize(Decimal("0.01")) if day_pct is not None else None
+                ),
+                "status": status,
+                "trade_count": len(symbol_trades),
+                "pricing_complete": gross_pnl is not None,
+            }
+        )
+
+    items.sort(key=lambda item: item["symbol"])
+    return {
+        "date": target_day,
+        "total_gross_pnl": total_gross_pnl.quantize(Decimal("0.01")),
+        "total_commission": total_commission.quantize(Decimal("0.01")),
+        "total_pnl": total_pnl.quantize(Decimal("0.01")),
+        "items": items,
     }
 
 

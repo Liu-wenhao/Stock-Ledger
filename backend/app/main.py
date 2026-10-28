@@ -21,6 +21,8 @@ def _ensure_schema() -> None:
         "ALTER TABLE price_cache ADD COLUMN price_as_of DATETIME NULL",
         "ALTER TABLE price_cache MODIFY COLUMN price_as_of DATETIME NULL",
         "ALTER TABLE daily_nav ADD COLUMN investment_total DECIMAL(18, 6) NOT NULL DEFAULT 0",
+        "ALTER TABLE position_stop ADD COLUMN target_qty DECIMAL(18, 6) NULL",
+        "ALTER TABLE position_stop ADD COLUMN max_buy_amount DECIMAL(18, 6) NULL",
         (
             "UPDATE price_cache SET price_as_of = fetched_at "
             "WHERE price_as_of IS NOT NULL "

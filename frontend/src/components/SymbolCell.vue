@@ -6,7 +6,10 @@ const props = defineProps({
   symbol: String,
   name: String,
   logoUrl: String,
+  asButton: Boolean,
 })
+
+defineEmits(['pick'])
 
 const ticker = computed(() => tickerOf(props.symbol))
 
@@ -45,8 +48,23 @@ const href = computed(() => {
 </script>
 
 <template>
+  <button
+    v-if="asButton"
+    type="button"
+    class="symbol-cell symbol-cell--button"
+    @click.stop="$emit('pick')"
+  >
+    <div class="symbol-logo">
+      <img v-if="logoUrl" :src="logoUrl" :alt="symbol" />
+      <span v-else>{{ ticker.slice(0, 2) }}</span>
+    </div>
+    <div class="symbol-meta">
+      <div class="code">{{ ticker }}</div>
+      <div class="name">{{ name || symbol }}</div>
+    </div>
+  </button>
   <a
-    v-if="href"
+    v-else-if="href"
     class="symbol-cell symbol-cell--link"
     :href="href"
     target="_blank"

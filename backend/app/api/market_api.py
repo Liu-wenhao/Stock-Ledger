@@ -4,11 +4,18 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.models.entities import SymbolMeta, Trade
-from app.schemas.portfolio import QuoteOut, SymbolSearchItem
+from app.schemas.portfolio import MarketSentiment, QuoteOut, SymbolSearchItem
 from app.services.market import get_quotes, refresh_quotes_sync
+from app.services.sentiment import build_market_sentiment
 
 router = APIRouter(prefix="/api", tags=["market"])
 settings = get_settings()
+
+
+@router.get("/market/sentiment", response_model=MarketSentiment)
+def market_sentiment(db: Session = Depends(get_db)):
+    """Large-cap breadth, Cboe VIX, and S&P / Nasdaq daily paths."""
+    return build_market_sentiment(db)
 
 
 @router.get("/market/quote", response_model=list[QuoteOut])

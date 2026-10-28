@@ -90,7 +90,8 @@ a {
   min-width: 0;
 }
 
-a.symbol-cell--link {
+a.symbol-cell--link,
+button.symbol-cell--button {
   color: inherit;
   text-decoration: none;
   cursor: pointer;
@@ -100,11 +101,20 @@ a.symbol-cell--link {
   transition: background 0.15s ease;
 }
 
-a.symbol-cell--link:hover {
+button.symbol-cell--button {
+  border: none;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+
+a.symbol-cell--link:hover,
+button.symbol-cell--button:hover {
   background: #f0f3fa;
 }
 
-a.symbol-cell--link:hover .code {
+a.symbol-cell--link:hover .code,
+button.symbol-cell--button:hover .code {
   color: #2962ff;
 }
 
@@ -450,18 +460,34 @@ a.symbol-cell--link:hover .code {
     width: calc(100vw - 16px) !important;
     max-width: none;
     margin: 8px auto;
+    top: 0;
     padding-bottom: max(8px, env(safe-area-inset-bottom));
   }
 
   .ant-modal-root .mobile-sheet-modal {
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .ant-modal-root .mobile-sheet-modal.ant-modal-centered {
+    align-items: flex-start;
   }
 
   .ant-modal-root .mobile-sheet-modal .ant-modal-content {
-    max-height: calc(100dvh - 16px);
-    padding: 18px 16px 16px;
-    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100dvh - 16px - env(safe-area-inset-bottom, 0px));
+    padding: 16px 14px 12px;
+    overflow: hidden;
     border-radius: 12px;
+  }
+
+  .ant-modal-root .mobile-sheet-modal .ant-modal-body {
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 4px;
   }
 
   .ant-modal-root .mobile-sheet-modal .ant-modal-header {

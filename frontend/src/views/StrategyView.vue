@@ -32,13 +32,19 @@ const positionValue = computed(() =>
   openPositions.value.reduce((sum, p) => sum + Number(p.market_value || 0), 0),
 )
 const positionPnl = computed(() =>
-  openPositions.value.reduce((sum, p) => sum + Number(p.pnl || 0), 0),
+  openPositions.value.reduce((sum, p) => sum + Number(p.total_pnl ?? p.pnl ?? 0), 0),
 )
 const positionCost = computed(() =>
   openPositions.value.reduce((sum, p) => sum + Number(p.cost || 0), 0),
 )
+const positionPnlBase = computed(() =>
+  openPositions.value.reduce(
+    (sum, p) => sum + Number(p.cost || 0) - Number(p.realized_pnl || 0),
+    0,
+  ),
+)
 const positionPnlPct = computed(() =>
-  positionCost.value > 0 ? (positionPnl.value / positionCost.value) * 100 : 0,
+  positionPnlBase.value > 0 ? (positionPnl.value / positionPnlBase.value) * 100 : 0,
 )
 const candidateFilters = computed(() => [
   { value: 'ready', label: '条件满足', count: readyCandidates.value.length },
@@ -367,7 +373,7 @@ onMounted(load)
         </div>
 
         <h2 id="strategy-positions" class="section-title"><span class="section-number">03</span>当前持仓怎么处理<span class="section-badge">{{ openPositions.length }} 个持仓</span></h2>
-        <p class="section-sub">行情和止损位由当前周期的收盘价计算；红色动作为规则已触发，需要人工确认并记录卖出。</p>
+        <p class="section-sub">行情和止损位由当前周期的收盘价计算；盈亏与持仓页一致，包含本周期分批卖出的已实现部分。红色动作为规则已触发，需要人工确认并记录卖出。</p>
 
         <div class="execution-overview">
           <div class="execution-stat">
@@ -376,7 +382,7 @@ onMounted(load)
             <small>成本 {{ formatMoney(positionCost, 'USD', 2) }}</small>
           </div>
           <div class="execution-stat">
-            <span>浮动盈亏</span>
+            <span>本周期累计盈亏</span>
             <strong :class="pnlClass(positionPnl)">{{ formatMoney(positionPnl, 'USD', 2) }}</strong>
             <small :class="pnlClass(positionPnl)">{{ formatPct(positionPnlPct) }}</small>
           </div>
@@ -446,10 +452,10 @@ onMounted(load)
                 <strong>{{ formatMoney(p.market_value, 'USD', 2) }}</strong>
               </div>
               <div>
-                <span>浮动盈亏</span>
-                <strong :class="pnlClass(p.pnl)">
-                  {{ formatMoney(p.pnl, 'USD', 2) }}
-                  <em>{{ formatPct(p.pnl_pct) }}</em>
+                <span>本周期累计盈亏</span>
+                <strong :class="pnlClass(p.total_pnl)">
+                  {{ formatMoney(p.total_pnl, 'USD', 2) }}
+                  <em>{{ formatPct(p.total_pnl_percent) }}</em>
                 </strong>
               </div>
             </div>
@@ -463,7 +469,7 @@ onMounted(load)
               <div :class="{ 'mandatory-stop': mandatoryStopHit(p) }">
                 <span>必须止损</span>
                 <strong>{{ priceText(p.hard_stop_price) }}</strong>
-                <small>成本 × 88% · −12%</small>
+                <small>成本 {{ priceText(p.avg_price) }} × 88%</small>
               </div>
               <div>
                 <span>已持有</span>
@@ -544,7 +550,15 @@ onMounted(load)
             </div>
 
             <div class="candidate-metrics">
-              <div><span>当前价</span><b>{{ priceText(c.current_price) }}</b></div>
+              <div>
+                <span>当前价</span>
+                <b>{{ priceText(c.current_price) }}</b>
+                <em v-if="c.change_since_exit_pct != null" :class="pnlClass(c.change_since_exit_pct)">
+                  {{ formatPct(c.change_since_exit_pct) }} 较清仓
+                </em>
+                <em v-else>—</em>
+              </div>
+              <div><span>上次清仓价</span><b>{{ priceText(c.exit_price) }}</b></div>
               <div><span>10 日均线</span><b>{{ priceText(c.ma10) }}</b></div>
               <div><span>前 20 日高点</span><b>{{ priceText(c.previous_20_high) }}</b></div>
             </div>
@@ -1250,7 +1264,7 @@ tbody tr:hover { background: #fafcfb; }
 .candidate-signal small { display: block; margin-top: 4px; color: #9ba5b4; font-size: 8px; }
 .candidate-metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
   margin-top: 10px;
 }
@@ -1264,6 +1278,17 @@ tbody tr:hover { background: #fafcfb; }
   font-weight: 650;
   line-height: 1.4;
   text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.candidate-metrics em {
+  display: block;
+  margin-top: 2px;
+  color: #98a1af;
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 650;
+  line-height: 1.4;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
