@@ -41,3 +41,17 @@ def to_yahoo_symbol(symbol: str | None) -> str | None:
 def exchange_of(symbol: str | None) -> str | None:
     exchange, _ = split_symbol(symbol)
     return exchange
+
+
+def quote_code(symbol: str | None) -> str | None:
+    """Tencent quote prefix. US symbols stay on the existing us/gb path."""
+    exchange, ticker = split_symbol(symbol)
+    if not ticker:
+        return None
+    if exchange == "SSE":
+        return f"sh{ticker.lower()}"
+    if exchange == "SZSE":
+        return f"sz{ticker.lower()}"
+    if exchange == "HKEX":
+        return f"hk{ticker.lower()}"
+    return None

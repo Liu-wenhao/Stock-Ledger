@@ -39,6 +39,7 @@ class HoldingRow(BaseModel):
     name: str | None = None
     logo_url: str | None = None
     exchange: str | None = None
+    currency: str | None = None
     quantity: Decimal
     # Break-even basis: includes this cycle's realized P/L, so that
     # (last_price - avg_price) * quantity == total_pnl
@@ -50,6 +51,7 @@ class HoldingRow(BaseModel):
     # User-set stop on the holdings page; quantity is how many shares to sell.
     stop_price: Decimal | None = None
     stop_qty: Decimal | None = None
+    take_profit_price: Decimal | None = None
     # Planned position: share count and/or max cash still in this name.
     target_qty: Decimal | None = None
     max_buy_amount: Decimal | None = None
@@ -122,6 +124,7 @@ class PositionStopUpdate(BaseModel):
     symbol: str
     stop_price: Decimal | None = None
     stop_qty: Decimal | None = None
+    take_profit_price: Decimal | None = None
 
 
 class PositionLimitUpdate(BaseModel):
@@ -134,6 +137,7 @@ class PositionStopOut(BaseModel):
     symbol: str
     stop_price: Decimal | None = None
     stop_qty: Decimal | None = None
+    take_profit_price: Decimal | None = None
     target_qty: Decimal | None = None
     max_buy_amount: Decimal | None = None
 
@@ -491,6 +495,12 @@ class AdviceMetrics(BaseModel):
     erp: float | None = None
 
 
+class TrendSection(BaseModel):
+    title: str
+    trend: str
+    advice: str
+
+
 class AdviceItem(BaseModel):
     symbol: str
     ticker: str
@@ -498,6 +508,10 @@ class AdviceItem(BaseModel):
     last: float | None = None
     stage: str
     tone: str = "neutral"
+    headline: str = ""
+    sections: list[TrendSection] = Field(default_factory=list)
+    stop_price: float | None = None
+    stop_hit: bool = False
     lines: list[str] = Field(default_factory=list)
     metrics: AdviceMetrics = Field(default_factory=AdviceMetrics)
 
@@ -537,11 +551,23 @@ class IndicatorPoint(BaseModel):
     vol_squeeze: bool = False
 
 
+class TrendBrief(BaseModel):
+    headline: str
+    sections: list[TrendSection] = Field(default_factory=list)
+    stop_price: float | None = None
+    stop_hit: bool = False
+    target_price: float | None = None
+    level_note: str = ""
+
+
 class IndicatorHistory(BaseModel):
     symbol: str
     ticker: str
-    days: int = 30
+    since: str | None = None
+    before: str | None = None
+    has_more: bool = False
     points: list[IndicatorPoint] = Field(default_factory=list)
+    brief: TrendBrief | None = None
 
 
 class SentimentBreadth(BaseModel):
@@ -552,8 +578,8 @@ class SentimentBreadth(BaseModel):
     unchanged: int = 0
     up_ratio: float | None = None
     median_change: float | None = None
-    strong_up: int = 0
-    strong_down: int = 0
+    strong_up: int | None = None
+    strong_down: int | None = None
 
 
 class SentimentSeriesPoint(BaseModel):

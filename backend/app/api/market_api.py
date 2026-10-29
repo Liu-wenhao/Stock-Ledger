@@ -6,6 +6,7 @@ from app.core.database import get_db
 from app.models.entities import SymbolMeta, Trade
 from app.schemas.portfolio import MarketSentiment, QuoteOut, SymbolSearchItem
 from app.services.market import get_quotes, refresh_quotes_sync
+from app.services.market_scope import current_market, in_market
 from app.services.sentiment import build_market_sentiment
 
 router = APIRouter(prefix="/api", tags=["market"])
@@ -14,8 +15,8 @@ settings = get_settings()
 
 @router.get("/market/sentiment", response_model=MarketSentiment)
 def market_sentiment(db: Session = Depends(get_db)):
-    """Large-cap breadth, Cboe VIX, and S&P / Nasdaq daily paths."""
-    return build_market_sentiment(db)
+    """Breadth and index paths for the selected market."""
+    return build_market_sentiment(db, current_market())
 
 
 @router.get("/market/quote", response_model=list[QuoteOut])
@@ -48,9 +49,15 @@ def refresh_market(force: bool = Query(True), db: Session = Depends(get_db)):
         }
     from app.services import ledger
 
+    from app.services.market_scope import current_market
+    from app.services.watchlist import watch_symbols
+
     state = ledger.replay(ledger.load_trades(db, settings.default_portfolio_id))
     syms = sorted(
-        sym for sym, position in state.positions.items() if position.quantity > 0
+        {
+            *(sym for sym, position in state.positions.items() if position.quantity > 0),
+            *watch_symbols(current_market()),
+        }
     )
     data = refresh_quotes_sync(db, syms, force=force)
     priced = sum(1 for v in data.values() if v.get("price") is not None)
@@ -65,7 +72,8 @@ def search_symbols(q: str = Query("", min_length=0), db: Session = Depends(get_d
         query = query.filter(
             (SymbolMeta.symbol.ilike(like)) | (SymbolMeta.name.ilike(like))
         )
-    rows = query.order_by(SymbolMeta.symbol.asc()).limit(30).all()
+    rows = query.order_by(SymbolMeta.symbol.asc()).limit(80).all()
+    rows = [row for row in rows if in_market(row.symbol)][:30]
     return [
         SymbolSearchItem(symbol=r.symbol, name=r.name, logo_url=r.logo_url) for r in rows
     ]

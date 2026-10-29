@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
 import logging
 
+from urllib.parse import parse_qs
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -23,6 +25,7 @@ def _ensure_schema() -> None:
         "ALTER TABLE daily_nav ADD COLUMN investment_total DECIMAL(18, 6) NOT NULL DEFAULT 0",
         "ALTER TABLE position_stop ADD COLUMN target_qty DECIMAL(18, 6) NULL",
         "ALTER TABLE position_stop ADD COLUMN max_buy_amount DECIMAL(18, 6) NULL",
+        "ALTER TABLE position_stop ADD COLUMN take_profit_price DECIMAL(18, 6) NULL",
         (
             "UPDATE price_cache SET price_as_of = fetched_at "
             "WHERE price_as_of IS NOT NULL "
@@ -67,8 +70,27 @@ async def lifespan(_: FastAPI):
     yield
 
 
+class MarketScopeMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        from app.services.market_scope import apply_market, clear_market
+
+        raw = parse_qs(scope.get("query_string", b"").decode())
+        token = apply_market((raw.get("market") or ["us"])[0])
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            clear_market(token)
+
+
 app = FastAPI(title="Stock Ledger API", version="1.0.0", lifespan=lifespan)
 
+app.add_middleware(MarketScopeMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,

@@ -6,6 +6,12 @@ const http = axios.create({
   timeout: 60000,
 })
 
+http.interceptors.request.use((config) => {
+  const market = localStorage.getItem('ledger-market') || 'us'
+  config.params = { ...(config.params || {}), market }
+  return config
+})
+
 http.interceptors.response.use(
   (res) => res,
   (err) => {

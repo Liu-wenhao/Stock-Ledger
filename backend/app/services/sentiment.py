@@ -15,11 +15,12 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from statistics import median, mean
 
+from app.services.bars import chart_since
 from app.services.market import _request_text
 
 _CACHE_SECONDS = 600
 _lock = threading.Lock()
-_cache: dict = {"at": 0.0, "payload": None, "event": None}
+_caches: dict[str, dict] = {}
 
 _BREADTH_URL = (
     "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var/"
@@ -29,40 +30,55 @@ _VIX_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.
 _INDEXES = (("标普 500", ".inx"), ("纳斯达克", ".ixic"))
 
 
-def build_market_sentiment(db=None) -> dict:
+def build_market_sentiment(db=None, market: str = "us") -> dict:
+    market = market if market in {"us", "cn", "hk"} else "us"
     now = time.time()
     owner = False
     cached_hit = None
     event = None
     with _lock:
-        cached = _cache["payload"]
-        if cached is not None and now - _cache["at"] < _CACHE_SECONDS:
+        slot = _caches.setdefault(market, {"at": 0.0, "payload": None, "event": None})
+        cached = slot["payload"]
+        if cached is not None and now - slot["at"] < _CACHE_SECONDS:
             cached_hit = cached
         else:
-            event = _cache["event"]
+            event = slot["event"]
             if event is None:
                 event = threading.Event()
-                _cache["event"] = event
+                slot["event"] = event
                 owner = True
     if cached_hit is not None:
-        return _overlay_open_session(cached_hit)
+        return _finish(cached_hit, market)
     if not owner:
         event.wait(timeout=90)
-        return _overlay_open_session(_cache["payload"] or _build(db))
-    try:
-        payload = _build(db)
         with _lock:
-            _cache["at"] = time.time()
-            _cache["payload"] = payload
-        return _overlay_open_session(payload)
+            payload = _caches[market]["payload"]
+        return _finish(payload or _build(db, market), market)
+    try:
+        payload = _build(db, market)
+        with _lock:
+            _caches[market]["at"] = time.time()
+            _caches[market]["payload"] = payload
+        return _finish(payload, market)
     finally:
         event.set()
         with _lock:
-            if _cache["event"] is event:
-                _cache["event"] = None
+            slot = _caches[market]
+            if slot["event"] is event:
+                slot["event"] = None
 
 
-def _build(db=None) -> dict:
+def _finish(payload: dict | None, market: str) -> dict | None:
+    if market != "us":
+        return payload
+    return _overlay_open_session(payload)
+
+
+def _build(db=None, market: str = "us") -> dict:
+    if market == "cn":
+        return _build_listed(db, market)
+    if market == "hk":
+        return _build_listed(db, market)
     from app.core.database import SessionLocal
     from app.services.bars import remember_breadth
 
@@ -208,7 +224,10 @@ def _vix(db) -> dict:
     closes = [(bar["d"], bar["c"]) for bar in bars]
     if len(closes) < 2:
         return empty
-    tail = closes[-30:]
+    floor = chart_since().isoformat()
+    tail = [(day, price) for day, price in closes if day >= floor]
+    if len(tail) < 2:
+        return empty
     window = [price for _, price in closes[-20:]]
     last = tail[-1][1]
     prev = tail[-2][1]
@@ -233,10 +252,13 @@ def _index(db, name: str, symbol: str) -> dict:
     bars = [(row["d"], row["c"]) for row in rows if row.get("c")]
     if len(bars) < 2:
         return empty
-    tail = bars[-30:]
-    last = tail[-1][1]
-    prev = tail[-2][1]
-    base = tail[-6][1] if len(tail) >= 6 else None
+    floor = chart_since().isoformat()
+    tail = [(day, price) for day, price in bars if day >= floor]
+    if len(tail) < 2:
+        return empty
+    last = bars[-1][1]
+    prev = bars[-2][1]
+    base = bars[-6][1] if len(bars) >= 6 else None
     return {
         "name": name,
         "last": round(last, 2),
@@ -253,8 +275,8 @@ def _push_today(item: dict, close: float, day: str) -> None:
         history[-1] = point
     else:
         history.append(point)
-        if len(history) > 30:
-            del history[:-30]
+    floor = chart_since().isoformat()
+    item["history"] = [point for point in history if point["date"] >= floor]
     last = history[-1]["close"]
     prev = history[-2]["close"] if len(history) >= 2 else None
     base = history[-6]["close"] if len(history) >= 6 else None
@@ -293,3 +315,136 @@ def _overlay_open_session(payload: dict | None) -> dict | None:
         if item.get("history"):
             as_of = item["history"][-1]["date"]
     return {**payload, "indexes": indexes, "vix": vix, "as_of": as_of}
+
+
+_CN_INDEXES = (
+    ("上证指数", "SSE:000001"),
+    ("深证成指", "SZSE:399001"),
+    ("创业板指", "SZSE:399006"),
+)
+_HK_INDEXES = (
+    ("恒生指数", "HKEX:HSI"),
+    ("恒生科技", "HKEX:HSTECH"),
+)
+
+
+def _build_listed(db, market: str) -> dict:
+    from app.core.database import SessionLocal
+
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
+    try:
+        if market == "cn":
+            breadth = _breadth_exchanges()
+            indexes = [_index_tencent(db, name, symbol) for name, symbol in _CN_INDEXES]
+            label, tone, note = _read_ratio(breadth, "沪深")
+        else:
+            breadth = None
+            indexes = [_index_tencent(db, name, symbol) for name, symbol in _HK_INDEXES]
+            label, tone, note = "中性", "info", "恒生指数和恒生科技的日线。涨跌家数没有公开汇总。"
+    finally:
+        if own_db:
+            db.close()
+    as_of = None
+    for item in indexes:
+        if item["history"]:
+            as_of = item["history"][-1]["date"]
+    return {
+        "as_of": as_of,
+        "label": label,
+        "tone": tone,
+        "note": note,
+        "breadth": breadth,
+        "vix": None,
+        "indexes": indexes,
+    }
+
+
+def _read_ratio(breadth: dict | None, name: str) -> tuple[str, str, str]:
+    if not breadth or breadth.get("up_ratio") is None:
+        return "中性", "info", f"{name}涨跌家数这次没有取到，只看指数。"
+    ratio = breadth["up_ratio"]
+    universe = breadth.get("universe") or name
+    if ratio < 40:
+        return "偏弱", "warning", f"{universe}下跌家数更多。"
+    if ratio > 60:
+        return "偏强", "success", f"{universe}上涨家数更多。"
+    return "中性", "info", f"{universe}涨跌接近对半，没有单边。"
+
+
+def _breadth_exchanges() -> dict | None:
+    """Shanghai plus Shenzhen advance/decline printed on the two index quotes."""
+    try:
+        text = _request_text(
+            "https://push2.eastmoney.com/api/qt/ulist.np/get",
+            params={
+                "fltt": "2",
+                "secids": "1.000001,0.399001",
+                "fields": "f12,f104,f105,f106",
+            },
+            encoding="utf-8",
+            timeout=8,
+        )
+        payload = json.loads(text)
+    except Exception:
+        return None
+    rows = ((payload.get("data") or {}).get("diff")) or []
+    up = down = flat = 0
+    for row in rows:
+        try:
+            up += int(row.get("f104") or 0)
+            down += int(row.get("f105") or 0)
+            flat += int(row.get("f106") or 0)
+        except (TypeError, ValueError):
+            continue
+    count = up + down + flat
+    if count < 100:
+        return None
+    return {
+        "universe": "沪深",
+        "count": count,
+        "advancers": up,
+        "decliners": down,
+        "unchanged": flat,
+        "up_ratio": round(up / count * 100, 1),
+        "median_change": None,
+        "strong_up": None,
+        "strong_down": None,
+    }
+
+
+def _index_tencent(db, name: str, symbol: str) -> dict:
+    from app.services.bars import cn_frozen, hk_frozen, load_bars
+    from app.services.market import fetch_tencent_bars
+    from app.services.market_scope import market_of
+
+    empty = {"name": name, "last": None, "day_change": None, "ret_5d": None, "history": []}
+    kind = market_of(symbol)
+    frozen = hk_frozen() if kind == "hk" else cn_frozen()
+    try:
+        rows = load_bars(db, symbol, lambda: fetch_tencent_bars(symbol, lot_size=1), frozen=frozen)
+    except Exception:
+        return empty
+    return _index_view(name, rows)
+
+
+def _index_view(name: str, rows: list[dict]) -> dict:
+    empty = {"name": name, "last": None, "day_change": None, "ret_5d": None, "history": []}
+    bars = [(row["d"], row["c"]) for row in rows if row.get("c")]
+    if len(bars) < 2:
+        return empty
+    floor = chart_since().isoformat()
+    tail = [(day, price) for day, price in bars if day >= floor]
+    if len(tail) < 2:
+        return empty
+    last = bars[-1][1]
+    prev = bars[-2][1]
+    base = bars[-6][1] if len(bars) >= 6 else None
+    return {
+        "name": name,
+        "last": round(last, 2),
+        "day_change": round((last / prev - 1) * 100, 2) if prev else None,
+        "ret_5d": None if not base else round((last / base - 1) * 100, 2),
+        "history": [{"date": day, "close": round(price, 2)} for day, price in tail],
+    }

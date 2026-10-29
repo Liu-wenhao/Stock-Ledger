@@ -10,6 +10,7 @@ from app.models.entities import DailyNav, SymbolMeta, Trade
 from app.schemas.trade import TradeCreate, TradeImportResult, TradeOut, TradeUpdate
 from app.services.csv_io import export_csv, import_csv
 from app.services.market import ensure_symbol_meta
+from app.services.market_scope import in_market
 
 router = APIRouter(prefix="/api/trades", tags=["trades"])
 settings = get_settings()
@@ -67,6 +68,7 @@ def list_trades(
         like = f"%{q.strip()}%"
         query = query.filter(Trade.symbol.ilike(like))
     rows = query.order_by(Trade.closing_time.desc(), Trade.id.desc()).all()
+    rows = [row for row in rows if in_market(row.symbol)]
     return [_to_out(db, t) for t in rows]
 
 

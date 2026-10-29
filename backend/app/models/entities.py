@@ -82,6 +82,7 @@ class PositionStop(Base):
     symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     stop_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
     stop_qty: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    take_profit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
     # Planned size: share count and/or max cash still allowed in this name.
     target_qty: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
     max_buy_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)

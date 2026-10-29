@@ -130,7 +130,7 @@ function formatCardValue(card) {
   if (card.format === 'count') {
     return `${card.value} ${PERIOD_UNIT[granularity.value] || '天'}`
   }
-  return formatMoney(card.value).replace(' USD', '')
+  return formatMoney(card.value).replace(/ [A-Z]{3}$/, '')
 }
 
 function formatCellPnl(v) {
@@ -589,7 +589,7 @@ load()
           >
             <div class="cell-year">{{ yearLabel(item) }}</div>
             <div class="cell-pnl" :class="pnlClass(item.pnl)">
-              {{ formatMoney(item.pnl).replace(' USD', '') }}
+              {{ formatMoney(item.pnl).replace(/ [A-Z]{3}$/, '') }}
             </div>
             <div class="cell-pct" :class="pnlClass(item.pnl)">
               {{ formatPct(item.pnl_percent) }}

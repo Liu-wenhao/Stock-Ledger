@@ -15,8 +15,8 @@ export const fetchPeriodPerformance = (params) =>
   http.get('/api/portfolio/period-performance', { params }).then((r) => r.data)
 export const fetchHoldings = (params) => http.get('/api/holdings', { params }).then((r) => r.data)
 export const fetchHoldingsAdvice = () => http.get('/api/holdings/advice').then((r) => r.data)
-export const fetchIndicatorHistory = (symbol, days = 30) =>
-  http.get('/api/holdings/indicator-history', { params: { symbol, days } }).then((r) => r.data)
+export const fetchIndicatorHistory = (symbol, params = {}) =>
+  http.get('/api/holdings/indicator-history', { params: { symbol, limit: 40, ...params } }).then((r) => r.data)
 export const fetchMarketSentiment = () => http.get('/api/market/sentiment').then((r) => r.data)
 export const updateHoldingStop = (data) =>
   http.put('/api/holdings/stop', data).then((r) => r.data)

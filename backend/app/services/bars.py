@@ -8,7 +8,7 @@ session is calculated from the live fetch and is not written.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -42,11 +42,61 @@ def cash_session_closed(now: datetime | None = None) -> bool:
     return minutes >= 16 * 60 or minutes < 9 * 60 + 30
 
 
+def chart_since(today: date | None = None) -> date:
+    """Price charts start at April of the current year and use bars already stored."""
+    today = today or date.today()
+    return date(today.year, 4, 1)
+
+
 def frozen_through(now: datetime | None = None) -> date:
     session = us_equity_session_date(now)
     if cash_session_closed(now):
         return session
     return previous_us_session_date(session)
+
+
+def _local_now(tz_name: str, now: datetime | None) -> datetime:
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo(tz_name)
+    if now and now.tzinfo:
+        return now.astimezone(zone)
+    return datetime.now(zone)
+
+
+def _local_session(local: datetime, open_minute: int) -> date:
+    day = local.date()
+    minutes = local.hour * 60 + local.minute
+    if minutes < open_minute:
+        day -= timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
+
+
+def _local_closed(local: datetime, open_minute: int, close_minute: int) -> bool:
+    if local.weekday() >= 5:
+        return True
+    minutes = local.hour * 60 + local.minute
+    return minutes < open_minute or minutes >= close_minute
+
+
+def _local_frozen(tz_name: str, open_minute: int, close_minute: int, now: datetime | None) -> date:
+    local = _local_now(tz_name, now)
+    session = _local_session(local, open_minute)
+    if _local_closed(local, open_minute, close_minute):
+        return session
+    return previous_us_session_date(session)
+
+
+def cn_frozen(now: datetime | None = None) -> date:
+    """Last completed Shanghai/Shenzhen cash session. Lunch does not freeze the bar."""
+    return _local_frozen("Asia/Shanghai", 9 * 60 + 30, 15 * 60, now)
+
+
+def hk_frozen(now: datetime | None = None) -> date:
+    """Last completed Hong Kong cash session."""
+    return _local_frozen("Asia/Shanghai", 9 * 60 + 30, 16 * 60, now)
 
 
 def _num(value: float | None, digits: str = "0.000001") -> Decimal | None:
@@ -121,12 +171,12 @@ def covers_frozen(bars: list[dict], frozen: date) -> bool:
     return latest >= frozen
 
 
-def load_bars(db: Session, symbol: str, fetcher) -> list[dict]:
+def load_bars(db: Session, symbol: str, fetcher, frozen: date | None = None) -> list[dict]:
     """Return daily bars, fetching only when a frozen session is still missing."""
     key = bar_key(symbol)
     if not key:
         return []
-    frozen = frozen_through()
+    frozen = frozen or frozen_through()
     stored = _read_stored(db, key)
     if covers_frozen(stored, frozen):
         return [bar for bar in stored if bar["d"] <= frozen.isoformat()]
@@ -180,6 +230,19 @@ def load_sina_bars(db: Session, symbol: str) -> list[dict]:
         return parse_sina_bars(raw)
 
     return load_bars(db, key, fetch)
+
+
+def load_symbol_bars(db: Session, symbol: str) -> list[dict]:
+    """US bars stay on Sina. A-share and Hong Kong bars come from Tencent daily klines."""
+    from app.services.market import fetch_tencent_bars
+    from app.services.market_scope import market_of
+
+    kind = market_of(symbol)
+    if kind == "cn":
+        return load_bars(db, symbol, lambda: fetch_tencent_bars(symbol, lot_size=100), frozen=cn_frozen())
+    if kind == "hk":
+        return load_bars(db, symbol, lambda: fetch_tencent_bars(symbol, lot_size=1), frozen=hk_frozen())
+    return load_sina_bars(db, symbol)
 
 
 def _quote_code(symbol: str) -> str:

@@ -107,12 +107,15 @@ def import_csv(
 
 
 def export_csv(db: Session, portfolio_id: int = 1) -> str:
+    from app.services.market_scope import in_market
+
     trades = (
         db.query(Trade)
         .filter(Trade.portfolio_id == portfolio_id)
         .order_by(Trade.closing_time.asc(), Trade.id.asc())
         .all()
     )
+    trades = [row for row in trades if in_market(row.symbol)]
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["Symbol", "Side", "Qty", "Fill Price", "Commission", "Closing Time", "Notes"])

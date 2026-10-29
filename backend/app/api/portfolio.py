@@ -65,9 +65,64 @@ def _attach_position_stops(db: Session, items: list[dict], portfolio_id: int) ->
         stop = by_symbol.get(str(item.get("symbol") or "").upper())
         item["stop_price"] = stop.stop_price if stop else None
         item["stop_qty"] = stop.stop_qty if stop else None
+        item["take_profit_price"] = stop.take_profit_price if stop else None
         item["target_qty"] = stop.target_qty if stop else None
         item["max_buy_amount"] = stop.max_buy_amount if stop else None
     return items
+
+
+def _merge_watch_rows(db: Session, items: list[dict]) -> list[dict]:
+    """Add the A-share or Hong Kong quote list. These rows are not positions."""
+    from app.services.market import ensure_symbol_meta, get_quotes
+    from app.services.market_scope import current_market
+    from app.services.symbols import exchange_of
+    from app.services.watchlist import watch_symbols
+
+    market = current_market()
+    symbols = watch_symbols(market)
+    if not symbols:
+        return items
+    present = {str(item.get("symbol") or "").upper() for item in items}
+    missing = [symbol for symbol in symbols if symbol.upper() not in present]
+    if not missing:
+        return items
+    quotes = get_quotes(db, missing, background_refresh=False)
+    currency = "CNY" if market == "cn" else "HKD"
+    extra = []
+    for symbol in missing:
+        meta = ensure_symbol_meta(db, symbol)
+        quote = quotes.get(symbol) or {}
+        name = quote.get("name") or meta.name
+        extra.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "logo_url": meta.logo_url,
+                "exchange": exchange_of(symbol),
+                "currency": currency,
+                "quantity": ZERO,
+                "avg_price": ZERO,
+                "last_price": quote.get("price"),
+                "cost_basis": ZERO,
+                "lot_avg_price": ZERO,
+                "lot_cost_basis": ZERO,
+                "market_value": ZERO,
+                "invested": ZERO,
+                "allocation": ZERO,
+                "total_pnl": ZERO,
+                "total_pnl_percent": ZERO,
+                "day_change": quote.get("change"),
+                "day_change_percent": quote.get("change_percent"),
+                "open_price": quote.get("open"),
+                "high_price": quote.get("high"),
+                "low_price": quote.get("low"),
+                "prev_close": quote.get("prev_close"),
+                "price_as_of": quote.get("price_as_of"),
+                "closed": False,
+                "trade_count": 0,
+            }
+        )
+    return [*items, *extra]
 
 
 def _sort_holding_rows(
@@ -158,6 +213,7 @@ def period_performance(
 def holdings(
     view: str = Query("positions"),
     include_closed: bool = False,
+    watch: bool = Query(False),
     q: str | None = None,
     sort_by: Literal["total_pnl", "total_pnl_percent"] | None = None,
     sort_order: Literal["asc", "desc"] = "desc",
@@ -208,7 +264,8 @@ def holdings(
         )
 
     data = ledger.compute_holdings(db, include_closed=include_closed)
-    items = _sort_holding_rows(_filter_rows(data["items"], q), sort_by, sort_order)
+    items = _merge_watch_rows(db, data["items"]) if watch else data["items"]
+    items = _sort_holding_rows(_filter_rows(items, q), sort_by, sort_order)
     items = review.enrich_holding_stop_levels(items)
     items = _attach_position_stops(db, items, settings.default_portfolio_id)
     return HoldingsResponse(
@@ -236,6 +293,7 @@ def _position_stop_out(row: PositionStop | None, symbol: str) -> PositionStopOut
         symbol=row.symbol,
         stop_price=row.stop_price,
         stop_qty=row.stop_qty,
+        take_profit_price=row.take_profit_price,
         target_qty=row.target_qty,
         max_buy_amount=row.max_buy_amount,
     )
@@ -245,6 +303,7 @@ def _position_stop_empty(row: PositionStop) -> bool:
     return (
         row.stop_price is None
         and row.stop_qty is None
+        and row.take_profit_price is None
         and row.target_qty is None
         and row.max_buy_amount is None
     )
@@ -255,32 +314,31 @@ def update_holding_stop(payload: PositionStopUpdate, db: Session = Depends(get_d
     symbol = (payload.symbol or "").strip().upper()
     if not symbol:
         raise HTTPException(status_code=400, detail="缺少商品代码")
-    if payload.stop_price is not None and payload.stop_price <= ZERO:
+    fields = payload.model_fields_set - {"symbol"}
+    if "stop_price" in fields and payload.stop_price is not None and payload.stop_price <= ZERO:
         raise HTTPException(status_code=400, detail="止损价格必须大于 0")
-    if payload.stop_qty is not None and payload.stop_qty <= ZERO:
+    if "stop_qty" in fields and payload.stop_qty is not None and payload.stop_qty <= ZERO:
         raise HTTPException(status_code=400, detail="止损数量必须大于 0")
+    if (
+        "take_profit_price" in fields
+        and payload.take_profit_price is not None
+        and payload.take_profit_price <= ZERO
+    ):
+        raise HTTPException(status_code=400, detail="止盈价格必须大于 0")
 
     row = _position_stop_row(db, symbol)
-    if payload.stop_price is None and payload.stop_qty is None:
-        if row is not None:
-            row.stop_price = None
-            row.stop_qty = None
-            if _position_stop_empty(row):
-                db.delete(row)
-                db.commit()
-                return _position_stop_out(None, symbol)
-            db.commit()
-            db.refresh(row)
-        return _position_stop_out(row, symbol)
-
     if row is None:
-        row = PositionStop(
-            portfolio_id=settings.default_portfolio_id,
-            symbol=symbol,
-        )
+        if not any(getattr(payload, name) is not None for name in fields):
+            return _position_stop_out(None, symbol)
+        row = PositionStop(portfolio_id=settings.default_portfolio_id, symbol=symbol)
         db.add(row)
-    row.stop_price = payload.stop_price
-    row.stop_qty = payload.stop_qty
+    for name in ("stop_price", "stop_qty", "take_profit_price"):
+        if name in fields:
+            setattr(row, name, getattr(payload, name))
+    if _position_stop_empty(row):
+        db.delete(row)
+        db.commit()
+        return _position_stop_out(None, symbol)
     db.commit()
     db.refresh(row)
     return _position_stop_out(row, symbol)
@@ -331,10 +389,11 @@ def holdings_advice(db: Session = Depends(get_db)):
 @router.get("/holdings/indicator-history", response_model=IndicatorHistory)
 def holdings_indicator_history(
     symbol: str = Query(...),
-    days: int = Query(30, ge=5, le=60),
+    before: str | None = Query(None),
+    limit: int = Query(40, ge=20, le=80),
 ):
-    """Daily indicator path for one holding, recomputed on each of the last sessions."""
-    return build_indicator_history(symbol, days)
+    """One page of daily indicators, walking back from the newest stored bar toward April."""
+    return build_indicator_history(symbol, before=before, limit=limit)
 
 
 @router.get("/analysis/monthly-returns", response_model=MonthlyReturnsResponse)

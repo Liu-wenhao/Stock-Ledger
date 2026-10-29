@@ -379,7 +379,7 @@ onUnmounted(() => {
           <div class="hero-main">
             <p class="eyebrow"><span class="hero-dot"></span>已实现盈亏</p>
             <p class="hero-num" :class="pnlClass(capital.realized)">
-              {{ formatMoney(capital.realized, 'USD', 0).replace(' USD', '') }}<small>USD</small>
+              {{ formatMoney(capital.realized, 'USD', 0).replace(/ [A-Z]{3}$/, '') }}<small>USD</small>
             </p>
             <p class="hero-sub">
               <span class="return-chip" :class="pnlClass(capital.realized_pct)">{{ formatPct(capital.realized_pct, 1) }}</span>

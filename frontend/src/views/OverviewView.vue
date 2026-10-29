@@ -68,7 +68,7 @@ const CHART_SERIES = [
 
 function formatPnlByMode(amount, percent) {
   if (mode.value === 'percent') return formatPct(percent)
-  return formatMoney(amount).replace(' USD', '')
+  return formatMoney(amount).replace(/ [A-Z]{3}$/, '')
 }
 
 const dayPnlText = computed(() => {
@@ -121,7 +121,7 @@ function moverMetric(item) {
 
 function formatMover(item) {
   if (mode.value === 'percent') return formatPct(item.change_percent)
-  return formatMoney(item.change).replace(' USD', '')
+  return formatMoney(item.change).replace(/ [A-Z]{3}$/, '')
 }
 
 function barWidth(item, peers) {
@@ -222,7 +222,7 @@ function formatRangeChip(r) {
   if (mode.value === 'percent') {
     return r.return_percent == null ? '—' : formatPct(r.return_percent)
   }
-  return r.pnl == null ? '—' : formatMoney(r.pnl).replace(' USD', '')
+  return r.pnl == null ? '—' : formatMoney(r.pnl).replace(/ [A-Z]{3}$/, '')
 }
 
 function rangeChipClass(r) {

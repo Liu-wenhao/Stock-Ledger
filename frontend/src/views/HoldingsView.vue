@@ -3,8 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { useRoute, useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
-import { message } from 'ant-design-vue'
-import { DownloadOutlined, QuestionCircleOutlined } from '@ant-design/icons-vue'
+import { message, Modal } from 'ant-design-vue'
+import { DashboardOutlined, DownloadOutlined, FallOutlined, LineChartOutlined, QuestionCircleOutlined, RiseOutlined } from '@ant-design/icons-vue'
 import { fetchHoldings, fetchHoldingsAdvice, fetchIndicatorHistory, fetchMarketSentiment, fetchTrades, refreshMarket, updateHoldingLimit, updateHoldingStop } from '@/api/portfolio'
 import SymbolCell from '@/components/SymbolCell.vue'
 import { formatMoney, formatPct, formatQty, pnlClass, tickerOf, toNumber } from '@/utils/format'
@@ -125,6 +125,7 @@ async function load({ silent = false } = {}) {
     const isCumulative = subTab.value === 'cumulative'
     data.value = await fetchHoldings({
       view: isClosed ? 'closed' : isCumulative ? 'cumulative' : 'positions',
+      watch: isPricePage.value ? 1 : undefined,
       q: keyword.value || undefined,
       sort_by: sortState.field || undefined,
       sort_order: sortState.order || undefined,
@@ -236,7 +237,7 @@ async function openTradeHistory(record, cycle = null) {
 }
 
 function tradeStepTitle(t) {
-  const base = `${SIDE_LABELS[t.side] || t.side}  ${formatMoney(t.fill_price, 'USD', 4).replace(' USD', '')} × ${formatQty(t.qty)}`
+  const base = `${SIDE_LABELS[t.side] || t.side}  ${formatMoney(t.fill_price, 'USD', 4).replace(/ [A-Z]{3}$/, '')} × ${formatQty(t.qty)}`
   if (clearTradeIds.value.has(t.id)) return `${base}  · 清仓`
   return base
 }
@@ -250,10 +251,10 @@ function goEditTrade(t) {
 function tradeStepDesc(t) {
   const parts = [
     dayjs(t.closing_time).format('YYYY-MM-DD HH:mm'),
-    `总额 ${formatMoney(t.total).replace(' USD', '')}`,
+    `总额 ${formatMoney(t.total).replace(/ [A-Z]{3}$/, '')}`,
   ]
   if (toNumber(t.commission) > 0) {
-    parts.push(`手续费 ${formatMoney(t.commission).replace(' USD', '')}`)
+    parts.push(`手续费 ${formatMoney(t.commission).replace(/ [A-Z]{3}$/, '')}`)
   }
   if (t.notes) parts.push(t.notes)
   return parts.join(' · ')
@@ -415,7 +416,7 @@ function renderPriceChart() {
       yAxis: avg,
       label: {
         show: true,
-        formatter: `均价 ${formatMoney(avg, 'USD', 4).replace(' USD', '')}`,
+        formatter: `均价 ${formatMoney(avg, 'USD', 4).replace(/ [A-Z]{3}$/, '')}`,
         color: '#e6a700',
         fontSize: 11,
         position: 'insideStartTop',
@@ -432,7 +433,7 @@ function renderPriceChart() {
       yAxis: close,
       label: {
         show: true,
-        formatter: `价格 ${formatMoney(close, 'USD', 4).replace(' USD', '')}`,
+        formatter: `价格 ${formatMoney(close, 'USD', 4).replace(/ [A-Z]{3}$/, '')}`,
         color: '#26a69a',
         fontSize: 11,
         position: 'insideStartTop',
@@ -491,7 +492,7 @@ function renderPriceChart() {
           return [
             `${side} ${d.side === 'Buy' ? 'B' : 'S'}`,
             dayjs(ts).format('YYYY-MM-DD HH:mm'),
-            `成交价 ${formatMoney(price, 'USD', 4).replace(' USD', '')}`,
+            `成交价 ${formatMoney(price, 'USD', 4).replace(/ [A-Z]{3}$/, '')}`,
             `数量 ${formatQty(d.qty)}`,
           ].join('<br/>')
         },
@@ -596,20 +597,19 @@ const positionColumns = [
     sorter: true,
   },
   {
+    title: '回本 %',
+    key: 'breakeven_percent',
+    dataIndex: 'breakeven_percent',
+    width: 80,
+    align: 'right',
+  },
+  {
     title: '盈亏 %',
     dataIndex: 'total_pnl_percent',
     key: 'total_pnl_percent',
     width: 80,
     align: 'right',
     sorter: true,
-    fixed: 'right',
-  },
-  {
-    title: '回本 %',
-    key: 'breakeven_percent',
-    dataIndex: 'breakeven_percent',
-    width: 80,
-    align: 'right',
     fixed: 'right',
   },
   { title: '操作', key: 'actions', width: 64, align: 'center', fixed: 'right' },
@@ -803,7 +803,7 @@ function holdingStopHit(record, stopKey) {
 }
 
 function stopPriceText(value) {
-  return value == null ? '—' : formatMoney(value).replace(' USD', '')
+  return value == null ? '—' : formatMoney(value).replace(/ [A-Z]{3}$/, '')
 }
 
 function positionLimit(record) {
@@ -819,7 +819,7 @@ function positionLimit(record) {
   if (targetQty != null) parts.push(`${formatQty(qty)}/${formatQty(targetQty)}股`)
   if (maxBuy != null) {
     parts.push(
-      `${formatMoney(cost).replace(' USD', '')}/${formatMoney(maxBuy).replace(' USD', '')}`,
+      `${formatMoney(cost).replace(/ [A-Z]{3}$/, '')}/${formatMoney(maxBuy).replace(/ [A-Z]{3}$/, '')}`,
     )
   }
   return {
@@ -858,7 +858,7 @@ function holdingStopMark(record) {
     price:
       record.stop_price == null
         ? '—'
-        : `${formatMoney(record.stop_price).replace(' USD', '')}$`,
+        : `${formatMoney(record.stop_price).replace(/ [A-Z]{3}$/, '')}$`,
     qty: `${isFullStop(record) ? 'ALL' : formatQty(record.stop_qty)}股`,
   }
 }
@@ -942,6 +942,11 @@ function formatCount(value) {
   return formatQty(n)
 }
 
+function moneyNumber(value, currency) {
+  if (value == null || value === '') return null
+  return formatMoney(value, currency).replace(/ [A-Z]{3}$/, '')
+}
+
 function priceMetricText(record, key) {
   const metrics = metricsOf(record.symbol)
   if (!metrics) return adviceLoading.value ? '…' : '—'
@@ -983,6 +988,7 @@ const trendSymbol = ref('')
 const trendBook = ref(null)
 const trendChartRef = ref(null)
 let trendChart
+let trendLoadToken = 0
 
 const trendColumns = [
   { title: '日期', dataIndex: 'date', key: 'date', width: 108, fixed: 'left' },
@@ -999,6 +1005,7 @@ const trendColumns = [
   { title: '动量', key: 'mom', align: 'right', width: 80 },
 ]
 
+const trendCursor = ref(null)
 const trendRows = computed(() => [...(trendBook.value?.points || [])].reverse())
 const trendLatest = computed(() => {
   const points = trendBook.value?.points || []
@@ -1065,52 +1072,164 @@ async function loadSentiment() {
   }
 }
 
+function chartSlider(dates, extra = {}) {
+  return {
+    type: 'slider',
+    height: 18,
+    bottom: 2,
+    backgroundColor: '#f6f8fb',
+    borderColor: 'transparent',
+    fillerColor: 'rgba(20, 151, 125, 0.14)',
+    handleSize: 14,
+    handleStyle: { color: '#fff', borderColor: '#d5deea', borderWidth: 1 },
+    moveHandleSize: 0,
+    brushSelect: false,
+    showDetail: false,
+    dataBackground: {
+      lineStyle: { color: '#b7c6da', width: 1 },
+      areaStyle: { color: 'rgba(20, 151, 125, 0.08)' },
+    },
+    selectedDataBackground: {
+      lineStyle: { color: '#14977d', width: 1 },
+      areaStyle: { color: 'rgba(20, 151, 125, 0.16)' },
+    },
+    textStyle: { color: '#8b95a8', fontSize: 10 },
+    labelFormatter: (value) => (typeof value === 'string' ? value.slice(5) : dates[value]?.slice(5) || ''),
+    ...extra,
+  }
+}
+
 function renderSentimentChart() {
   const book = sentiment.value
   if (!sentimentChartRef.value || !book) return
-  const nasdaq = (book.indexes || []).find((item) => item.name === '纳斯达克')
-  const points = nasdaq?.history?.length ? nasdaq.history : book.vix?.history || []
+  const indexes = book.indexes || []
+  const primary = indexes.find((item) => item.name === '纳斯达克') || indexes.find((item) => item.history?.length)
+  const points = primary?.history?.length ? primary.history : book.vix?.history || []
   if (!points.length) return
+  const primaryName = primary?.name === '纳斯达克' ? '纳指' : primary?.name || '指数'
+  let secondaryName = ''
+  let secondaryData = []
+  if (book.vix?.history?.length) {
+    secondaryName = 'VIX'
+    const vixByDate = Object.fromEntries(book.vix.history.map((point) => [point.date, point.close]))
+    secondaryData = points.map((point) => vixByDate[point.date] ?? null)
+  } else {
+    const other = indexes.find((item) => item !== primary && item.history?.length)
+    if (other) {
+      secondaryName = other.name
+      const byDate = Object.fromEntries(other.history.map((point) => [point.date, point.close]))
+      secondaryData = points.map((point) => byDate[point.date] ?? null)
+    }
+  }
   if (!sentimentChart) sentimentChart = echarts.init(sentimentChartRef.value)
+  const dates = points.map((point) => point.date)
   const vixByDate = Object.fromEntries((book.vix?.history || []).map((point) => [point.date, point.close]))
+  const zoomStart = dates[Math.max(0, dates.length - 60)]
+  const zoomEnd = dates[dates.length - 1]
+  const axisLabel = { color: '#8b95a8', fontSize: 11 }
+  const series = [
+    {
+      name: primaryName,
+      type: 'line',
+      smooth: 0.18,
+      showSymbol: false,
+      symbol: 'circle',
+      symbolSize: 7,
+      data: points.map((point) => point.close),
+      lineStyle: { width: 2.2, color: '#14977d', cap: 'round', join: 'round' },
+      itemStyle: { color: '#14977d', borderColor: '#fff', borderWidth: 2 },
+      areaStyle: {
+        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          { offset: 0, color: 'rgba(20, 151, 125, 0.22)' },
+          { offset: 1, color: 'rgba(20, 151, 125, 0.02)' },
+        ]),
+      },
+      emphasis: { focus: 'series' },
+    },
+  ]
+  if (secondaryName) {
+    series.push({
+      name: secondaryName,
+      type: 'line',
+      yAxisIndex: 1,
+      smooth: 0.18,
+      showSymbol: false,
+      symbol: 'circle',
+      symbolSize: 7,
+      data: secondaryData,
+      lineStyle: { width: 1.6, color: '#d9852a', cap: 'round', join: 'round' },
+      itemStyle: { color: '#d9852a', borderColor: '#fff', borderWidth: 2 },
+      emphasis: { focus: 'series' },
+    })
+  }
   sentimentChart.setOption(
     {
-      animationDuration: 200,
-      grid: { left: 44, right: 36, top: 28, bottom: 22 },
-      tooltip: { trigger: 'axis' },
-      legend: { top: 0, itemWidth: 12, textStyle: { fontSize: 11, color: '#787b86' } },
+      animationDuration: 280,
+      grid: { left: 4, right: 4, top: 32, bottom: 28, containLabel: true },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: 'rgba(255,255,255,0.96)',
+        borderColor: '#e7ebf2',
+        borderWidth: 1,
+        padding: [8, 12],
+        textStyle: { color: '#243047', fontSize: 12 },
+        axisPointer: { type: 'line', lineStyle: { color: '#c5d0e0', type: 'dashed', width: 1 } },
+      },
+      legend: {
+        top: 0,
+        right: 0,
+        icon: 'circle',
+        itemWidth: 8,
+        itemHeight: 8,
+        itemGap: 14,
+        textStyle: { color: '#7b8598', fontSize: 12 },
+      },
+      dataZoom: [
+        {
+          type: 'inside',
+          zoomOnMouseWheel: true,
+          moveOnMouseMove: true,
+          moveOnMouseWheel: false,
+          startValue: zoomStart,
+          endValue: zoomEnd,
+        },
+        chartSlider(dates, { startValue: zoomStart, endValue: zoomEnd }),
+      ],
       xAxis: {
         type: 'category',
-        data: points.map((point) => point.date.slice(5)),
-        axisLabel: { color: '#787b86', fontSize: 10 },
+        data: dates,
+        boundaryGap: false,
+        axisLine: { lineStyle: { color: '#e7ebf2' } },
         axisTick: { show: false },
+        axisLabel: {
+          ...axisLabel,
+          hideOverlap: true,
+          formatter: (value) => String(value).slice(5),
+        },
       },
       yAxis: [
-        { type: 'value', scale: true, axisLabel: { color: '#787b86', fontSize: 10 } },
-        { type: 'value', scale: true, axisLabel: { color: '#787b86', fontSize: 10 } },
-      ],
-      series: [
         {
-          name: '纳指',
-          type: 'line',
-          showSymbol: false,
-          data: nasdaq?.history?.length ? points.map((point) => point.close) : [],
-          lineStyle: { width: 1.5, color: '#089981' },
-          itemStyle: { color: '#089981' },
+          type: 'value',
+          scale: true,
+          axisLine: { show: false },
+          axisTick: { show: false },
+          splitLine: { lineStyle: { color: '#eef2f6' } },
+          axisLabel,
         },
         {
-          name: 'VIX',
-          type: 'line',
-          yAxisIndex: 1,
-          showSymbol: false,
-          data: points.map((point) => vixByDate[point.date] ?? null),
-          lineStyle: { width: 1.5, color: '#f23645' },
-          itemStyle: { color: '#f23645' },
+          type: 'value',
+          scale: true,
+          axisLine: { show: false },
+          axisTick: { show: false },
+          splitLine: { show: false },
+          axisLabel,
         },
       ],
+      series,
     },
     true,
   )
+  sentimentChart.resize()
 }
 
 function openTrend() {
@@ -1122,25 +1241,72 @@ function openTrend() {
   loadTrend()
 }
 
+function trendPointChange(point) {
+  const points = trendBook.value?.points || []
+  const index = points.findIndex((item) => item.date === point?.date)
+  const prev = index > 0 ? points[index - 1]?.close : null
+  if (!point?.close || !prev) return null
+  return (point.close / prev - 1) * 100
+}
+
+function captureTrendRange(dates) {
+  if (!trendChart || !dates.length) return null
+  const zoom = trendChart.getOption()?.dataZoom?.[0]
+  if (!zoom) return null
+  if (typeof zoom.startValue === 'string' && typeof zoom.endValue === 'string') {
+    return { startValue: zoom.startValue, endValue: zoom.endValue }
+  }
+  const start = Math.round(((zoom.start ?? 0) / 100) * (dates.length - 1))
+  const end = Math.round(((zoom.end ?? 100) / 100) * (dates.length - 1))
+  return { startValue: dates[Math.max(0, start)], endValue: dates[Math.min(dates.length - 1, end)] }
+}
+
 async function loadTrend() {
-  if (!trendSymbol.value) return
+  const symbol = trendSymbol.value
+  if (!symbol) return
+  const token = ++trendLoadToken
   trendLoading.value = true
+  trendCursor.value = null
   try {
-    trendBook.value = await fetchIndicatorHistory(trendSymbol.value, 30)
-    await nextTick()
-    renderTrendChart()
+    let before
+    let first = true
+    while (trendOpen.value && token === trendLoadToken) {
+      const page = await fetchIndicatorHistory(symbol, before ? { before } : {})
+      if (token !== trendLoadToken || trendSymbol.value !== symbol || !trendOpen.value) return
+      const extend = !first
+      if (first) {
+        trendBook.value = page
+        trendCursor.value = page.points?.[page.points.length - 1] || null
+        first = false
+        trendLoading.value = false
+      } else if (page.points?.length) {
+        const prev = trendBook.value
+        trendBook.value = {
+          ...prev,
+          points: [...page.points, ...(prev?.points || [])],
+          has_more: page.has_more,
+          before: page.before,
+        }
+      }
+      await nextTick()
+      renderTrendChart({ keepRange: extend })
+      if (!page.has_more || !page.before || page.before === before) break
+      before = page.before
+    }
   } catch {
-    trendBook.value = null
+    if (token === trendLoadToken) trendBook.value = null
   } finally {
-    trendLoading.value = false
+    if (token === trendLoadToken) trendLoading.value = false
   }
 }
 
-function renderTrendChart() {
+function renderTrendChart({ keepRange = false } = {}) {
   const points = trendBook.value?.points || []
   if (!trendChartRef.value || !points.length) return
   if (!trendChart) trendChart = echarts.init(trendChartRef.value)
-  const dates = points.map((point) => point.date.slice(5))
+  const previousDates = trendChart.getOption()?.xAxis?.[0]?.data || []
+  const kept = keepRange ? captureTrendRange(previousDates) : null
+  const dates = points.map((point) => point.date)
   const upColor = '#089981'
   const downColor = '#f23645'
   const candles = points.map((point) => {
@@ -1174,29 +1340,83 @@ function renderTrendChart() {
   })
   const mom = points[points.length - 1]?.mom
   const wash = mom > 0 ? 'rgba(8,153,129,0.08)' : mom < 0 ? 'rgba(230,167,0,0.10)' : 'transparent'
+  const zoomEnd = dates[dates.length - 1]
+  const zoomStart = kept?.startValue && dates.includes(kept.startValue)
+    ? kept.startValue
+    : dates[Math.max(0, dates.length - 60)]
+  const zoomStop = kept?.endValue && dates.includes(kept.endValue) ? kept.endValue : zoomEnd
   trendChart.setOption(
     {
-      animationDuration: 200,
-      axisPointer: { link: [{ xAxisIndex: [0, 1, 2] }] },
-      legend: { top: 0, itemWidth: 12, textStyle: { fontSize: 11, color: '#787b86' } },
-      tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+      animationDuration: 280,
+      axisPointer: {
+        link: [{ xAxisIndex: [0, 1, 2] }],
+        lineStyle: { color: '#c5d0e0', type: 'dashed', width: 1 },
+      },
+      legend: {
+        top: 0,
+        right: 4,
+        icon: 'circle',
+        itemWidth: 8,
+        itemHeight: 8,
+        itemGap: 12,
+        textStyle: { fontSize: 12, color: '#7b8598' },
+      },
+      tooltip: {
+        show: true,
+        showContent: false,
+        trigger: 'axis',
+        axisPointer: { type: 'cross', lineStyle: { color: '#c5d0e0', type: 'dashed', width: 1 } },
+      },
+      dataZoom: [
+        {
+          type: 'inside',
+          xAxisIndex: [0, 1, 2],
+          zoomOnMouseWheel: true,
+          moveOnMouseMove: false,
+          moveOnMouseWheel: false,
+          preventDefaultMouseMove: false,
+          startValue: zoomStart,
+          endValue: zoomStop,
+        },
+        chartSlider(dates, {
+          xAxisIndex: [0, 1, 2],
+          left: 28,
+          right: 4,
+          startValue: zoomStart,
+          endValue: zoomStop,
+        }),
+      ],
       grid: [
-        { left: 52, right: 16, top: 28, height: '48%' },
-        { left: 52, right: 16, top: '68%', height: '10%' },
-        { left: 52, right: 16, top: '82%', height: '10%' },
+        { left: 28, right: 4, top: 28, bottom: '30%' },
+        { left: 28, right: 4, top: '73%', height: '8%' },
+        { left: 28, right: 4, top: '83%', height: '8%' },
       ],
       xAxis: [0, 1, 2].map((gridIndex) => ({
         type: 'category',
         gridIndex,
         data: dates,
         boundaryGap: true,
-        axisLabel: { show: gridIndex === 2, color: '#787b86', fontSize: 10 },
+        axisLine: { lineStyle: { color: '#e7ebf2' } },
+        axisLabel: {
+          show: gridIndex === 2,
+          color: '#8b95a8',
+          fontSize: 11,
+          hideOverlap: true,
+          formatter: (value) => String(value).slice(5),
+        },
         axisTick: { show: false },
+        splitLine: { show: false },
       })),
       yAxis: [
-        { scale: true, axisLabel: { color: '#787b86', fontSize: 10 } },
-        { gridIndex: 1, axisLabel: { show: false }, splitLine: { show: false } },
-        { gridIndex: 2, scale: true, axisLabel: { show: false }, splitLine: { show: false } },
+        {
+          scale: true,
+          axisLine: { show: false },
+          axisTick: { show: false },
+          splitLine: { lineStyle: { color: '#eef2f6' } },
+          axisLabel: { color: '#8b95a8', fontSize: 11, margin: 4, align: 'right' },
+        },
+        { gridIndex: 1, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
+        { gridIndex: 2, scale: true, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
       ],
       series: [
         {
@@ -1220,8 +1440,9 @@ function renderTrendChart() {
           name: 'MA20',
           type: 'line',
           showSymbol: false,
+          smooth: 0.12,
           data: points.map((point) => point.ma20),
-          lineStyle: { width: 1.2, color: '#e6a700' },
+          lineStyle: { width: 1.8, color: '#e6a700', cap: 'round', join: 'round' },
           itemStyle: { color: '#e6a700' },
         },
         {
@@ -1229,8 +1450,8 @@ function renderTrendChart() {
           type: 'line',
           showSymbol: false,
           data: points.map((point) => point.anchor_vwap),
-          lineStyle: { width: 2.4, type: 'dashed', color: upColor },
-          itemStyle: { color: upColor },
+          lineStyle: { width: 2, type: 'dashed', color: '#14977d', cap: 'round' },
+          itemStyle: { color: '#14977d' },
         },
         {
           name: '成交量',
@@ -1261,6 +1482,18 @@ function renderTrendChart() {
     },
     true,
   )
+  trendChart.off('updateAxisPointer')
+  trendChart.on('updateAxisPointer', (event) => {
+    const axis = (event?.axesInfo || []).find((item) => item.axisDim === 'x')
+    const raw = axis?.value
+    const date = typeof raw === 'number' ? points[raw]?.date : raw
+    const point = points.find((item) => item.date === date)
+    if (point) trendCursor.value = point
+  })
+  trendChart.off('globalout')
+  trendChart.on('globalout', () => {
+    trendCursor.value = points[points.length - 1] || null
+  })
   trendChart.resize()
 }
 
@@ -1323,6 +1556,7 @@ async function saveStopModal() {
     })
     record.stop_price = saved.stop_price
     record.stop_qty = saved.stop_qty
+    record.take_profit_price = saved.take_profit_price
     applyLimitFields(record, saved)
     message.success(stopPrice == null && stopQty == null ? '已清除止损' : '止损已保存')
     stopModalOpen.value = false
@@ -1337,6 +1571,36 @@ async function clearStopModal() {
   stopForm.stopPrice = null
   stopForm.stopQty = null
   await saveStopModal()
+}
+
+function confirmAdoptLevel(kind) {
+  const brief = trendBook.value?.brief
+  const symbol = trendSymbol.value
+  const price = kind === 'stop' ? brief?.stop_price : brief?.target_price
+  if (!symbol || price == null) return
+  const label = kind === 'stop' ? '止损' : '止盈'
+  const ticker = tickerOf(symbol)
+  const shown = adviceNum(price)
+  Modal.confirm({
+    title: `把 ${ticker} 的${label}设为 ${shown}？`,
+    content: `确认后写入这只股票的${label}。`,
+    okText: '确认',
+    cancelText: '取消',
+    centered: true,
+    async onOk() {
+      const payload = { symbol }
+      if (kind === 'stop') payload.stop_price = Number(price)
+      else payload.take_profit_price = Number(price)
+      const saved = await updateHoldingStop(payload)
+      const row = data.value.items.find((item) => item.symbol === symbol)
+      if (row) {
+        row.stop_price = saved.stop_price
+        row.stop_qty = saved.stop_qty
+        row.take_profit_price = saved.take_profit_price
+      }
+      message.success(`已把 ${ticker} 的${label}设为 ${shown}`)
+    },
+  })
 }
 
 function openLimitModal(record) {
@@ -1636,15 +1900,15 @@ const positionsSummaryCells = computed(() => [
     tone: pnlClass(positionsSummary.value.total_pnl),
     align: 'right',
   },
+  {
+    text: breakevenText(positionsSummary.value.breakeven_percent),
+    tone: positionsSummary.value.breakeven_percent > 0 ? 'pnl-down' : '',
+    align: 'right',
+  },
   // 累计盈亏 %
   {
     text: formatPct(positionsSummary.value.total_pnl_percent),
     tone: pnlClass(positionsSummary.value.total_pnl_percent),
-    align: 'right',
-  },
-  {
-    text: breakevenText(positionsSummary.value.breakeven_percent),
-    tone: positionsSummary.value.breakeven_percent > 0 ? 'pnl-down' : '',
     align: 'right',
   },
   { text: '', align: 'center' }, // 操作
@@ -1697,7 +1961,7 @@ const closedSummaryCells = computed(() => [
 // 单元格值和表格里的渲染保持一致（包括 null 显示 —、金额带 USD、红绿配色）。
 const isBlank = (v) => v == null || v === ''
 const imageMoney = (v) => (isBlank(v) ? '—' : formatMoney(v))
-const imagePrice = (v) => (isBlank(v) ? '—' : formatMoney(v).replace(' USD', ''))
+const imagePrice = (v) => (isBlank(v) ? '—' : formatMoney(v).replace(/ [A-Z]{3}$/, ''))
 const imagePct = (v) => (isBlank(v) ? '—' : formatPct(v))
 const imageSymbol = (r) => ({ text: tickerOf(r.symbol), secondary: r.name || '' })
 const imagePnl = (v) => ({ text: imageMoney(v), tone: pnlClass(v) })
@@ -1724,7 +1988,8 @@ const positionImageCells = {
       `建议 ${imagePrice(r.suggested_stop_price)}`,
       `必须 ${imagePrice(r.mandatory_stop_price)}`,
     ]
-    if (mark) parts.push(`${mark.price} ${mark.qty}`)
+    if (mark) parts.push(`止损 ${mark.price} ${mark.qty}`)
+    if (r.take_profit_price != null) parts.push(`止盈 ${imagePrice(r.take_profit_price)}`)
     return { text: parts.join('  ') }
   },
   position_limit: (r) => {
@@ -1864,7 +2129,10 @@ watch(priceModalOpen, (open) => {
   if (!open) disposePriceChart()
 })
 watch(trendOpen, (open) => {
-  if (!open) disposeTrendChart()
+  if (!open) {
+    trendLoadToken += 1
+    disposeTrendChart()
+  }
 })
 watch(trendSymbol, () => {
   if (trendOpen.value) loadTrend()
@@ -1885,7 +2153,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="holdings-view">
+  <div class="holdings-view" :class="{ 'price-page': isPricePage }">
     <a-tabs v-if="!isPricePage" v-model:activeKey="subTab" size="small">
       <a-tab-pane key="positions" tab="持仓" />
       <a-tab-pane key="cumulative" tab="累计" />
@@ -1952,11 +2220,11 @@ onUnmounted(() => {
                   class="trade-count-link"
                   :class="avgPriceClass({ avg_price: cycle.avg_price, last_price: cycle.price })"
                   @click.prevent="openAvgPriceChart({ ...record, avg_price: cycle.avg_price, last_price: cycle.price }, cycle)"
-                >{{ formatMoney(cycle.avg_price).replace(' USD', '') }}</a>
+                >{{ formatMoney(cycle.avg_price).replace(/ [A-Z]{3}$/, '') }}</a>
                 <span v-else>—</span>
               </template>
               <template v-else-if="column.key === 'price'">
-                {{ cycle.price == null ? '—' : formatMoney(cycle.price).replace(' USD', '') }}
+                {{ cycle.price == null ? '—' : formatMoney(cycle.price).replace(/ [A-Z]{3}$/, '') }}
               </template>
               <template v-else-if="column.key === 'cost'">
                 {{ formatMoney(cycle.cost) }}
@@ -1999,13 +2267,13 @@ onUnmounted(() => {
               class="trade-count-link"
               :class="avgPriceClass(record)"
               @click.prevent="openAvgPriceChart(record)"
-            >{{ formatMoney(record.avg_price).replace(' USD', '') }}</a>
+            >{{ formatMoney(record.avg_price).replace(/ [A-Z]{3}$/, '') }}</a>
             <span v-else>—</span>
           </template>
           <template v-else-if="column.key === 'last_price'">
             <span v-if="record.last_price == null">—</span>
             <span v-else class="close-price-cell">
-              {{ formatMoney(record.last_price).replace(' USD', '') }}
+              {{ moneyNumber(record.last_price, record.currency) }}
             </span>
           </template>
           <template v-else-if="column.key === 'cost'">{{ formatMoney(record.cost) }}</template>
@@ -2155,75 +2423,106 @@ onUnmounted(() => {
     </template>
 
     <template v-else>
-      <section v-if="isPricePage" class="market-sentiment">
-        <div class="sentiment-copy">
-          <p class="sentiment-kicker">市场情绪</p>
-          <p v-if="!sentiment && sentimentState !== 'error'" class="sentiment-label">读取中</p>
-          <template v-else-if="sentiment">
-            <p class="sentiment-label">
-              <span class="advice-stage" :class="`is-${sentiment.tone}`">{{ sentiment.label }}</span>
-              <span v-if="sentiment.as_of" class="sentiment-asof">截至 {{ sentiment.as_of }}</span>
-            </p>
-            <p class="sentiment-note">{{ sentiment.note }}</p>
-            <dl v-if="sentiment.breadth" class="sentiment-stats">
-              <div>
-                <dt>上涨</dt>
-                <dd class="pnl-up">{{ sentiment.breadth.advancers }}</dd>
-              </div>
-              <div>
-                <dt>下跌</dt>
-                <dd class="pnl-down">{{ sentiment.breadth.decliners }}</dd>
-              </div>
-              <div>
-                <dt>平盘</dt>
-                <dd>{{ sentiment.breadth.unchanged }}</dd>
-              </div>
-              <div>
-                <dt>上涨占比</dt>
-                <dd>{{ sentiment.breadth.up_ratio == null ? '—' : `${sentiment.breadth.up_ratio.toFixed(1)}%` }}</dd>
-              </div>
-              <div>
-                <dt>中位涨跌</dt>
-                <dd :class="pnlClass(sentiment.breadth.median_change)">
-                  {{ sentiment.breadth.median_change == null ? '—' : `${sentiment.breadth.median_change > 0 ? '+' : ''}${sentiment.breadth.median_change.toFixed(2)}%` }}
-                </dd>
-              </div>
-              <div>
-                <dt>涨超 2%</dt>
-                <dd>{{ sentiment.breadth.strong_up }}</dd>
-              </div>
-              <div>
-                <dt>跌超 2%</dt>
-                <dd>{{ sentiment.breadth.strong_down }}</dd>
-              </div>
-            </dl>
-            <p v-if="sentiment.breadth" class="sentiment-note">{{ sentiment.breadth.universe }}，共 {{ sentiment.breadth.count }} 只。涨跌家数用的是当前行情。</p>
-            <dl class="sentiment-stats">
-              <div v-if="sentiment.vix">
-                <dt>VIX</dt>
-                <dd>
-                  {{ sentiment.vix.last == null ? '—' : sentiment.vix.last.toFixed(2) }}
-                  <span :class="pnlClass(sentiment.vix.day_change)">
-                    {{ sentiment.vix.day_change == null ? '' : `${sentiment.vix.day_change > 0 ? '+' : ''}${sentiment.vix.day_change.toFixed(2)}%` }}
-                  </span>
-                </dd>
-              </div>
-              <div v-for="item in sentiment.indexes" :key="item.name">
-                <dt>{{ item.name }}</dt>
-                <dd>
-                  <span :class="pnlClass(item.day_change)">
-                    {{ item.day_change == null ? '—' : `${item.day_change > 0 ? '+' : ''}${item.day_change.toFixed(2)}%` }}
-                  </span>
-                  <span class="sentiment-sub">5日 {{ item.ret_5d == null ? '—' : `${item.ret_5d > 0 ? '+' : ''}${item.ret_5d.toFixed(2)}%` }}</span>
-                </dd>
-              </div>
-            </dl>
-          </template>
-          <p v-else class="sentiment-note">市场情绪暂时没有取到。</p>
+      <header v-if="isPricePage" class="price-header">
+        <div>
+          <p class="price-eyebrow">行情 / 价格</p>
+          <h1 class="price-title">价格<span class="price-title-dot"></span></h1>
+          <p class="price-description">先看市场情绪，再看每只持仓的指标。点击一行打开这只股票的建议。</p>
         </div>
+        <div class="price-header-actions">
+          <a-button class="price-action" :disabled="!data.items.length" @click="openTrend">指标趋势</a-button>
+          <a-button
+            class="price-action"
+            :loading="imageExporting"
+            :disabled="!data.items.length"
+            @click="handleDownloadImage('price')"
+          >
+            <DownloadOutlined /> 下载图片
+          </a-button>
+        </div>
+      </header>
+      <section v-if="isPricePage" class="price-hero">
+        <div class="price-hero-copy">
+          <p class="price-kicker"><span class="price-kicker-dot"></span>当前市场情绪</p>
+          <h2 v-if="sentiment">{{ sentiment.label }}</h2>
+          <h2 v-else-if="sentimentState !== 'error'">读取中</h2>
+          <h2 v-else>暂时没有取到</h2>
+          <p class="price-hero-note">
+            {{ sentiment?.note || (sentimentState === 'error' ? '市场情绪暂时没有取到。' : '正在读取涨跌家数和指数。') }}
+          </p>
+          <div v-if="sentiment" class="price-hero-meta">
+            <span v-if="sentiment.as_of">截至 {{ sentiment.as_of }}</span>
+            <span v-if="sentiment.breadth">{{ sentiment.breadth.universe }} · {{ sentiment.breadth.count }} 只</span>
+            <span v-if="sentiment.breadth">平盘 {{ sentiment.breadth.unchanged }}</span>
+            <span v-if="sentiment.breadth?.strong_up != null">涨超 2% {{ sentiment.breadth.strong_up }}</span>
+            <span v-if="sentiment.breadth?.strong_down != null">跌超 2% {{ sentiment.breadth.strong_down }}</span>
+          </div>
+        </div>
+        <div v-if="sentiment?.breadth" class="price-metrics">
+          <article>
+            <span class="price-metric-icon teal"><RiseOutlined /></span>
+            <div>
+              <p>上涨</p>
+              <strong class="pnl-up">{{ sentiment.breadth.advancers }}</strong>
+              <span>当前行情里的上涨家数</span>
+            </div>
+          </article>
+          <article>
+            <span class="price-metric-icon amber"><FallOutlined /></span>
+            <div>
+              <p>下跌</p>
+              <strong class="pnl-down">{{ sentiment.breadth.decliners }}</strong>
+              <span>当前行情里的下跌家数</span>
+            </div>
+          </article>
+          <article>
+            <span class="price-metric-icon blue"><LineChartOutlined /></span>
+            <div>
+              <p>上涨占比</p>
+              <strong>{{ sentiment.breadth.up_ratio == null ? '—' : `${sentiment.breadth.up_ratio.toFixed(1)}%` }}</strong>
+              <span>{{ sentiment.breadth.universe }}里上涨所占的比例</span>
+            </div>
+          </article>
+          <article v-if="sentiment.breadth.median_change != null">
+            <span class="price-metric-icon violet"><DashboardOutlined /></span>
+            <div>
+              <p>中位涨跌</p>
+              <strong :class="pnlClass(sentiment.breadth.median_change)">
+                {{ `${sentiment.breadth.median_change > 0 ? '+' : ''}${sentiment.breadth.median_change.toFixed(2)}%` }}
+              </strong>
+              <span>{{ sentiment.breadth.universe }}的中位数</span>
+            </div>
+          </article>
+        </div>
+      </section>
+      <section v-if="isPricePage && sentiment && (sentiment.vix || sentiment.indexes?.length)" class="price-tape">
+        <article v-if="sentiment.vix">
+          <p>VIX</p>
+          <strong>{{ sentiment.vix.last == null ? '—' : sentiment.vix.last.toFixed(2) }}</strong>
+          <span :class="pnlClass(sentiment.vix.day_change)">
+            {{ sentiment.vix.day_change == null ? '—' : `${sentiment.vix.day_change > 0 ? '+' : ''}${sentiment.vix.day_change.toFixed(2)}%` }}
+          </span>
+        </article>
+        <article v-for="item in sentiment.indexes" :key="item.name">
+          <p>{{ item.name }}</p>
+          <strong :class="pnlClass(item.day_change)">
+            {{ item.day_change == null ? '—' : `${item.day_change > 0 ? '+' : ''}${item.day_change.toFixed(2)}%` }}
+          </strong>
+          <span>5日 {{ item.ret_5d == null ? '—' : `${item.ret_5d > 0 ? '+' : ''}${item.ret_5d.toFixed(2)}%` }}</span>
+        </article>
         <div ref="sentimentChartRef" class="sentiment-chart"></div>
       </section>
-      <div class="toolbar">
+      <div v-if="isPricePage" class="price-section-head">
+        <h2 class="price-section-title">
+          <span class="price-section-number">01</span>持仓行情
+          <span class="price-section-badge">{{ data.items.length }} 只</span>
+        </h2>
+        <p class="price-section-sub">
+          {{ adviceLoading ? '指标计算中' : indicatorBook?.as_of ? `指标截至 ${indicatorBook.as_of} 日线。` : '' }}
+          点击一行看这只股票的建议。
+        </p>
+      </div>
+      <div class="toolbar" :class="{ 'price-toolbar': isPricePage }">
         <a-input-search
           v-model:value="keyword"
           placeholder="搜索商品代码"
@@ -2231,17 +2530,11 @@ onUnmounted(() => {
           allow-clear
           @search="load"
         />
-        <div class="toolbar-actions">
-          <span v-if="isPricePage" class="advice-note">
-            {{ adviceLoading ? '指标计算中' : indicatorBook?.as_of ? `指标截至 ${indicatorBook.as_of} 日线，点击一行看这只股票的建议` : '点击一行看这只股票的建议' }}
-          </span>
-          <a-button v-if="isPricePage" :disabled="!data.items.length" @click="openTrend">
-            30日趋势
-          </a-button>
+        <div v-if="!isPricePage" class="toolbar-actions">
           <a-button
             :loading="imageExporting"
             :disabled="!data.items.length"
-            @click="handleDownloadImage(isPricePage ? 'price' : 'positions')"
+            @click="handleDownloadImage('positions')"
           >
             <DownloadOutlined /> 下载图片
           </a-button>
@@ -2326,7 +2619,7 @@ onUnmounted(() => {
           <template v-else-if="column.key === 'last_price'">
             <span v-if="record.last_price == null">—</span>
             <span v-else class="close-price-cell">
-              {{ formatMoney(record.last_price).replace(' USD', '') }}
+              {{ moneyNumber(record.last_price, record.currency) }}
               <span
                 v-if="subTab === 'positions' && record.day_change_percent != null"
                 class="price-day-change"
@@ -2349,7 +2642,10 @@ onUnmounted(() => {
                 必须 {{ stopPriceText(record.mandatory_stop_price) }}
               </span>
               <span v-if="holdingStopMark(record)" class="holding-stop-tag is-set">
-                {{ holdingStopMark(record).price }} {{ holdingStopMark(record).qty }}
+                止损 {{ holdingStopMark(record).price }} {{ holdingStopMark(record).qty }}
+              </span>
+              <span v-if="record.take_profit_price != null" class="holding-stop-tag is-target">
+                止盈 {{ stopPriceText(record.take_profit_price) }}
               </span>
             </button>
           </template>
@@ -2374,18 +2670,18 @@ onUnmounted(() => {
               :class="avgPriceClass(record)"
               @click.prevent="openAvgPriceChart(record)"
             >
-              {{ formatMoney(record.avg_price).replace(' USD', '') }}
+              {{ formatMoney(record.avg_price).replace(/ [A-Z]{3}$/, '') }}
             </a>
             <span v-else>
-              {{ record.avg_price == null ? '—' : formatMoney(record.avg_price).replace(' USD', '') }}
+              {{ record.avg_price == null ? '—' : formatMoney(record.avg_price).replace(/ [A-Z]{3}$/, '') }}
             </span>
           </template>
           <template v-else-if="['open_price', 'high_price', 'low_price', 'prev_close'].includes(column.key)">
-            {{ record[column.key] == null ? '—' : formatMoney(record[column.key]).replace(' USD', '') }}
+            {{ record[column.key] == null ? '—' : moneyNumber(record[column.key], record.currency) }}
           </template>
           <template v-else-if="['cost_basis', 'market_value', 'day_change'].includes(column.key)">
             <span :class="column.key === 'day_change' ? pnlClass(record[column.key]) : ''">
-              {{ record[column.key] == null ? '—' : formatMoney(record[column.key]) }}
+              {{ record[column.key] == null ? '—' : formatMoney(record[column.key], record.currency || 'USD') }}
             </span>
           </template>
           <template v-else-if="column.key === 'total_pnl'">
@@ -2425,7 +2721,7 @@ onUnmounted(() => {
       v-model:open="adviceOpen"
       :title="selectedAdvice ? `${selectedAdvice.ticker} 建议` : '建议'"
       :footer="null"
-      :width="viewportWidth > 560 ? 560 : '100%'"
+      :width="viewportWidth > 560 ? 640 : '100%'"
       wrap-class-name="advice-modal"
       :centered="viewportWidth > 560"
     >
@@ -2434,13 +2730,31 @@ onUnmounted(() => {
           <span class="advice-stage" :class="`is-${selectedAdvice.tone}`">{{ selectedAdvice.stage }}</span>
           <span v-if="selectedAdvice.name" class="advice-name">{{ selectedAdvice.name }}</span>
         </p>
-        <p v-for="(line, i) in selectedAdvice.lines" :key="i">{{ line }}</p>
+        <p v-if="selectedAdvice.headline" class="trend-brief-lead">{{ selectedAdvice.headline }}</p>
+        <div v-if="selectedAdvice.stop_price != null" class="trend-levels">
+          <div class="is-stop">
+            <span>{{ selectedAdvice.stop_hit ? '已破止损' : '止损' }}</span>
+            <strong>{{ adviceNum(selectedAdvice.stop_price) }}</strong>
+          </div>
+        </div>
+        <div v-if="selectedAdvice.sections?.length" class="trend-brief advice-sections">
+          <div class="trend-brief-grid">
+            <article v-for="section in selectedAdvice.sections" :key="section.title">
+              <h3>{{ section.title }}</h3>
+              <p>{{ section.trend }}</p>
+              <p class="trend-brief-advice">{{ section.advice }}</p>
+            </article>
+          </div>
+        </div>
+        <template v-else>
+          <p v-for="(line, i) in selectedAdvice.lines" :key="i">{{ line }}</p>
+        </template>
       </div>
     </a-modal>
 
     <a-modal
       v-model:open="trendOpen"
-      title="30 日指标趋势"
+      title="指标趋势"
       :footer="null"
       :width="viewportWidth > 560 ? 980 : '100%'"
       wrap-class-name="advice-modal"
@@ -2451,10 +2765,10 @@ onUnmounted(() => {
       <div class="trend-toolbar">
         <a-select
           v-model:value="trendSymbol"
-          style="width: 180px"
-          :options="data.items.map((item) => ({ value: item.symbol, label: tickerOf(item.symbol) }))"
+          show-search
+          option-filter-prop="label"
+          :options="data.items.map((item) => ({ value: item.symbol, label: item.name || tickerOf(item.symbol) }))"
         />
-        <span class="sentiment-note">已收盘按收盘重算。市场未收盘时，最后一根是进入本页时取到的今日行情，不写入历史。PE 和 ERP 没有日频，不在这里。</span>
       </div>
       <div v-if="trendLatest" class="trend-marks">
         <span v-for="mark in trendMarks" :key="mark.text" class="trend-mark" :class="`is-${mark.tone}`">
@@ -2464,8 +2778,60 @@ onUnmounted(() => {
           防守线从 {{ trendLatest.anchor_date }} 低点锚定
         </span>
       </div>
+      <div v-if="trendBook?.brief" class="trend-brief">
+        <p class="trend-brief-lead">{{ trendBook.brief.headline }}</p>
+        <div class="trend-brief-grid">
+          <article v-for="section in trendBook.brief.sections" :key="section.title">
+            <h3>{{ section.title }}</h3>
+            <p>{{ section.trend }}</p>
+            <p class="trend-brief-advice">{{ section.advice }}</p>
+          </article>
+        </div>
+        <p class="sentiment-note">{{ trendBook.brief.level_note }}</p>
+      </div>
+      <div v-if="trendBook?.brief && (trendBook.brief.stop_price != null || trendBook.brief.target_price != null)" class="trend-levels">
+          <button
+            v-if="trendBook.brief.stop_price != null"
+            type="button"
+            class="is-stop"
+            title="点击后写入这只股票的止损"
+            @click="confirmAdoptLevel('stop')"
+          >
+            <span>{{ trendBook.brief.stop_hit ? '已破止损' : '止损' }}</span>
+            <strong>{{ adviceNum(trendBook.brief.stop_price) }}</strong>
+          </button>
+          <button
+            v-if="trendBook.brief.target_price != null"
+            type="button"
+            class="is-target"
+            title="点击后写入这只股票的止盈"
+            @click="confirmAdoptLevel('target')"
+          >
+            <span>止盈</span>
+            <strong>{{ adviceNum(trendBook.brief.target_price) }}</strong>
+          </button>
+        </div>
+      <div v-if="trendCursor" class="trend-quote">
+        <div class="trend-quote-head">
+          <span class="trend-quote-date">{{ trendCursor.date }}</span>
+          <span class="trend-quote-last">
+            <b :class="pnlClass(trendPointChange(trendCursor))">{{ adviceNum(trendCursor.close) }}</b>
+            <b class="trend-quote-change" :class="pnlClass(trendPointChange(trendCursor))">{{ trendPointChange(trendCursor) == null ? '' : formatPct(trendPointChange(trendCursor)) }}</b>
+          </span>
+        </div>
+        <div class="trend-quote-grid">
+          <span><em>开</em><b>{{ adviceNum(trendCursor.open) }}</b></span>
+          <span><em>高</em><b>{{ adviceNum(trendCursor.high) }}</b></span>
+          <span><em>低</em><b>{{ adviceNum(trendCursor.low) }}</b></span>
+          <span><em>量</em><b>{{ formatCount(trendCursor.volume) }}</b></span>
+          <span class="is-ma"><em>MA20</em><b>{{ adviceNum(trendCursor.ma20) }}</b></span>
+          <span class="is-vwap"><em>AVWAP</em><b>{{ adviceNum(trendCursor.anchor_vwap) }}</b></span>
+          <span><em>Amihud</em><b>{{ adviceNum(trendCursor.illiq, 3) }}</b></span>
+        </div>
+      </div>
       <div ref="trendChartRef" class="trend-chart"></div>
       <a-table
+        class="trend-table"
         :columns="trendColumns"
         :data-source="trendRows"
         :loading="trendLoading"
@@ -2506,16 +2872,16 @@ onUnmounted(() => {
           </div>
           <div>
             <span>当前均价</span>
-            <strong>{{ formatMoney(addPositionRecord.avg_price).replace(' USD', '') }}</strong>
+            <strong>{{ formatMoney(addPositionRecord.avg_price).replace(/ [A-Z]{3}$/, '') }}</strong>
           </div>
           <div>
             <span>当前价格</span>
-            <strong>{{ addPositionRecord.last_price == null ? '—' : formatMoney(addPositionRecord.last_price).replace(' USD', '') }}</strong>
+            <strong>{{ addPositionRecord.last_price == null ? '—' : formatMoney(addPositionRecord.last_price).replace(/ [A-Z]{3}$/, '') }}</strong>
           </div>
           <div>
             <span>当前盈亏</span>
             <strong :class="pnlClass(addPositionCalculation.currentPnl)">
-              {{ addPositionCalculation.currentPnl == null ? '—' : formatMoney(addPositionCalculation.currentPnl).replace(' USD', '') }}
+              {{ addPositionCalculation.currentPnl == null ? '—' : formatMoney(addPositionCalculation.currentPnl).replace(/ [A-Z]{3}$/, '') }}
             </strong>
             <small v-if="addPositionCalculation.currentPnlPct != null" :class="pnlClass(addPositionCalculation.currentPnlPct)">
               {{ formatPct(addPositionCalculation.currentPnlPct) }}
@@ -2572,7 +2938,7 @@ onUnmounted(() => {
           </div>
           <div class="calculator-result">
             <span>剩余均价</span>
-            <strong>{{ addPositionCalculation.newQty > 0 ? formatMoney(addPositionCalculation.newAvg).replace(' USD', '') : '—' }}</strong>
+            <strong>{{ addPositionCalculation.newQty > 0 ? formatMoney(addPositionCalculation.newAvg).replace(/ [A-Z]{3}$/, '') : '—' }}</strong>
           </div>
           <div class="calculator-result">
             <span>盈亏比例</span>
@@ -2580,7 +2946,7 @@ onUnmounted(() => {
               {{ addPositionCalculation.afterPnlPct == null ? '—' : formatPct(addPositionCalculation.afterPnlPct) }}
             </strong>
             <small v-if="addPositionCalculation.afterPnl != null" :class="pnlClass(addPositionCalculation.afterPnl)">
-              {{ formatMoney(addPositionCalculation.afterPnl).replace(' USD', '') }}
+              {{ formatMoney(addPositionCalculation.afterPnl).replace(/ [A-Z]{3}$/, '') }}
             </small>
             <small v-else-if="addPositionCalculation.isSell && addPositionCalculation.newQty === 0">
               已按现价全部卖出
@@ -2589,7 +2955,7 @@ onUnmounted(() => {
           <div class="calculator-result">
             <span>止损亏损</span>
             <strong :class="pnlClass(addPositionCalculation.stopPnl)">
-              {{ addPositionCalculation.stopPnl == null ? '—' : formatMoney(addPositionCalculation.stopPnl).replace(' USD', '') }}
+              {{ addPositionCalculation.stopPnl == null ? '—' : formatMoney(addPositionCalculation.stopPnl).replace(/ [A-Z]{3}$/, '') }}
             </strong>
             <small v-if="addPositionCalculation.stopPnlPct != null" :class="pnlClass(addPositionCalculation.stopPnlPct)">
               {{ formatPct(addPositionCalculation.stopPnlPct) }}
@@ -2626,11 +2992,11 @@ onUnmounted(() => {
           </div>
           <div>
             <span>当前均价</span>
-            <strong>{{ formatMoney(stopModalRecord.avg_price).replace(' USD', '') }}</strong>
+            <strong>{{ formatMoney(stopModalRecord.avg_price).replace(/ [A-Z]{3}$/, '') }}</strong>
           </div>
           <div>
             <span>当前价格</span>
-            <strong>{{ stopModalRecord.last_price == null ? '—' : formatMoney(stopModalRecord.last_price).replace(' USD', '') }}</strong>
+            <strong>{{ stopModalRecord.last_price == null ? '—' : formatMoney(stopModalRecord.last_price).replace(/ [A-Z]{3}$/, '') }}</strong>
           </div>
         </div>
         <div class="stop-modal-form">
@@ -2646,10 +3012,10 @@ onUnmounted(() => {
             />
             <div class="stop-presets">
               <a-button size="small" @click="fillStopFrom('suggested_stop_price')">
-                建议 {{ stopModalRecord.suggested_stop_price == null ? '—' : formatMoney(stopModalRecord.suggested_stop_price).replace(' USD', '') }}
+                建议 {{ stopModalRecord.suggested_stop_price == null ? '—' : formatMoney(stopModalRecord.suggested_stop_price).replace(/ [A-Z]{3}$/, '') }}
               </a-button>
               <a-button size="small" danger @click="fillStopFrom('mandatory_stop_price')">
-                必须 {{ stopModalRecord.mandatory_stop_price == null ? '—' : formatMoney(stopModalRecord.mandatory_stop_price).replace(' USD', '') }}
+                必须 {{ stopModalRecord.mandatory_stop_price == null ? '—' : formatMoney(stopModalRecord.mandatory_stop_price).replace(/ [A-Z]{3}$/, '') }}
               </a-button>
             </div>
           </label>
@@ -2967,6 +3333,11 @@ onUnmounted(() => {
 .holding-stop-tag.is-set {
   color: #b52f27;
   background: #ffe8ea;
+}
+
+.holding-stop-tag.is-target {
+  color: #067a68;
+  background: #e7f6f2;
 }
 
 .holding-limit-status {
@@ -3297,8 +3668,16 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  max-height: min(70vh, 720px);
-  overflow: auto;
+}
+
+.advice-body .trend-brief {
+  margin-bottom: 0;
+}
+
+.advice-body .trend-brief-grid,
+.advice-body .trend-brief-grid article:last-child {
+  grid-template-columns: 1fr;
+  grid-column: auto;
 }
 
 .advice-headline {
@@ -3315,57 +3694,335 @@ onUnmounted(() => {
   line-height: 1.65;
 }
 
-.market-sentiment {
-  display: grid;
-  grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);
-  gap: 16px;
-  margin-bottom: 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel);
+.price-page {
+  width: 100%;
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 8px 0 32px;
+  color: #243047;
 }
 
-.sentiment-kicker,
-.sentiment-label {
-  margin: 0 0 6px;
+.price-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+  margin-bottom: 26px;
 }
 
-.sentiment-kicker,
-.sentiment-asof,
-.sentiment-note,
-.sentiment-sub {
-  color: var(--muted);
+.price-eyebrow {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: #7b8598;
+}
+
+.price-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 27px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1.3;
+}
+
+.price-title-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #14977d;
+}
+
+.price-description {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #7b8598;
+}
+
+.price-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.price-page :deep(.price-action.ant-btn) {
+  height: 36px;
+  border-radius: 9px;
+  border-color: #dce3f4;
+  color: #4662bf;
+  background: #f9faff;
   font-size: 12px;
+  box-shadow: none;
 }
 
-.sentiment-label {
+.price-hero {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(390px, 0.92fr);
+  gap: 34px;
+  align-items: center;
+  overflow: hidden;
+  margin-bottom: 16px;
+  padding: 34px;
+  border: 1px solid #dde9e5;
+  border-radius: 20px;
+  background: linear-gradient(122deg, #f4faf7 0%, #f8fbfe 50%, #eef3ff 100%);
+}
+
+.price-hero::after {
+  content: '';
+  position: absolute;
+  right: -76px;
+  top: -108px;
+  width: 250px;
+  height: 250px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(80, 109, 185, 0.1), rgba(80, 109, 185, 0));
+  pointer-events: none;
+}
+
+.price-hero-copy,
+.price-metrics {
+  position: relative;
+  z-index: 1;
+}
+
+.price-kicker {
   display: flex;
   align-items: center;
   gap: 8px;
+  margin: 0 0 15px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #60766f;
+}
+
+.price-kicker-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #14977d;
+  box-shadow: 0 0 0 4px rgba(20, 151, 125, 0.1);
+}
+
+.price-hero-copy h2 {
+  margin: 0;
+  font-size: clamp(30px, 3.6vw, 43px);
+  font-weight: 680;
+  line-height: 1.24;
+  letter-spacing: -0.05em;
+  color: #21836f;
+}
+
+.price-hero-note {
+  max-width: 600px;
+  margin: 17px 0 0;
+  font-size: 13px;
+  line-height: 1.85;
+  color: #66778b;
+}
+
+.price-hero-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  margin-top: 21px;
+}
+
+.price-hero-meta span {
+  padding: 5px 9px;
+  border: 1px solid rgba(210, 222, 230, 0.9);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.58);
+  font-size: 10px;
+  color: #687b89;
+}
+
+.price-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.price-metrics article {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+  min-height: 118px;
+  padding: 17px;
+  border: 1px solid rgba(219, 227, 239, 0.95);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.84);
+  box-shadow: 0 5px 18px rgba(46, 70, 105, 0.035);
+}
+
+.price-metric-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  font-size: 15px;
+}
+
+.price-metric-icon.blue { color: #4b6de0; background: #eef2ff; }
+.price-metric-icon.teal { color: #14977d; background: #eaf7f3; }
+.price-metric-icon.amber { color: #b78631; background: #fcf5e8; }
+.price-metric-icon.violet { color: #8a68c9; background: #f3effb; }
+
+.price-metrics p {
+  margin: 1px 0 7px;
+  font-size: 10px;
+  color: #7c8798;
+}
+
+.price-metrics strong {
+  display: block;
+  font-size: 21px;
+  line-height: 1.22;
+  letter-spacing: -0.035em;
+  font-variant-numeric: tabular-nums;
+  color: #31445b;
+}
+
+.price-metrics strong.pnl-up,
+.price-tape strong.pnl-up,
+.price-tape span.pnl-up {
+  color: #089981;
+}
+
+.price-metrics strong.pnl-down,
+.price-tape strong.pnl-down,
+.price-tape span.pnl-down {
+  color: #f23645;
+}
+
+.price-metrics article > div > span {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #929baa;
+}
+
+.price-tape {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 8px;
+  padding: 18px;
+  border: 1px solid #dfe8e4;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #fbfdfc, #f7fafb);
+}
+
+.price-tape article {
+  min-width: 0;
+  padding: 14px 15px;
+  border: 1px solid #e5ece9;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.price-tape p {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 650;
+  color: #425969;
+}
+
+.price-tape strong {
+  display: block;
+  font-size: 20px;
+  line-height: 1.2;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-tape article > span {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: #8994a1;
+}
+
+.price-tape .sentiment-chart {
+  grid-column: 1 / -1;
+  height: 228px;
+  margin-top: 4px;
+}
+
+.price-section-head {
+  margin-top: 28px;
+}
+
+.price-section-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 8px;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.025em;
+}
+
+.price-section-number {
+  padding: 5px 6px;
+  border-radius: 5px;
+  background: #eaf5f1;
+  color: #3c8a77;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-section-badge {
+  padding: 3px 8px;
+  border-radius: 5px;
+  background: #f3f5f9;
+  color: #8992a4;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.price-section-sub {
+  margin: 0 0 14px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #7b8598;
+}
+
+.price-toolbar {
+  margin-bottom: 12px;
+}
+
+.price-page .price-table :deep(.ant-table) {
+  border: 1px solid #e7ebf2;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 4px 16px rgba(38, 58, 95, 0.025);
+}
+
+.price-page .price-table :deep(.ant-table-thead > tr > th) {
+  background: #f8f9fc;
+  color: #7b8598;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .sentiment-note {
-  margin: 0 0 8px;
-  line-height: 1.5;
-}
-
-.sentiment-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 16px;
-  margin: 0 0 8px;
-}
-
-.sentiment-stats dt {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.sentiment-stats dd {
   margin: 0;
-  font-variant-numeric: tabular-nums;
-  font-weight: 650;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .sentiment-chart,
@@ -3374,7 +4031,78 @@ onUnmounted(() => {
 }
 
 .sentiment-chart {
-  height: 180px;
+  height: 200px;
+}
+
+@media (max-width: 1100px) {
+  .price-hero {
+    grid-template-columns: 1fr;
+    gap: 26px;
+    padding: 28px;
+  }
+}
+
+@media (max-width: 800px) {
+  .price-header {
+    align-items: flex-start;
+  }
+
+  .price-hero {
+    padding: 24px;
+  }
+
+  .price-tape {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    padding: 12px;
+  }
+
+  .price-tape article {
+    padding: 10px 8px;
+  }
+
+  .price-tape p,
+  .price-tape article > span {
+    font-size: 11px;
+  }
+
+  .price-tape strong {
+    font-size: 15px;
+  }
+}
+
+@media (max-width: 560px) {
+  .price-header {
+    flex-direction: column;
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+
+  .price-title {
+    font-size: 24px;
+  }
+
+  .price-header-actions {
+    width: 100%;
+  }
+
+  .price-hero {
+    padding: 22px 18px;
+    border-radius: 16px;
+  }
+
+  .price-hero-copy h2 {
+    font-size: 28px;
+  }
+
+  .price-metrics article {
+    min-height: 0;
+    padding: 13px;
+  }
+
+  .price-metrics strong {
+    font-size: 17px;
+  }
 }
 
 .col-head {
@@ -3392,9 +4120,11 @@ onUnmounted(() => {
 
 .trend-toolbar {
   display: flex;
-  align-items: center;
-  gap: 12px;
   margin-bottom: 8px;
+}
+
+.trend-toolbar :deep(.ant-select) {
+  width: 280px;
 }
 
 .trend-marks {
@@ -3406,8 +4136,8 @@ onUnmounted(() => {
 }
 
 .trend-mark {
-  padding: 1px 8px;
-  border-radius: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
   font-size: 12px;
   font-weight: 650;
   line-height: 20px;
@@ -3433,14 +4163,237 @@ onUnmounted(() => {
   background: #e8efff;
 }
 
+.trend-quote {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 6px;
+  padding: 10px 12px 8px;
+  border: 1px solid #e7ebf2;
+  border-radius: 12px;
+  background: #fff;
+  font-variant-numeric: tabular-nums;
+}
+
+.trend-quote-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.trend-quote-date {
+  color: #7b8598;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.trend-quote-last {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.trend-quote-last b:first-child {
+  font-size: 20px;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+}
+
+.trend-quote b {
+  font-weight: 650;
+}
+
+.trend-quote-change {
+  font-size: 13px;
+}
+
+.trend-quote-grid {
+  display: flex;
+  gap: 6px;
+}
+
+.trend-quote-grid span {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: #f8f9fc;
+}
+
+.trend-quote-grid em {
+  color: #7b8598;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.trend-quote-grid b {
+  color: #243047;
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.trend-quote .is-ma b {
+  color: #e6a700;
+}
+
+.trend-quote .is-vwap b {
+  color: #089981;
+}
+
 .trend-chart {
-  height: 420px;
+  height: 460px;
   margin-bottom: 8px;
 }
 
+.trend-table {
+  max-width: 100%;
+}
+
+.trend-table :deep(.ant-table) {
+  border: 1px solid #e7ebf2;
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.trend-table :deep(.ant-table-thead > tr > th) {
+  background: #f8f9fc;
+  color: #7b8598;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.trend-brief {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.trend-brief-lead {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.55;
+  letter-spacing: -0.02em;
+  color: #243047;
+}
+
+.trend-levels {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.trend-levels div,
+.trend-levels button {
+  display: flex;
+  flex: 1 1 0;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font: inherit;
+}
+
+.trend-levels button {
+  cursor: pointer;
+}
+
+.trend-levels button:hover {
+  filter: brightness(0.97);
+}
+
+.trend-levels span {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.trend-levels strong {
+  font-size: 18px;
+  line-height: 1.2;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
+.trend-levels .is-stop {
+  color: #f23645;
+  background: #fff5f6;
+  border: 1px solid #ffd6da;
+}
+
+.trend-levels .is-target {
+  color: #089981;
+  background: #f3fbf8;
+  border: 1px solid #cde8df;
+}
+
+.trend-brief-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.trend-brief-grid article {
+  padding: 12px 14px;
+  border: 1px solid #e5ece9;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #fbfdfc, #f7fafb);
+}
+
+.trend-brief-grid h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 650;
+  color: #3c8a77;
+}
+
+.trend-brief-grid p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.trend-brief-advice {
+  margin-top: 4px;
+  color: var(--muted);
+}
+
+.trend-brief-grid article:last-child {
+  grid-column: 1 / -1;
+}
+
 @media (max-width: 720px) {
-  .market-sentiment {
+  .trend-toolbar {
+    flex-direction: column;
+  }
+
+  .trend-toolbar :deep(.ant-select) {
+    width: 100% !important;
+  }
+
+  .trend-brief-grid {
     grid-template-columns: 1fr;
+  }
+
+  .trend-quote-grid {
+    flex-wrap: wrap;
+  }
+
+  .trend-quote-grid span {
+    flex: 1 1 22%;
+  }
+
+  .trend-chart {
+    height: 320px;
   }
 }
 
@@ -3504,24 +4457,28 @@ onUnmounted(() => {
 
 .advice-stage {
   font-size: 12px;
-  line-height: 1;
-  padding: 3px 6px;
-  border-radius: 4px;
-  background: var(--chip);
-  color: var(--muted);
+  font-weight: 650;
+  line-height: 20px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: #f4f6fa;
+  color: #5c6b82;
 }
 
 .advice-stage.is-warning,
 .advice-stage.is-danger {
-  color: var(--red);
+  color: #b52f27;
+  background: #ffe8ea;
 }
 
 .advice-stage.is-success {
-  color: var(--green);
+  color: #067a68;
+  background: #e7f6f2;
 }
 
 .advice-stage.is-info {
-  color: var(--blue);
+  color: #315ea8;
+  background: #e8efff;
 }
 
 .price-table :deep(th.ant-table-cell-fix-left),

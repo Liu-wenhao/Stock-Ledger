@@ -380,7 +380,7 @@ onUnmounted(() => {
           {{ ['Deposit', 'Withdrawal'].includes(record.side) ? '—' : formatQty(record.qty) }}
         </template>
         <template v-else-if="column.key === 'fill_price'">
-          {{ formatMoney(record.fill_price, 'USD', 4).replace(' USD', '') }}
+          {{ formatMoney(record.fill_price, 'USD', 4).replace(/ [A-Z]{3}$/, '') }}
         </template>
         <template v-else-if="column.key === 'commission'">
           {{ formatMoney(record.commission) }}

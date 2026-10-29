@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.models.entities import DailyNav, SymbolMeta, Trade
 from app.services.market import get_history_closes, get_quotes
+from app.services.market_scope import market_currency
 from app.services.symbols import exchange_of
 
 ZERO = Decimal("0")
@@ -335,12 +336,15 @@ def _nav_series_needs_rebuild(existing: list[DailyNav]) -> bool:
 
 
 def load_trades(db: Session, portfolio_id: int = 1) -> list[Trade]:
-    return (
+    from app.services.market_scope import in_market
+
+    rows = (
         db.query(Trade)
         .filter(Trade.portfolio_id == portfolio_id)
         .order_by(Trade.closing_time.asc(), Trade.id.asc())
         .all()
     )
+    return [row for row in rows if in_market(row.symbol)]
 
 
 def compute_holdings(
@@ -811,7 +815,7 @@ def compute_summary(db: Session, portfolio_id: int = 1) -> dict:
         "total_pnl": total_pnl,
         "total_pnl_percent": total_pct.quantize(Decimal("0.01")),
         "annualized_return": annualized,
-        "currency": settings.base_currency,
+        "currency": market_currency(),
         "as_of": datetime.utcnow(),
         "net_invested": net_invested,
     }
@@ -890,12 +894,19 @@ def range_start(key: str, first_date: date | None) -> date:
 
 
 def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) -> list[DailyNav]:
-    existing = (
-        db.query(DailyNav)
-        .filter(DailyNav.portfolio_id == portfolio_id)
-        .order_by(DailyNav.nav_date.asc())
-        .all()
-    )
+    from app.services.market_scope import current_market
+
+    # The stored NAV is the US book. Other markets are computed in memory so a
+    # filtered request cannot overwrite that cache.
+    persist = current_market() == "us"
+    existing = []
+    if persist:
+        existing = (
+            db.query(DailyNav)
+            .filter(DailyNav.portfolio_id == portfolio_id)
+            .order_by(DailyNav.nav_date.asc())
+            .all()
+        )
     if existing and not rebuild:
         if _nav_series_needs_rebuild(existing):
             rebuild = True
@@ -919,9 +930,9 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
         symbols, datetime.combine(start, datetime.min.time()), datetime.utcnow()
     )
 
-    # Clear old
-    db.query(DailyNav).filter(DailyNav.portfolio_id == portfolio_id).delete()
-    db.commit()
+    if persist:
+        db.query(DailyNav).filter(DailyNav.portfolio_id == portfolio_id).delete()
+        db.commit()
 
     rows: list[DailyNav] = []
     day = start
@@ -973,10 +984,13 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
             net_invested=net_invested,
             investment_total=investment_total,
         )
-        db.add(row)
+        if persist:
+            db.add(row)
         rows.append(row)
         day += timedelta(days=1)
 
+    if not persist:
+        return rows
     db.commit()
     return (
         db.query(DailyNav)
@@ -988,6 +1002,9 @@ def build_nav_series(db: Session, portfolio_id: int = 1, rebuild: bool = False) 
 
 def _sync_live_today_nav(db: Session, rows: list[DailyNav], portfolio_id: int = 1) -> list[DailyNav]:
     """Align the current US session NAV row with live holdings."""
+    from app.services.market_scope import current_market
+
+    persist = current_market() == "us"
     summary = compute_summary(db, portfolio_id)
     live_investment_total = _live_investment_total(db, portfolio_id)
     live_value = _dec(summary["portfolio_value"])
@@ -1008,9 +1025,10 @@ def _sync_live_today_nav(db: Session, rows: list[DailyNav], portfolio_id: int = 
         last.holdings_value = live_value - live_cash
         last.net_invested = _dec(summary.get("net_invested"))
         last.investment_total = live_investment_total
-        db.add(last)
-        db.commit()
-        db.refresh(last)
+        if persist:
+            db.add(last)
+            db.commit()
+            db.refresh(last)
         return rows
 
     if last.nav_date < session_today:
@@ -1025,9 +1043,10 @@ def _sync_live_today_nav(db: Session, rows: list[DailyNav], portfolio_id: int = 
             net_invested=_dec(summary.get("net_invested")),
             investment_total=live_investment_total,
         )
-        db.add(row)
-        db.commit()
-        db.refresh(row)
+        if persist:
+            db.add(row)
+            db.commit()
+            db.refresh(row)
         return [*rows, row]
 
     return rows

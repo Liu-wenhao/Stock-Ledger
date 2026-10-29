@@ -14,7 +14,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.models.entities import PriceCache, SymbolMeta
-from app.services.symbols import to_market_symbol
+from app.services.market_scope import market_of
+from app.services.symbols import quote_code, to_market_symbol
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -29,6 +30,7 @@ _USER_AGENT = (
 )
 _SINA_QUOTE_URL = "https://hq.sinajs.cn/list={symbols}"
 _TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q={symbols}"
+_TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 _SINA_KLINE_URL = (
     "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var/"
     "US_MinKService.getDailyK"
@@ -134,6 +136,8 @@ def ensure_symbol_meta(db: Session, symbol: str, fetch_remote: bool = False) -> 
         return row
 
     exchange = symbol.split(":")[0] if ":" in symbol else None
+    kind = market_of(symbol)
+    currency = {"cn": "CNY", "hk": "HKD"}.get(kind, "USD")
     row = SymbolMeta(
         symbol=symbol,
         # The legacy column also stores the normalized ticker used by the
@@ -141,7 +145,7 @@ def ensure_symbol_meta(db: Session, symbol: str, fetch_remote: bool = False) -> 
         yahoo_symbol=provider_symbol,
         name=KNOWN_NAMES.get(provider_symbol),
         exchange=exchange,
-        currency="USD",
+        currency=currency,
         logo_url=None,
     )
     db.add(row)
@@ -216,8 +220,32 @@ def get_quotes(
         fetched = _fetch_global_stock_data_batch(stale)
         _persist_quotes(stale, fetched)
         for sym in stale:
-            cache = db.query(PriceCache).filter(PriceCache.symbol == sym).first()
-            result[sym] = _cache_to_dict(cache, sym)
+            data = fetched.get(sym) or {}
+            # A new symbol is written on another session. This request's
+            # transaction cannot see that commit, so use the fetch itself.
+            if data.get("price") is not None:
+                result[sym] = {
+                    "symbol": sym,
+                    "price": data.get("price"),
+                    "prev_close": data.get("prev_close"),
+                    "open": data.get("open"),
+                    "high": data.get("high"),
+                    "low": data.get("low"),
+                    "change": data.get("change"),
+                    "change_percent": data.get("change_percent"),
+                    "price_as_of": data.get("price_as_of"),
+                    "name": data.get("name"),
+                }
+            else:
+                cache = db.query(PriceCache).filter(PriceCache.symbol == sym).first()
+                result[sym] = _cache_to_dict(cache, sym)
+            name = data.get("name")
+            if name:
+                meta = db.query(SymbolMeta).filter(SymbolMeta.symbol == sym).first()
+                if meta and not meta.name:
+                    meta.name = str(name)[:255]
+        if any((fetched.get(sym) or {}).get("name") for sym in stale):
+            db.commit()
 
     return result
 
@@ -294,6 +322,11 @@ def _persist_quotes(symbols: list[str], fetched: dict[str, dict[str, Any]]) -> N
             if change_pct is not None:
                 cache.change_percent = change_pct
             cache.fetched_at = now
+            name = data.get("name")
+            if name:
+                meta = db.query(SymbolMeta).filter(SymbolMeta.symbol == sym).first()
+                if meta and not meta.name:
+                    meta.name = str(name)[:255]
         db.commit()
     except Exception as exc:
         db.rollback()
@@ -316,6 +349,7 @@ def _request_text(
     params: dict[str, Any] | None = None,
     referer: str | None = None,
     timeout: int = 5,
+    encoding: str = "gbk",
 ) -> str:
     import requests
 
@@ -324,7 +358,7 @@ def _request_text(
         headers["Referer"] = referer
     response = requests.get(url, params=params, headers=headers, timeout=timeout)
     response.raise_for_status()
-    response.encoding = "gbk"
+    response.encoding = encoding
     return response.text
 
 
@@ -378,15 +412,15 @@ def _parse_sina_quote(text: str, ticker: str) -> dict[str, Any]:
     )
 
 
-def _parse_tencent_quote(text: str, ticker: str) -> dict[str, Any]:
-    pattern = rf'v_us{re.escape(ticker)}="([^"]*)"'
+def _parse_tencent_quote(text: str, code: str) -> dict[str, Any]:
+    pattern = rf'v_{re.escape(code)}="([^"]*)"'
     match = re.search(pattern, text, flags=re.IGNORECASE)
     if not match:
         return {}
     fields = match.group(1).split("~")
-    if len(fields) < 52:
+    if len(fields) < 35:
         return {}
-    return _quote_payload(
+    payload = _quote_payload(
         price=fields[3],
         prev_close=fields[4],
         open_price=fields[5],
@@ -394,11 +428,32 @@ def _parse_tencent_quote(text: str, ticker: str) -> dict[str, Any]:
         low=fields[34],
         timestamp=fields[30],
     )
+    name = fields[1].strip() if len(fields) > 1 else ""
+    if payload and name:
+        payload["name"] = name
+    return payload
 
 
-def _fetch_global_stock_data_batch(
-    symbols: list[str],
-) -> dict[str, dict[str, Any]]:
+def _fetch_cn_hk_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
+    """A-share and Hong Kong quotes. Prefixes are sh/sz/hk, not the US feed."""
+    out: dict[str, dict[str, Any]] = {symbol: {} for symbol in symbols}
+    codes = {symbol: quote_code(symbol) for symbol in symbols}
+    codes = {symbol: code for symbol, code in codes.items() if code}
+    if not codes:
+        return out
+    try:
+        text = _request_text(_TENCENT_QUOTE_URL.format(symbols=",".join(codes.values())))
+    except Exception as exc:
+        logger.warning("Tencent CN/HK quote request failed: %s", exc)
+        return out
+    for symbol, code in codes.items():
+        quote = _parse_tencent_quote(text, code)
+        if quote.get("price") is not None:
+            out[symbol] = quote
+    return out
+
+
+def _fetch_us_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
     """Fetch US quotes using global-stock-data's Sina -> Tencent priority."""
     out: dict[str, dict[str, Any]] = {symbol: {} for symbol in symbols}
     mapping = {symbol: _provider_ticker(symbol) for symbol in symbols}
@@ -423,7 +478,7 @@ def _fetch_global_stock_data_batch(
             tencent_codes = ",".join(f"us{ticker}" for ticker in missing)
             text = _request_text(_TENCENT_QUOTE_URL.format(symbols=tencent_codes))
             for ticker in missing:
-                quote = _parse_tencent_quote(text, ticker)
+                quote = _parse_tencent_quote(text, f"us{ticker}")
                 if quote.get("price") is not None:
                     by_ticker[ticker] = quote
         except Exception as exc:
@@ -432,6 +487,64 @@ def _fetch_global_stock_data_batch(
     for symbol, ticker in mapping.items():
         out[symbol] = by_ticker.get(ticker, {})
     return out
+
+
+def _fetch_global_stock_data_batch(
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    local = [symbol for symbol in symbols if market_of(symbol) in {"cn", "hk"}]
+    us = [symbol for symbol in symbols if symbol not in local]
+    out: dict[str, dict[str, Any]] = {}
+    if us:
+        out.update(_fetch_us_quotes(us))
+    if local:
+        out.update(_fetch_cn_hk_quotes(local))
+    return out
+
+
+def fetch_tencent_bars(symbol: str, lot_size: int = 1, limit: int = 320) -> list[dict[str, Any]]:
+    """Daily bars from Tencent. A-share volume is in lots of 100 shares."""
+    code = quote_code(symbol)
+    if not code:
+        return []
+    text = _request_text(
+        _TENCENT_KLINE_URL,
+        params={"param": f"{code},day,,,{limit},qfq"},
+        timeout=12,
+        encoding="utf-8",
+    )
+    payload = json.loads(text)
+    node = (payload.get("data") or {}).get(code) or {}
+    rows = node.get("qfqday") or node.get("day") or []
+    bars: list[dict[str, Any]] = []
+    scale = lot_size if lot_size > 0 else 1
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        day = str(row[0])[:10]
+        try:
+            opened = float(row[1])
+            close = float(row[2])
+            high = float(row[3])
+            low = float(row[4])
+            volume = float(row[5]) * scale
+        except (TypeError, ValueError):
+            continue
+        if not day or close <= 0:
+            continue
+        bars.append(
+            {
+                "d": day,
+                "o": opened,
+                "h": high,
+                "l": low,
+                "c": close,
+                "v": volume,
+                "dol": close * volume,
+            }
+        )
+    bars.sort(key=lambda bar: bar["d"])
+    return bars
 
 
 def _fetch_sina_history(ticker: str, num: int) -> list[dict[str, Any]]:
