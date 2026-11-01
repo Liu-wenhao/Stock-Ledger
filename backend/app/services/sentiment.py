@@ -27,7 +27,7 @@ _BREADTH_URL = (
     "US_CategoryService.getList"
 )
 _VIX_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
-_INDEXES = (("标普 500", ".inx"), ("纳斯达克", ".ixic"))
+_INDEXES = (("标普 500", ".inx"), ("道琼斯", ".dji"), ("纳斯达克", ".ixic"))
 
 
 def build_market_sentiment(db=None, market: str = "us") -> dict:
@@ -241,10 +241,19 @@ def _vix(db) -> dict:
     }
 
 
+def _ma20_fields(closes: list[float], last: float) -> dict:
+    window = closes[-20:]
+    ma20 = round(mean(window), 2) if len(window) >= 20 else None
+    return {
+        "ma20": ma20,
+        "vs_ma20": None if not ma20 else round((last / ma20 - 1) * 100, 2),
+    }
+
+
 def _index(db, name: str, symbol: str) -> dict:
     from app.services.bars import load_sina_bars
 
-    empty = {"name": name, "last": None, "day_change": None, "ret_5d": None, "history": []}
+    empty = {"name": name, "last": None, "day_change": None, "ret_5d": None, "ma20": None, "vs_ma20": None, "history": []}
     try:
         rows = load_sina_bars(db, symbol)
     except Exception:
@@ -264,6 +273,7 @@ def _index(db, name: str, symbol: str) -> dict:
         "last": round(last, 2),
         "day_change": round((last / prev - 1) * 100, 2) if prev else None,
         "ret_5d": None if not base else round((last / base - 1) * 100, 2),
+        **_ma20_fields([price for _, price in bars], last),
         "history": [{"date": day, "close": round(price, 2)} for day, price in tail],
     }
 
@@ -284,8 +294,10 @@ def _push_today(item: dict, close: float, day: str) -> None:
     item["day_change"] = round((last / prev - 1) * 100, 2) if prev else None
     if "ret_5d" in item:
         item["ret_5d"] = None if not base else round((last / base - 1) * 100, 2)
-    if "ma20" in item and item.get("ma20"):
-        item["vs_ma20"] = round((last / item["ma20"] - 1) * 100, 1)
+    if "ma20" in item:
+        window = [point["close"] for point in item["history"][-20:]]
+        item["ma20"] = round(mean(window), 2) if len(window) >= 20 else None
+        item["vs_ma20"] = None if not item["ma20"] else round((last / item["ma20"] - 1) * 100, 2)
 
 
 def _overlay_open_session(payload: dict | None) -> dict | None:
@@ -321,6 +333,7 @@ _CN_INDEXES = (
     ("上证指数", "SSE:000001"),
     ("深证成指", "SZSE:399001"),
     ("创业板指", "SZSE:399006"),
+    ("科创板", "SSE:000688"),
 )
 _HK_INDEXES = (
     ("恒生指数", "HKEX:HSI"),
@@ -430,7 +443,7 @@ def _index_tencent(db, name: str, symbol: str) -> dict:
 
 
 def _index_view(name: str, rows: list[dict]) -> dict:
-    empty = {"name": name, "last": None, "day_change": None, "ret_5d": None, "history": []}
+    empty = {"name": name, "last": None, "day_change": None, "ret_5d": None, "ma20": None, "vs_ma20": None, "history": []}
     bars = [(row["d"], row["c"]) for row in rows if row.get("c")]
     if len(bars) < 2:
         return empty
@@ -446,5 +459,6 @@ def _index_view(name: str, rows: list[dict]) -> dict:
         "last": round(last, 2),
         "day_change": round((last / prev - 1) * 100, 2) if prev else None,
         "ret_5d": None if not base else round((last / base - 1) * 100, 2),
+        **_ma20_fields([price for _, price in bars], last),
         "history": [{"date": day, "close": round(price, 2)} for day, price in tail],
     }

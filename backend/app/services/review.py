@@ -787,6 +787,103 @@ def _build_reentry_candidates(
     return candidates
 
 
+# Unlevered broad index products. Single names and leveraged funds stay in the satellite sleeve.
+_CORE_TICKERS = {
+    "SPY", "VOO", "IVV", "SPLG", "QQQ", "QQQM", "DIA", "IWM", "VTI", "ITOT",
+    "SCHB", "SCHX", "VT", "VEA", "VWO",
+    "510050", "510300", "510310", "510330", "510500", "159919", "159922",
+    "159915", "159949", "588000", "588080",
+    "2800", "3033", "3067",
+}
+_SLEEVE_TARGET = (("core", "核心仓", 60), ("satellite", "卫星仓", 30), ("cash", "现金", 10))
+
+
+def _allocation_sleeve(symbol: str) -> str:
+    ticker = (symbol or "").split(":")[-1].upper()
+    return "core" if ticker in _CORE_TICKERS else "satellite"
+
+
+def _build_allocation(positions: list[dict], cash: Decimal) -> dict:
+    cash_value = cash if cash > ZERO else ZERO
+    buckets = {"core": ZERO, "satellite": ZERO}
+    names = []
+    for row in positions:
+        value = Decimal(row.get("market_value") or 0)
+        if value <= ZERO:
+            continue
+        sleeve = _allocation_sleeve(row["symbol"])
+        buckets[sleeve] += value
+        names.append(
+            {
+                "symbol": row["symbol"],
+                "ticker": (row["symbol"] or "").split(":")[-1],
+                "sleeve": "核心" if sleeve == "core" else "卫星",
+                "market_value": value,
+            }
+        )
+    holdings_value = buckets["core"] + buckets["satellite"]
+    equity = holdings_value + cash_value
+    single_cap = equity * Decimal("0.08")
+    current = {
+        "core": buckets["core"],
+        "satellite": buckets["satellite"],
+        "cash": cash_value,
+    }
+    sleeves = []
+    for key, label, target_pct in _SLEEVE_TARGET:
+        target_amount = equity * Decimal(target_pct) / Decimal("100")
+        amount = current[key]
+        sleeves.append(
+            {
+                "key": key,
+                "label": label,
+                "target_pct": target_pct,
+                "target_amount": _q(target_amount),
+                "current_pct": float(_q(amount / equity * Decimal("100"), "0.1")) if equity > ZERO else 0,
+                "current_amount": _q(amount),
+                "gap": _q(target_amount - amount),
+            }
+        )
+    priced = []
+    for row in names:
+        weight = row["market_value"] / equity * Decimal("100") if equity > ZERO else ZERO
+        priced.append(
+            {
+                **row,
+                "market_value": _q(row["market_value"]),
+                "weight": float(_q(weight, "0.1")),
+                "room": _q(single_cap - row["market_value"]),
+            }
+        )
+    priced.sort(key=lambda row: row["market_value"], reverse=True)
+    over = [row["ticker"] for row in priced if row["room"] < ZERO]
+    core_pct = sleeves[0]["current_pct"]
+    satellite_pct = sleeves[1]["current_pct"]
+    cash_pct = sleeves[2]["current_pct"]
+    if equity <= ZERO:
+        note = "当前账户没有持仓，也没有现金。"
+    else:
+        note = (
+            f"金额按持仓市值加现金计算。"
+            f"核心仓现在 {core_pct:.0f}%，卫星仓 {satellite_pct:.0f}%，现金 {cash_pct:.0f}%。"
+        )
+        if over:
+            note += f"{'、'.join(over)} 超过单只 8% 上限。"
+        elif core_pct == 0 and satellite_pct > 0:
+            note += "宽基指数才计入核心仓，现在的持仓都在卫星仓。"
+    return {
+        "equity": _q(equity),
+        "cash": _q(cash_value),
+        "holdings_value": _q(holdings_value),
+        "single_cap": _q(single_cap),
+        "tranche": _q(single_cap / Decimal("3")),
+        "loss_cap": _q(single_cap / Decimal("3") * Decimal("0.12")),
+        "sleeves": sleeves,
+        "names": priced,
+        "note": note,
+    }
+
+
 def build_strategy(db: Session, portfolio_id: int = 1) -> dict:
     """Review data plus live position actions and post-exit re-entry candidates."""
     data = build_review(db, portfolio_id)
@@ -823,9 +920,17 @@ def build_strategy(db: Session, portfolio_id: int = 1) -> dict:
         quotes,
         histories,
     )
+    try:
+        from app.services.ledger import compute_summary
+
+        cash = Decimal(compute_summary(db, portfolio_id)["cash"])
+    except Exception as exc:
+        logger.warning("strategy cash unavailable: %s", exc)
+        cash = ZERO
     return {
         **data,
         "open_positions": enriched,
         "reentry_candidates": candidates,
         "reentry_screened": len(candidates),
+        "allocation": _build_allocation(enriched, cash),
     }

@@ -199,6 +199,8 @@ def get_quotes(
 
     stale: list[str] = []
     now = datetime.utcnow()
+    from app.services.bars import session_closed
+
     for sym in unique:
         ensure_symbol_meta(db, sym, fetch_remote=False)
         cache = db.query(PriceCache).filter(PriceCache.symbol == sym).first()
@@ -209,6 +211,9 @@ def get_quotes(
             and cache.fetched_at
             and cache.fetched_at >= now - timedelta(seconds=settings.quote_cache_seconds)
         )
+        # A closed session does not print new volume or turnover. Keep the stored quote.
+        if session_closed(sym) and cache is not None and cache.price is not None:
+            continue
         if force or not fresh:
             stale.append(sym)
 
@@ -492,13 +497,28 @@ def _fetch_us_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
 def _fetch_global_stock_data_batch(
     symbols: list[str],
 ) -> dict[str, dict[str, Any]]:
-    local = [symbol for symbol in symbols if market_of(symbol) in {"cn", "hk"}]
-    us = [symbol for symbol in symbols if symbol not in local]
-    out: dict[str, dict[str, Any]] = {}
-    if us:
-        out.update(_fetch_us_quotes(us))
-    if local:
-        out.update(_fetch_cn_hk_quotes(local))
+    """YFinance for US, AkShare for A-share/HK. Sina/Tencent fill whatever is still empty."""
+    from app.services.data_sources import fetch_quotes
+
+    out = fetch_quotes(symbols)
+    missing_us = [
+        symbol
+        for symbol in symbols
+        if market_of(symbol) not in {"cn", "hk"} and not (out.get(symbol) or {}).get("price")
+    ]
+    missing_local = [
+        symbol
+        for symbol in symbols
+        if market_of(symbol) in {"cn", "hk"} and not (out.get(symbol) or {}).get("price")
+    ]
+    if missing_us:
+        for symbol, quote in _fetch_us_quotes(missing_us).items():
+            if quote.get("price") is not None:
+                out[symbol] = quote
+    if missing_local:
+        for symbol, quote in _fetch_cn_hk_quotes(missing_local).items():
+            if quote.get("price") is not None:
+                out[symbol] = quote
     return out
 
 

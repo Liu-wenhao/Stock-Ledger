@@ -8,12 +8,14 @@ import { DashboardOutlined, DownloadOutlined, FallOutlined, LineChartOutlined, Q
 import { fetchHoldings, fetchHoldingsAdvice, fetchIndicatorHistory, fetchMarketSentiment, fetchTrades, refreshMarket, updateHoldingLimit, updateHoldingStop } from '@/api/portfolio'
 import SymbolCell from '@/components/SymbolCell.vue'
 import { formatMoney, formatPct, formatQty, pnlClass, tickerOf, toNumber } from '@/utils/format'
-import { isUsMarketOpen } from '@/utils/marketHours'
+import { isMarketOpen } from '@/utils/marketHours'
+import { usePortfolioStore } from '@/stores/portfolio'
 import { downloadTableImage } from '@/utils/tableImage'
 import { useTableScrollY } from '@/composables/useTableScroll'
 
 const router = useRouter()
 const route = useRoute()
+const store = usePortfolioStore()
 
 const emit = defineEmits(['changed'])
 const isPricePage = computed(() => route.name === 'prices')
@@ -140,7 +142,7 @@ async function load({ silent = false } = {}) {
 }
 
 async function autoRefreshQuotes() {
-  if (quoteRefreshBusy || loading.value || !isUsMarketOpen()) return
+  if (quoteRefreshBusy || loading.value || !isMarketOpen(store.market)) return
   quoteRefreshBusy = true
   try {
     await refreshMarket(true)
@@ -630,7 +632,10 @@ const priceColumns = [
   { title: '锚定日', key: 'anchor_date', align: 'right', width: 108 },
   { title: 'AVWAP', key: 'anchor_vwap', align: 'right', width: 100 },
   { title: '距锚', key: 'vs_anchor', align: 'right', width: 84 },
+  { title: 'MA5', key: 'ma5', align: 'right', width: 88 },
+  { title: 'MA10', key: 'ma10', align: 'right', width: 88 },
   { title: 'MA20', key: 'ma20', align: 'right', width: 96 },
+  { title: '排列', key: 'ma_order', align: 'right', width: 72 },
   { title: '带宽', key: 'bandwidth', align: 'right', width: 84 },
   { title: '波动', key: 'vol', align: 'right', width: 84 },
   { title: '动量', key: 'mom', align: 'right', width: 80 },
@@ -882,7 +887,10 @@ const priceMetricKeys = [
   'anchor_date',
   'anchor_vwap',
   'vs_anchor',
+  'ma5',
+  'ma10',
   'ma20',
+  'ma_order',
   'bandwidth',
   'vol',
   'mom',
@@ -954,6 +962,7 @@ function priceMetricText(record, key) {
   if (key === 'volume' || key === 'turnover') return formatCount(value)
   if (key === 'anchor_date') return value || '—'
   if (key === 'illiq') return adviceNum(value, 3)
+  if (key === 'ma_order') return value || '—'
   if (key === 'vs_anchor' || key === 'erp') return adviceSignedPct(value)
   if (key === 'bandwidth' || key === 'vol' || key === 'vol_cap' || key === 'rp_weight') return advicePct(value)
   return adviceNum(value)
@@ -962,6 +971,7 @@ function priceMetricText(record, key) {
 function priceMetricTone(record, key) {
   const metrics = metricsOf(record.symbol)
   if (!metrics || metrics[key] == null) return ''
+  if (key === 'ma_order') return metrics[key] === '多头' ? 'pnl-up' : metrics[key] === '空头' ? 'pnl-down' : ''
   if (key === 'vs_anchor' || key === 'erp' || key === 'mom') return pnlClass(metrics[key])
   return ''
 }
@@ -989,6 +999,11 @@ const trendBook = ref(null)
 const trendChartRef = ref(null)
 let trendChart
 let trendLoadToken = 0
+let trendPaging = false
+let trendZoomLive = false
+let trendZoomStamp = 0
+let trendZoomGuard = null
+const TREND_PAGE = 40
 
 const trendColumns = [
   { title: '日期', dataIndex: 'date', key: 'date', width: 108, fixed: 'left' },
@@ -996,7 +1011,10 @@ const trendColumns = [
   { title: '成交量', key: 'volume', align: 'right', width: 100 },
   { title: '成交额', key: 'turnover', align: 'right', width: 100 },
   { title: 'Amihud', key: 'illiq', align: 'right', width: 96 },
+  { title: 'MA5', key: 'ma5', align: 'right', width: 88 },
+  { title: 'MA10', key: 'ma10', align: 'right', width: 88 },
   { title: 'MA20', key: 'ma20', align: 'right', width: 92 },
+  { title: '排列', key: 'ma_order', align: 'right', width: 72 },
   { title: '距均线', key: 'vs_ma20', align: 'right', width: 92 },
   { title: 'AVWAP', key: 'anchor_vwap', align: 'right', width: 100 },
   { title: '距锚', key: 'vs_anchor', align: 'right', width: 84 },
@@ -1012,21 +1030,114 @@ const trendLatest = computed(() => {
   return points.length ? points[points.length - 1] : null
 })
 const indicatorHints = {
-  volume: '已收盘交易日的成交股数。低于 20 日均量是锁仓的条件之一；超过均量 2 倍是派发的条件之一。',
-  turnover: '收盘价乘以成交量。Amihud 把它换成亿美元后再除。',
-  illiq: '当日涨跌幅绝对值（百分点）除以成交额（亿美元）。涨幅超过 3%、成交量低于 20 日均量、且大于 1，标锁仓。成交量超过均量 2 倍、涨跌落在 -1% 到 +1.5%、且小于 0.1，标派发。',
-  anchor_date: '近 20 个交易日最低价所在的日期。防守线从这一天起向后累积。',
-  anchor_vwap: '从锚定日起，用 (高+低+收)/3 按成交量加权。图上是绿色虚线。',
-  vs_anchor: '价格相对 AVWAP 的偏离。大于等于 0 为机构持仓安全，小于 0 为机构防守线失守。',
-  ma20: '近 20 个交易日收盘价的平均数，也是布林带中轨。',
-  vs_ma20: '收盘价相对 MA20 的偏离。',
-  bandwidth: '(上轨 − 下轨) / 中轨。上下轨是 MA20 加减 2 倍样本标准差。创近 120 个交易日新低时标变盘蓄势。',
-  vol: '近 20 日收益率的样本标准差乘以 √252，得到实际年化波动。',
-  mom: '近 20 日累计涨跌幅除以年化波动。大于 0 为顺势，图底淡绿；小于 0 为左侧博弈，图底淡黄。',
-  vol_cap: '目标波动 20% 除以年化波动，作为这只股票的仓位上限。',
-  rp_weight: '多头之间按波动的倒数分配。对冲腿不参与，这里留空。',
-  pe: '行情里的滚动市盈率，并且要和价格除以每股收益对得上才采用。',
-  erp: '1/PE 减去美国 10 年期国债收益率。PE 缺失或不是正数时留空。',
+  volume: {
+    text: '已收盘交易日的成交股数。',
+    up: '价涨同时成交量走高更好，说明有人接；缩量上涨偏弱。',
+    range: '放量但价格几乎不动，多是换手；缩量横盘是常态。',
+    down: '放量下跌更差；缩量下跌说明抛压在减轻。',
+  },
+  turnover: {
+    text: '收盘价乘以成交量。缩量上涨是上涨日成交额低于近 20 日的 80%；放量滞涨是涨跌不到 0.5% 且成交额高于近 20 日的 1.8 倍。',
+    up: '上涨日成交额走高更好；低于近 20 日 80% 的缩量上涨偏弱。',
+    range: '涨跌不到 0.5% 却放到 1.8 倍，是滞涨，不是方向。',
+    down: '下跌日成交额走高更差；走低说明杀跌在减弱。',
+  },
+  illiq: {
+    text: '当日涨跌幅绝对值（百分点）除以成交额（亿美元）。柱高表示买卖有多费劲。颜色另标成交额形态：绿色是缩量上涨，当天上涨超过 0.5% 且成交额低于近 20 日的 80%；金色是放量滞涨，当天涨跌不到 0.5% 且成交额高于近 20 日的 1.8 倍；红色是缩量下跌，当天下跌超过 0.5% 且成交额低于近 20 日的 80%；其余是灰色。',
+    up: '数值走低更好，上涨不需要很大的价格冲击。',
+    range: '走低说明好成交；走高只是变难交易，不代表方向。',
+    down: '数值走高更差，同样的卖出把价格打得更低。',
+  },
+  anchor_date: {
+    text: '近 20 个交易日最低价所在的日期。防守线从这一天起向后累积。',
+    up: '锚定日停在较早的低点、不再后移更好，说明低点没有继续下移。',
+    range: '锚定日在区间里来回换，不表示方向。',
+    down: '锚定日不断改到最近的新低，更差。',
+  },
+  anchor_vwap: {
+    text: '从锚定日起，用 (高+低+收)/3 按成交量加权。图上是绿色虚线。',
+    up: '这条线往上更好，回踩不跌破说明持仓成本还在抬高。',
+    range: '线走平是常态，价格在线上下穿不算趋势。',
+    down: '线往下是防守成本在降；走平或重新上拐才算转好。',
+  },
+  vs_anchor: {
+    text: '价格相对 AVWAP 的偏离。大于等于 0 为机构持仓安全，小于 0 为机构防守线失守。',
+    up: '维持在 0 上方更好；离得太远只说明涨多了，不因此加仓。',
+    range: '在 0 附近来回，不单独当买卖。',
+    down: '负得更多更差。往 0 靠是修复，收复前仍按失守处理。',
+  },
+  ma5: {
+    text: '近 5 个交易日收盘价的平均数，三条均线里反应最快。',
+    up: '均线往上、价格在它上方更好。',
+    range: '走平是常态，上下穿不算趋势。',
+    down: '均线往下是短线还在跌；走平或转上只是缓和，要看更长的均线。',
+  },
+  ma10: {
+    text: '近 10 个交易日收盘价的平均数。',
+    up: '往上、并且位于 MA20 之上更好。',
+    range: '走平，和 MA5、MA20 缠在一起就是交错。',
+    down: '往下、并且压在 MA20 之下，跌势还在；单独转上还不能算结束。',
+  },
+  ma20: {
+    text: '近 20 个交易日收盘价的平均数，也是布林带中轨。',
+    up: '往上、收盘站在它上方更好。',
+    range: '走平，价格在它附近来回。',
+    down: '往下、收盘在它下方是跌势。重新站上才离开左侧，站上之前不加仓。',
+  },
+  ma_order: {
+    text: 'MA5 高于 MA10、MA10 高于 MA20 为多头排列；反过来为空头排列；其余是交错。排列只描述三条均线，不代替价格和防守线。',
+    up: '多头排列更好。价格仍在 MA20 下方时，排列多头也不当成追涨。',
+    range: '交错是常态。',
+    down: '空头排列是跌势还在。从空头变成交错只是缓和，不是反转。',
+  },
+  vs_ma20: {
+    text: '收盘价相对 MA20 的偏离。',
+    up: '正偏离更好。偏离过大只说明离均线远，不因此加仓。',
+    range: '在 0 附近来回。',
+    down: '负偏离扩大更差。负值收窄是修复，回到 0 上方才离开均线下方。',
+  },
+  bandwidth: {
+    text: '(上轨 − 下轨) / 中轨。上下轨是 MA20 加减 2 倍样本标准差。创近 120 个交易日新低时标变盘蓄势。带宽本身不分涨跌。',
+    up: '从极窄再走阔、同时价格在涨，趋势在展开，更好。',
+    range: '走窄是收敛，方向还没选。',
+    down: '走阔同时价格在跌，跌势在加速，更差。',
+  },
+  vol: {
+    text: '近 20 日收益率的样本标准差乘以 √252，得到实际年化波动。',
+    up: '波动走低、价格仍往上，涨得更稳。突然走高可能是高潮，不是加仓理由。',
+    range: '走低是安静的区间；走高往往是要选择方向。',
+    down: '波动走高更差。走低只说明跌势变慢，不是已经见底。',
+  },
+  mom: {
+    text: '近 20 日累计涨跌幅除以年化波动。大于 0 为顺势，图底淡绿；小于 0 为左侧博弈，图底淡黄。',
+    up: '大于 0 并且继续走高更好。',
+    range: '靠近 0。',
+    down: '小于 0 是跌势还在，更负更差。往 0 靠是缓和，转正之前仍按左侧处理。',
+  },
+  vol_cap: {
+    text: '目标波动 20% 除以年化波动，作为这只股票的仓位上限。数值高只表示波动小、允许的仓位更大，不是涨跌信号。',
+    up: '上限变高可以拿得更多，仍不超过这一列。',
+    range: '按波动定大小，不按方向加仓。',
+    down: '上限变高也不表示该买。跌势里先看价格和防守线。',
+  },
+  rp_weight: {
+    text: '多头之间按波动的倒数分配。对冲腿不参与，这里留空。数值高表示这只波动更小、平价权重大。',
+    up: '权重走高说明它相对更稳，可以在多头里占更大比例。',
+    range: '权重只比较谁更稳，不表示即将突破。',
+    down: '权重高也不把正在下跌的名字当成该加的仓。',
+  },
+  pe: {
+    text: '行情里的滚动市盈率，并且要和价格除以每股收益对得上才采用。只作估值对照，不单独决定买卖。负的市盈率表示仍在亏损。',
+    up: '走低通常是盈利跟上价格，更好。走高多半是价格涨出来的，不便宜，也不因此卖出。',
+    range: '高低只说明贵贱，不选方向。',
+    down: '走低常常是价格跌出来的，便宜不等于能买。',
+  },
+  erp: {
+    text: '1/PE 减去美国 10 年期国债收益率。PE 缺失或不是正数时留空。越高表示盈利收益率比国债越高。',
+    up: '走高是估值更有吸引力，更好，不单独作为买入。',
+    range: '走高同样只是更便宜，方向还看价格。',
+    down: '走高往往是价格下跌造成的，便宜不等于跌势结束。',
+  },
 }
 
 const trendMarks = computed(() => {
@@ -1099,66 +1210,54 @@ function chartSlider(dates, extra = {}) {
   }
 }
 
+const SENTIMENT_COLORS = ['#14977d', '#3b6fd8', '#d9852a', '#7c5cbf']
+
 function renderSentimentChart() {
   const book = sentiment.value
   if (!sentimentChartRef.value || !book) return
-  const indexes = book.indexes || []
-  const primary = indexes.find((item) => item.name === '纳斯达克') || indexes.find((item) => item.history?.length)
-  const points = primary?.history?.length ? primary.history : book.vix?.history || []
+  const indexes = (book.indexes || []).filter((item) => item.history?.length)
+  const anchor = indexes.find((item) => item.name === '纳斯达克') || indexes[0]
+  const points = anchor?.history?.length ? anchor.history : book.vix?.history || []
   if (!points.length) return
-  const primaryName = primary?.name === '纳斯达克' ? '纳指' : primary?.name || '指数'
-  let secondaryName = ''
-  let secondaryData = []
-  if (book.vix?.history?.length) {
-    secondaryName = 'VIX'
-    const vixByDate = Object.fromEntries(book.vix.history.map((point) => [point.date, point.close]))
-    secondaryData = points.map((point) => vixByDate[point.date] ?? null)
-  } else {
-    const other = indexes.find((item) => item !== primary && item.history?.length)
-    if (other) {
-      secondaryName = other.name
-      const byDate = Object.fromEntries(other.history.map((point) => [point.date, point.close]))
-      secondaryData = points.map((point) => byDate[point.date] ?? null)
-    }
-  }
   if (!sentimentChart) sentimentChart = echarts.init(sentimentChartRef.value)
   const dates = points.map((point) => point.date)
-  const vixByDate = Object.fromEntries((book.vix?.history || []).map((point) => [point.date, point.close]))
   const zoomStart = dates[Math.max(0, dates.length - 60)]
   const zoomEnd = dates[dates.length - 1]
   const axisLabel = { color: '#8b95a8', fontSize: 11 }
-  const series = [
-    {
-      name: primaryName,
+  const series = indexes.map((item, index) => {
+    const byDate = Object.fromEntries(item.history.map((point) => [point.date, point.close]))
+    const base = item.history.find((point) => point.close)?.close
+    const color = SENTIMENT_COLORS[index % SENTIMENT_COLORS.length]
+    return {
+      name: item.name === '纳斯达克' ? '纳指' : item.name,
       type: 'line',
       smooth: 0.18,
       showSymbol: false,
       symbol: 'circle',
       symbolSize: 7,
-      data: points.map((point) => point.close),
-      lineStyle: { width: 2.2, color: '#14977d', cap: 'round', join: 'round' },
-      itemStyle: { color: '#14977d', borderColor: '#fff', borderWidth: 2 },
-      areaStyle: {
-        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-          { offset: 0, color: 'rgba(20, 151, 125, 0.22)' },
-          { offset: 1, color: 'rgba(20, 151, 125, 0.02)' },
-        ]),
-      },
+      data: dates.map((date) => {
+        const close = byDate[date]
+        if (close == null || !base) return null
+        return { value: Math.round((close / base) * 1000) / 10, close }
+      }),
+      lineStyle: { width: index === 0 ? 2.2 : 1.6, color, cap: 'round', join: 'round' },
+      itemStyle: { color, borderColor: '#fff', borderWidth: 2 },
       emphasis: { focus: 'series' },
-    },
-  ]
-  if (secondaryName) {
+    }
+  })
+  if (book.vix?.history?.length) {
+    const vixByDate = Object.fromEntries(book.vix.history.map((point) => [point.date, point.close]))
     series.push({
-      name: secondaryName,
+      name: 'VIX',
       type: 'line',
       yAxisIndex: 1,
       smooth: 0.18,
       showSymbol: false,
       symbol: 'circle',
       symbolSize: 7,
-      data: secondaryData,
-      lineStyle: { width: 1.6, color: '#d9852a', cap: 'round', join: 'round' },
-      itemStyle: { color: '#d9852a', borderColor: '#fff', borderWidth: 2 },
+      data: dates.map((date) => vixByDate[date] ?? null),
+      lineStyle: { width: 1.4, color: '#8b95a8', cap: 'round', join: 'round' },
+      itemStyle: { color: '#8b95a8', borderColor: '#fff', borderWidth: 2 },
       emphasis: { focus: 'series' },
     })
   }
@@ -1174,14 +1273,23 @@ function renderSentimentChart() {
         padding: [8, 12],
         textStyle: { color: '#243047', fontSize: 12 },
         axisPointer: { type: 'line', lineStyle: { color: '#c5d0e0', type: 'dashed', width: 1 } },
+        formatter: (params) => {
+          const rows = params.map((item) => {
+            const close = item.data?.close
+            const text = close == null ? (item.data ?? '—') : close
+            return `${item.marker}${item.seriesName} ${text}`
+          })
+          return `${params[0]?.axisValue || ''}<br/>${rows.join('<br/>')}`
+        },
       },
       legend: {
         top: 0,
         right: 0,
+        type: 'scroll',
         icon: 'circle',
         itemWidth: 8,
         itemHeight: 8,
-        itemGap: 14,
+        itemGap: 12,
         textStyle: { color: '#7b8598', fontSize: 12 },
       },
       dataZoom: [
@@ -1211,6 +1319,8 @@ function renderSentimentChart() {
         {
           type: 'value',
           scale: true,
+          name: '起点100',
+          nameTextStyle: { color: '#8b95a8', fontSize: 11 },
           axisLine: { show: false },
           axisTick: { show: false },
           splitLine: { lineStyle: { color: '#eef2f6' } },
@@ -1219,6 +1329,7 @@ function renderSentimentChart() {
         {
           type: 'value',
           scale: true,
+          show: Boolean(book.vix?.history?.length),
           axisLine: { show: false },
           axisTick: { show: false },
           splitLine: { show: false },
@@ -1265,39 +1376,103 @@ async function loadTrend() {
   const symbol = trendSymbol.value
   if (!symbol) return
   const token = ++trendLoadToken
+  trendPaging = false
   trendLoading.value = true
   trendCursor.value = null
   try {
-    let before
-    let first = true
-    while (trendOpen.value && token === trendLoadToken) {
-      const page = await fetchIndicatorHistory(symbol, before ? { before } : {})
-      if (token !== trendLoadToken || trendSymbol.value !== symbol || !trendOpen.value) return
-      const extend = !first
-      if (first) {
-        trendBook.value = page
-        trendCursor.value = page.points?.[page.points.length - 1] || null
-        first = false
-        trendLoading.value = false
-      } else if (page.points?.length) {
-        const prev = trendBook.value
-        trendBook.value = {
-          ...prev,
-          points: [...page.points, ...(prev?.points || [])],
-          has_more: page.has_more,
-          before: page.before,
-        }
-      }
-      await nextTick()
-      renderTrendChart({ keepRange: extend })
-      if (!page.has_more || !page.before || page.before === before) break
-      before = page.before
-    }
+    const page = await fetchIndicatorHistory(symbol, { limit: TREND_PAGE })
+    if (token !== trendLoadToken || trendSymbol.value !== symbol || !trendOpen.value) return
+    trendBook.value = page
+    trendCursor.value = page.points?.[page.points.length - 1] || null
+    await nextTick()
+    renderTrendChart()
   } catch {
     if (token === trendLoadToken) trendBook.value = null
   } finally {
     if (token === trendLoadToken) trendLoading.value = false
   }
+}
+
+async function loadOlderTrend() {
+  const book = trendBook.value
+  const symbol = trendSymbol.value
+  if (!book?.has_more || !book.before || trendPaging || !symbol) return
+  const token = trendLoadToken
+  trendPaging = true
+  try {
+    const page = await fetchIndicatorHistory(symbol, { before: book.before, limit: TREND_PAGE })
+    if (token !== trendLoadToken || trendSymbol.value !== symbol || !trendOpen.value) return
+    if (!page.points?.length) {
+      trendBook.value = { ...book, has_more: false }
+      return
+    }
+    trendBook.value = {
+      ...book,
+      points: [...page.points, ...(book.points || [])],
+      has_more: page.has_more,
+      before: page.before,
+    }
+    await nextTick()
+    renderTrendChart({ keepRange: true })
+  } catch {
+    // The next slide to the older edge can retry.
+  } finally {
+    trendPaging = false
+  }
+}
+
+const THS_LINE = {
+  ma5: '#8B93A3',
+  ma10: '#7C5CBF',
+  ma20: '#F07A1A',
+  bollUp: '#F23645',
+  bollMid: '#1A4F9C',
+  bollLow: '#089981',
+  dif: '#2B2F36',
+  dea: '#F0B400',
+}
+
+function trendStudyGraphics(point) {
+  const macd = point?.macd
+  const macdColor = macd == null ? '#243047' : macd >= 0 ? '#089981' : '#f23645'
+  const piece = (fill) => ({ fill, fontSize: 11 })
+  return [
+    {
+      id: 'boll-caption',
+      type: 'text',
+      silent: true,
+      left: 0,
+      top: '49%',
+      style: {
+        text: `{name|布林}  {up|上轨} {v|${adviceNum(point?.boll_upper)}}  {mid|中轨} {v|${adviceNum(point?.ma20)}}  {low|下轨} {v|${adviceNum(point?.boll_lower)}}`,
+        rich: {
+          name: { ...piece('#243047'), fontWeight: 650 },
+          up: piece(THS_LINE.bollUp),
+          mid: piece(THS_LINE.bollMid),
+          low: piece(THS_LINE.bollLow),
+          v: piece('#243047'),
+        },
+      },
+    },
+    {
+      id: 'macd-caption',
+      type: 'text',
+      silent: true,
+      left: 0,
+      top: '64.8%',
+      style: {
+        text: `{name|MACD}  {dif|DIF} {v|${adviceNum(point?.macd_dif, 4)}}  {dea|DEA} {v|${adviceNum(point?.macd_dea, 4)}}  {bar|MACD} {m|${adviceNum(macd, 4)}}`,
+        rich: {
+          name: { ...piece(THS_LINE.dif), fontWeight: 650 },
+          dif: piece(THS_LINE.dif),
+          dea: piece(THS_LINE.dea),
+          bar: piece(macdColor),
+          v: piece('#243047'),
+          m: piece(macdColor),
+        },
+      },
+    },
+  ]
 }
 
 function renderTrendChart({ keepRange = false } = {}) {
@@ -1325,7 +1500,7 @@ function renderTrendChart({ keepRange = false } = {}) {
         symbolRotate: 0,
         symbolOffset: [0, 10],
         itemStyle: { color: upColor },
-        label: { formatter: '锁仓', position: 'bottom', color: upColor, fontSize: 10 },
+        label: { formatter: '缩量', position: 'bottom', color: upColor, fontSize: 10 },
       })
     } else if (point.signal === 'distribute') {
       marks.push({
@@ -1334,7 +1509,7 @@ function renderTrendChart({ keepRange = false } = {}) {
         symbolRotate: 180,
         symbolOffset: [0, -10],
         itemStyle: { color: '#e6a700' },
-        label: { formatter: '派发', position: 'top', color: '#8a6400', fontSize: 10 },
+        label: { formatter: '滞涨', position: 'top', color: '#8a6400', fontSize: 10 },
       })
     }
   })
@@ -1343,24 +1518,19 @@ function renderTrendChart({ keepRange = false } = {}) {
   const zoomEnd = dates[dates.length - 1]
   const zoomStart = kept?.startValue && dates.includes(kept.startValue)
     ? kept.startValue
-    : dates[Math.max(0, dates.length - 60)]
+    : dates[Math.max(0, dates.length - TREND_PAGE)]
   const zoomStop = kept?.endValue && dates.includes(kept.endValue) ? kept.endValue : zoomEnd
+  trendZoomGuard = { start: zoomStart, end: zoomStop }
+  const zoomStamp = ++trendZoomStamp
+  trendZoomLive = false
   trendChart.setOption(
     {
       animationDuration: 280,
       axisPointer: {
-        link: [{ xAxisIndex: [0, 1, 2] }],
+        link: [{ xAxisIndex: [0, 1, 2, 3, 4] }],
         lineStyle: { color: '#c5d0e0', type: 'dashed', width: 1 },
       },
-      legend: {
-        top: 0,
-        right: 4,
-        icon: 'circle',
-        itemWidth: 8,
-        itemHeight: 8,
-        itemGap: 12,
-        textStyle: { fontSize: 12, color: '#7b8598' },
-      },
+      legend: { show: false },
       tooltip: {
         show: true,
         showContent: false,
@@ -1370,16 +1540,16 @@ function renderTrendChart({ keepRange = false } = {}) {
       dataZoom: [
         {
           type: 'inside',
-          xAxisIndex: [0, 1, 2],
-          zoomOnMouseWheel: true,
+          xAxisIndex: [0, 1, 2, 3, 4],
+          zoomOnMouseWheel: false,
           moveOnMouseMove: false,
           moveOnMouseWheel: false,
-          preventDefaultMouseMove: false,
+          preventDefaultMouseMove: true,
           startValue: zoomStart,
           endValue: zoomStop,
         },
         chartSlider(dates, {
-          xAxisIndex: [0, 1, 2],
+          xAxisIndex: [0, 1, 2, 3, 4],
           left: 28,
           right: 4,
           startValue: zoomStart,
@@ -1387,18 +1557,24 @@ function renderTrendChart({ keepRange = false } = {}) {
         }),
       ],
       grid: [
-        { left: 28, right: 4, top: 28, bottom: '30%' },
-        { left: 28, right: 4, top: '73%', height: '8%' },
-        { left: 28, right: 4, top: '83%', height: '8%' },
+        { left: 36, right: 8, top: 8, bottom: '58%' },
+        { left: 36, right: 8, top: '43%', height: '5.5%' },
+        { left: 36, right: 8, top: '53%', height: '11%' },
+        { left: 36, right: 8, top: '69%', height: '12%' },
+        { left: 36, right: 8, top: '84.5%', height: '5.5%' },
       ],
-      xAxis: [0, 1, 2].map((gridIndex) => ({
+      graphic: trendStudyGraphics(points.find((point) => point.date === trendCursor.value?.date) || points[points.length - 1]),
+      xAxis: [0, 1, 2, 3, 4].map((gridIndex) => ({
         type: 'category',
         gridIndex,
         data: dates,
         boundaryGap: true,
         axisLine: { lineStyle: { color: '#e7ebf2' } },
+        axisPointer: {
+          label: { show: false },
+        },
         axisLabel: {
-          show: gridIndex === 2,
+          show: gridIndex === 4,
           color: '#8b95a8',
           fontSize: 11,
           hideOverlap: true,
@@ -1417,6 +1593,8 @@ function renderTrendChart({ keepRange = false } = {}) {
         },
         { gridIndex: 1, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
         { gridIndex: 2, scale: true, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
+        { gridIndex: 3, scale: true, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
+        { gridIndex: 4, scale: true, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
       ],
       series: [
         {
@@ -1437,13 +1615,31 @@ function renderTrendChart({ keepRange = false } = {}) {
           },
         },
         {
+          name: 'MA5',
+          type: 'line',
+          showSymbol: false,
+          smooth: 0.12,
+          data: points.map((point) => point.ma5),
+          lineStyle: { width: 1.2, color: THS_LINE.ma5, cap: 'round', join: 'round' },
+          itemStyle: { color: THS_LINE.ma5 },
+        },
+        {
+          name: 'MA10',
+          type: 'line',
+          showSymbol: false,
+          smooth: 0.12,
+          data: points.map((point) => point.ma10),
+          lineStyle: { width: 1.2, color: THS_LINE.ma10, cap: 'round', join: 'round' },
+          itemStyle: { color: THS_LINE.ma10 },
+        },
+        {
           name: 'MA20',
           type: 'line',
           showSymbol: false,
           smooth: 0.12,
           data: points.map((point) => point.ma20),
-          lineStyle: { width: 1.8, color: '#e6a700', cap: 'round', join: 'round' },
-          itemStyle: { color: '#e6a700' },
+          lineStyle: { width: 1.8, color: THS_LINE.ma20, cap: 'round', join: 'round' },
+          itemStyle: { color: THS_LINE.ma20 },
         },
         {
           name: 'AVWAP',
@@ -1468,15 +1664,104 @@ function renderTrendChart({ keepRange = false } = {}) {
         {
           name: 'Amihud',
           type: 'bar',
-          xAxisIndex: 2,
-          yAxisIndex: 2,
+          xAxisIndex: 4,
+          yAxisIndex: 4,
           data: points.map((point) => ({
             value: point.illiq,
             itemStyle: {
               color:
-                point.signal === 'squeeze' ? upColor : point.signal === 'distribute' ? '#e6a700' : '#c5cad3',
+                point.signal === 'squeeze'
+                  ? upColor
+                  : point.signal === 'distribute'
+                    ? '#e6a700'
+                    : point.signal === 'shrink_down'
+                      ? downColor
+                      : '#c5cad3',
             },
           })),
+        },
+        {
+          name: '布林K线',
+          type: 'candlestick',
+          xAxisIndex: 2,
+          yAxisIndex: 2,
+          data: candles,
+          itemStyle: {
+            color: upColor,
+            color0: downColor,
+            borderColor: upColor,
+            borderColor0: downColor,
+          },
+        },
+        {
+          name: '布林上轨',
+          type: 'line',
+          xAxisIndex: 2,
+          yAxisIndex: 2,
+          showSymbol: false,
+          smooth: 0.12,
+          data: points.map((point) => point.boll_upper),
+          lineStyle: { width: 1.2, color: THS_LINE.bollUp },
+          itemStyle: { color: THS_LINE.bollUp },
+        },
+        {
+          name: '布林中轨',
+          type: 'line',
+          xAxisIndex: 2,
+          yAxisIndex: 2,
+          showSymbol: false,
+          smooth: 0.12,
+          data: points.map((point) => point.ma20),
+          lineStyle: { width: 1.2, color: THS_LINE.bollMid },
+          itemStyle: { color: THS_LINE.bollMid },
+        },
+        {
+          name: '布林下轨',
+          type: 'line',
+          xAxisIndex: 2,
+          yAxisIndex: 2,
+          showSymbol: false,
+          smooth: 0.12,
+          data: points.map((point) => point.boll_lower),
+          lineStyle: { width: 1.2, color: THS_LINE.bollLow },
+          itemStyle: { color: THS_LINE.bollLow },
+        },
+        {
+          name: 'MACD',
+          type: 'bar',
+          xAxisIndex: 3,
+          yAxisIndex: 3,
+          data: points.map((point) => ({
+            value: point.macd,
+            itemStyle: { color: (point.macd ?? 0) >= 0 ? upColor : downColor },
+          })),
+          markLine: {
+            silent: true,
+            symbol: 'none',
+            label: { show: false },
+            lineStyle: { color: '#e7ebf2', width: 1 },
+            data: [{ yAxis: 0 }],
+          },
+        },
+        {
+          name: 'DIF',
+          type: 'line',
+          xAxisIndex: 3,
+          yAxisIndex: 3,
+          showSymbol: false,
+          data: points.map((point) => point.macd_dif),
+          lineStyle: { width: 1.2, color: THS_LINE.dif },
+          itemStyle: { color: THS_LINE.dif },
+        },
+        {
+          name: 'DEA',
+          type: 'line',
+          xAxisIndex: 3,
+          yAxisIndex: 3,
+          showSymbol: false,
+          data: points.map((point) => point.macd_dea),
+          lineStyle: { width: 1.2, color: THS_LINE.dea },
+          itemStyle: { color: THS_LINE.dea },
         },
       ],
     },
@@ -1488,17 +1773,71 @@ function renderTrendChart({ keepRange = false } = {}) {
     const raw = axis?.value
     const date = typeof raw === 'number' ? points[raw]?.date : raw
     const point = points.find((item) => item.date === date)
-    if (point) trendCursor.value = point
+    if (point) {
+      trendCursor.value = point
+      trendChart.setOption({ graphic: trendStudyGraphics(point) })
+    }
   })
   trendChart.off('globalout')
   trendChart.on('globalout', () => {
-    trendCursor.value = points[points.length - 1] || null
+    const latest = points[points.length - 1] || null
+    trendCursor.value = latest
+    if (latest) trendChart.setOption({ graphic: trendStudyGraphics(latest) })
   })
+  trendChart.off('datazoom')
+  trendChart.on('datazoom', () => {
+    if (!trendZoomLive || trendPaging) return
+    const dates = (trendBook.value?.points || []).map((point) => point.date)
+    const range = captureTrendRange(dates)
+    if (!range) return
+    if (trendZoomGuard && range.startValue === trendZoomGuard.start && range.endValue === trendZoomGuard.end) return
+    trendZoomGuard = null
+    if (trendSliderNearOldest(dates, range.startValue)) loadOlderTrend()
+  })
+  bindTrendSlider(trendChartRef.value)
   trendChart.resize()
+  setTimeout(() => {
+    if (zoomStamp === trendZoomStamp) trendZoomLive = true
+  }, 80)
+}
+
+function trendSliderNearOldest(dates, startValue) {
+  const index = dates.indexOf(startValue)
+  return index >= 0 && index <= 2
+}
+
+function bindTrendSlider(el) {
+  if (!el || el.dataset.trendSlider) return
+  el.dataset.trendSlider = '1'
+  let origin = null
+  const onSlider = (event) => event.offsetY >= el.clientHeight - 28
+  el.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || !onSlider(event)) {
+      origin = null
+      return
+    }
+    origin = { x: event.clientX }
+  })
+  el.addEventListener('pointerup', (event) => {
+    if (!origin || !trendZoomLive) {
+      origin = null
+      return
+    }
+    const dx = event.clientX - origin.x
+    origin = null
+    if (dx > -24) return
+    const dates = (trendBook.value?.points || []).map((point) => point.date)
+    const range = captureTrendRange(dates)
+    if (range && trendSliderNearOldest(dates, range.startValue)) loadOlderTrend()
+  })
+  el.addEventListener('pointercancel', () => {
+    origin = null
+  })
 }
 
 function trendCell(record, key) {
   const value = record[key]
+  if (key === 'ma_order') return value || '—'
   if (key === 'volume' || key === 'turnover') return formatCount(value)
   if (key === 'illiq') return adviceNum(value, 3)
   if (key === 'vs_ma20' || key === 'vs_anchor') return adviceSignedPct(value)
@@ -1508,6 +1847,10 @@ function trendCell(record, key) {
 }
 
 function trendTone(record, key) {
+  if (key === 'ma_order') {
+    const order = record[key]
+    return order === '多头' ? 'pnl-up' : order === '空头' ? 'pnl-down' : ''
+  }
   if (!['vs_ma20', 'vs_anchor', 'mom'].includes(key) || record[key] == null) return ''
   return pnlClass(record[key])
 }
@@ -2037,7 +2380,10 @@ const priceImageCells = {
   anchor_date: (r) => priceMetricText(r, 'anchor_date'),
   anchor_vwap: (r) => priceMetricText(r, 'anchor_vwap'),
   vs_anchor: (r) => priceMetricText(r, 'vs_anchor'),
+  ma5: (r) => priceMetricText(r, 'ma5'),
+  ma10: (r) => priceMetricText(r, 'ma10'),
   ma20: (r) => priceMetricText(r, 'ma20'),
+  ma_order: (r) => priceMetricText(r, 'ma_order'),
   bandwidth: (r) => priceMetricText(r, 'bandwidth'),
   vol: (r) => priceMetricText(r, 'vol'),
   mom: (r) => priceMetricText(r, 'mom'),
@@ -2496,20 +2842,30 @@ onUnmounted(() => {
         </div>
       </section>
       <section v-if="isPricePage && sentiment && (sentiment.vix || sentiment.indexes?.length)" class="price-tape">
-        <article v-if="sentiment.vix">
-          <p>VIX</p>
-          <strong>{{ sentiment.vix.last == null ? '—' : sentiment.vix.last.toFixed(2) }}</strong>
-          <span :class="pnlClass(sentiment.vix.day_change)">
-            {{ sentiment.vix.day_change == null ? '—' : `${sentiment.vix.day_change > 0 ? '+' : ''}${sentiment.vix.day_change.toFixed(2)}%` }}
-          </span>
-        </article>
-        <article v-for="item in sentiment.indexes" :key="item.name">
-          <p>{{ item.name }}</p>
-          <strong :class="pnlClass(item.day_change)">
-            {{ item.day_change == null ? '—' : `${item.day_change > 0 ? '+' : ''}${item.day_change.toFixed(2)}%` }}
-          </strong>
-          <span>5日 {{ item.ret_5d == null ? '—' : `${item.ret_5d > 0 ? '+' : ''}${item.ret_5d.toFixed(2)}%` }}</span>
-        </article>
+        <div class="price-tape-row">
+          <article v-if="sentiment.vix">
+            <p>VIX</p>
+            <strong>
+              {{ sentiment.vix.last == null ? '—' : sentiment.vix.last.toFixed(2) }}
+              <span :class="pnlClass(sentiment.vix.day_change)">
+                {{ sentiment.vix.day_change == null ? '—' : `${sentiment.vix.day_change > 0 ? '+' : ''}${sentiment.vix.day_change.toFixed(2)}%` }}
+              </span>
+            </strong>
+          </article>
+          <article v-for="item in sentiment.indexes" :key="item.name">
+            <p>{{ item.name }}</p>
+            <strong>
+              {{ item.last == null ? '—' : item.last.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}
+              <span :class="pnlClass(item.day_change)">
+                {{ item.day_change == null ? '—' : `${item.day_change > 0 ? '+' : ''}${item.day_change.toFixed(2)}%` }}
+              </span>
+            </strong>
+            <span>
+              MA20 {{ item.ma20 == null ? '—' : item.ma20.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}
+              <span :class="pnlClass(item.vs_ma20)">{{ item.vs_ma20 == null ? '—' : `${item.vs_ma20 > 0 ? '+' : ''}${item.vs_ma20.toFixed(2)}%` }}</span>
+            </span>
+          </article>
+        </div>
         <div ref="sentimentChartRef" class="sentiment-chart"></div>
       </section>
       <div v-if="isPricePage" class="price-section-head">
@@ -2557,7 +2913,15 @@ onUnmounted(() => {
         <template v-if="isPricePage" #headerCell="{ column }">
           <span class="col-head">
             <span>{{ column.title }}</span>
-            <a-tooltip v-if="indicatorHints[column.key]" :title="indicatorHints[column.key]">
+            <a-tooltip v-if="indicatorHints[column.key]" overlay-class-name="indicator-tip">
+              <template #title>
+                <div class="hint-pop">
+                  <p>{{ indicatorHints[column.key].text }}</p>
+                  <p class="is-up"><b>上涨趋势</b>{{ indicatorHints[column.key].up }}</p>
+                  <p class="is-range"><b>震荡趋势</b>{{ indicatorHints[column.key].range }}</p>
+                  <p class="is-down"><b>下跌趋势</b>{{ indicatorHints[column.key].down }}</p>
+                </div>
+              </template>
               <QuestionCircleOutlined class="col-hint" />
             </a-tooltip>
           </span>
@@ -2824,10 +3188,15 @@ onUnmounted(() => {
           <span><em>高</em><b>{{ adviceNum(trendCursor.high) }}</b></span>
           <span><em>低</em><b>{{ adviceNum(trendCursor.low) }}</b></span>
           <span><em>量</em><b>{{ formatCount(trendCursor.volume) }}</b></span>
-          <span class="is-ma"><em>MA20</em><b>{{ adviceNum(trendCursor.ma20) }}</b></span>
-          <span class="is-vwap"><em>AVWAP</em><b>{{ adviceNum(trendCursor.anchor_vwap) }}</b></span>
-          <span><em>Amihud</em><b>{{ adviceNum(trendCursor.illiq, 3) }}</b></span>
+          <span><em>排列</em><b :class="trendTone(trendCursor, 'ma_order')">{{ trendCursor.ma_order || '—' }}</b></span>
         </div>
+      </div>
+      <div v-if="trendCursor" class="trend-topline">
+        <span class="is-ma5"><em>MA5</em><b>{{ adviceNum(trendCursor.ma5) }}</b></span>
+        <span class="is-ma10"><em>MA10</em><b>{{ adviceNum(trendCursor.ma10) }}</b></span>
+        <span class="is-ma"><em>MA20</em><b>{{ adviceNum(trendCursor.ma20) }}</b></span>
+        <span class="is-vwap"><em>AVWAP</em><b>{{ adviceNum(trendCursor.anchor_vwap) }}</b></span>
+        <span><em>Amihud</em><b>{{ adviceNum(trendCursor.illiq, 3) }}</b></span>
       </div>
       <div ref="trendChartRef" class="trend-chart"></div>
       <a-table
@@ -2843,7 +3212,15 @@ onUnmounted(() => {
         <template #headerCell="{ column }">
           <span class="col-head">
             <span>{{ column.title }}</span>
-            <a-tooltip v-if="indicatorHints[column.key]" :title="indicatorHints[column.key]">
+            <a-tooltip v-if="indicatorHints[column.key]" overlay-class-name="indicator-tip">
+              <template #title>
+                <div class="hint-pop">
+                  <p>{{ indicatorHints[column.key].text }}</p>
+                  <p class="is-up"><b>上涨趋势</b>{{ indicatorHints[column.key].up }}</p>
+                  <p class="is-range"><b>震荡趋势</b>{{ indicatorHints[column.key].range }}</p>
+                  <p class="is-down"><b>下跌趋势</b>{{ indicatorHints[column.key].down }}</p>
+                </div>
+              </template>
               <QuestionCircleOutlined class="col-hint" />
             </a-tooltip>
           </span>
@@ -3913,14 +4290,21 @@ onUnmounted(() => {
 }
 
 .price-tape {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 12px;
   margin-bottom: 8px;
   padding: 18px;
   border: 1px solid #dfe8e4;
   border-radius: 16px;
   background: linear-gradient(180deg, #fbfdfc, #f7fafb);
+}
+
+.price-tape-row {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 12px;
 }
 
 .price-tape article {
@@ -3939,11 +4323,19 @@ onUnmounted(() => {
 }
 
 .price-tape strong {
-  display: block;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
   font-size: 20px;
   line-height: 1.2;
   letter-spacing: -0.03em;
   font-variant-numeric: tabular-nums;
+}
+
+.price-tape strong > span {
+  font-size: 13px;
+  font-weight: 650;
 }
 
 .price-tape article > span {
@@ -3951,12 +4343,16 @@ onUnmounted(() => {
   margin-top: 4px;
   font-size: 12px;
   color: #8994a1;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-tape article > span > span {
+  margin-left: 6px;
+  font-weight: 650;
 }
 
 .price-tape .sentiment-chart {
-  grid-column: 1 / -1;
   height: 228px;
-  margin-top: 4px;
 }
 
 .price-section-head {
@@ -4052,9 +4448,14 @@ onUnmounted(() => {
   }
 
   .price-tape {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 8px;
     padding: 12px;
+  }
+
+  .price-tape-row {
+    grid-auto-flow: row;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
   }
 
   .price-tape article {
@@ -4116,6 +4517,39 @@ onUnmounted(() => {
   color: var(--muted);
   font-size: 12px;
   cursor: help;
+}
+
+:global(.indicator-tip .ant-tooltip-inner) {
+  width: 280px;
+  padding: 10px 12px;
+}
+
+:global(.indicator-tip .hint-pop p) {
+  margin: 0 0 6px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+:global(.indicator-tip .hint-pop p:last-child) {
+  margin-bottom: 0;
+}
+
+:global(.indicator-tip .hint-pop b) {
+  display: inline-block;
+  margin-right: 6px;
+  font-weight: 650;
+}
+
+:global(.indicator-tip .hint-pop .is-up b) {
+  color: #3dcca8;
+}
+
+:global(.indicator-tip .hint-pop .is-range b) {
+  color: #e6b45a;
+}
+
+:global(.indicator-tip .hint-pop .is-down b) {
+  color: #ff8a96;
 }
 
 .trend-toolbar {
@@ -4209,13 +4643,13 @@ onUnmounted(() => {
 }
 
 .trend-quote-grid {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 6px;
 }
 
 .trend-quote-grid span {
   display: flex;
-  flex: 1 1 0;
   flex-direction: column;
   gap: 2px;
   min-width: 0;
@@ -4236,18 +4670,52 @@ onUnmounted(() => {
   color: #243047;
   font-size: 13px;
   line-height: 1.2;
+  white-space: nowrap;
 }
 
-.trend-quote .is-ma b {
-  color: #e6a700;
+.trend-quote .is-ma5 b,
+.trend-topline .is-ma5 b {
+  color: #8b93a3;
 }
 
-.trend-quote .is-vwap b {
+.trend-quote .is-ma10 b,
+.trend-topline .is-ma10 b {
+  color: #7c5cbf;
+}
+
+.trend-quote .is-ma b,
+.trend-topline .is-ma b {
+  color: #f07a1a;
+}
+
+.trend-quote .is-vwap b,
+.trend-topline .is-vwap b {
   color: #089981;
 }
 
+.trend-topline {
+  display: flex;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 0 10px;
+  font-size: 10px;
+}
+
+.trend-topline em {
+  margin-right: 4px;
+  color: #7b8598;
+  font-style: normal;
+  font-weight: 650;
+}
+
+.trend-topline b {
+  font-weight: 650;
+}
+
 .trend-chart {
-  height: 460px;
+  width: 100%;
+  height: 640px;
   margin-bottom: 8px;
 }
 
@@ -4384,16 +4852,8 @@ onUnmounted(() => {
     grid-template-columns: 1fr;
   }
 
-  .trend-quote-grid {
-    flex-wrap: wrap;
-  }
-
-  .trend-quote-grid span {
-    flex: 1 1 22%;
-  }
-
   .trend-chart {
-    height: 320px;
+    height: 500px;
   }
 }
 

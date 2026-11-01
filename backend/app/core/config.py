@@ -17,6 +17,20 @@ class Settings(BaseSettings):
     default_portfolio_id: int = 1
     default_portfolio_name: str = "我的投资组合"
     base_currency: str = "USD"
+    # AkShare is the default A-share/HK source. US history and live quotes use YFinance.
+    tushare_token: str = ""
+    enable_eastmoney_patch: bool = False
+    max_workers: int = 4
+    longbridge_oauth_client_id: str = ""
+    longbridge_oauth_token_cache_b64: str = ""
+    longbridge_app_key: str = ""
+    longbridge_app_secret: str = ""
+    longbridge_access_token: str = ""
+    longbridge_connection_cooldown_seconds: int = 15
+    longbridge_http_url: str = ""
+    longbridge_quote_ws_url: str = ""
+    longbridge_trade_ws_url: str = ""
+    longbridge_region: str = ""
 
     @property
     def cors_origin_list(self) -> list[str]:

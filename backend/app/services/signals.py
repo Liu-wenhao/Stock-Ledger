@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor
-from statistics import mean, median, stdev
+from statistics import mean, stdev
 
 from sqlalchemy.orm import Session
 
@@ -30,6 +30,7 @@ LEVERAGE = {
     "QLD": 2.0,
     "SOXL": 3.0,
     "SOXS": -3.0,
+    "07709": 2.0,
 }
 
 
@@ -73,40 +74,52 @@ def _load_bars(symbol: str) -> list[dict]:
         db.close()
 
 
+def _dollar_chip(day_ret: float | None, dollar: float | None, avg_dollar: float | None) -> str | None:
+    """Turnover versus the last 20 sessions. Shared by the price-page note and the chart tags."""
+    if day_ret is None or not avg_dollar or not dollar:
+        return None
+    if day_ret > 0.005 and dollar < avg_dollar * 0.8:
+        return "squeeze"
+    if abs(day_ret) < 0.005 and dollar > avg_dollar * 1.8:
+        return "distribute"
+    if day_ret < -0.005 and dollar < avg_dollar * 0.8:
+        return "shrink_down"
+    return None
+
+
 def _flow(rets: list[float], amounts: list[float]) -> str:
-    if len(rets) < 5:
+    if len(rets) < 1 or len(amounts) < 20:
         return "中性"
-    illiq: list[float | None] = []
-    for i, ret in enumerate(rets):
-        dollar = amounts[i + 1]
-        illiq.append(abs(ret) / dollar if dollar > 0 else None)
-    last = illiq[-1]
-    base_vals = [x for x in illiq[-60:-20] if x is not None]
-    base = median(base_vals) if base_vals else None
-    avg_dollar = mean(amounts[-20:]) if amounts else 0
-    last_dollar = amounts[-1]
-    last_ret = rets[-1]
-    if (
-        last
-        and base
-        and last_ret > 0.005
-        and last > base * 2
-        and avg_dollar
-        and last_dollar < avg_dollar * 0.8
-    ):
-        return "缩量推升"
-    if abs(last_ret) < 0.005 and avg_dollar and last_dollar > avg_dollar * 1.8:
-        return "放量滞涨"
-    if (
-        last
-        and base
-        and last_ret < -0.005
-        and last > base * 2
-        and avg_dollar
-        and last_dollar < avg_dollar * 0.8
-    ):
-        return "缩量下跌"
-    return "中性"
+    tag = _dollar_chip(rets[-1], amounts[-1], mean(amounts[-20:]))
+    return {"squeeze": "缩量推升", "distribute": "放量滞涨", "shrink_down": "缩量下跌"}.get(tag or "", "中性")
+
+
+def _ema_series(values: list[float], period: int) -> list[float | None]:
+    """EMA seeded with the first `period` observations' average."""
+    out: list[float | None] = [None] * len(values)
+    if len(values) < period or period < 1:
+        return out
+    prev = sum(values[:period]) / period
+    out[period - 1] = prev
+    weight = 2 / (period + 1)
+    for index in range(period, len(values)):
+        prev = values[index] * weight + prev * (1 - weight)
+        out[index] = prev
+    return out
+
+
+def _macd_last(closes: list[float]) -> tuple[float | None, float | None, float | None]:
+    """DIF, DEA and the histogram for 12, 26, 9. The bar is 2 × (DIF − DEA)."""
+    fast = _ema_series(closes, 12)
+    slow = _ema_series(closes, 26)
+    difs = [fast[i] - slow[i] for i in range(len(closes)) if fast[i] is not None and slow[i] is not None]
+    if len(difs) < 9:
+        return (difs[-1], None, None) if difs else (None, None, None)
+    dea = _ema_series(difs, 9)[-1]
+    dif = difs[-1]
+    if dea is None:
+        return dif, None, None
+    return dif, dea, 2 * (dif - dea)
 
 
 def _measure(bars: list[dict], live: float | None) -> dict | None:
@@ -167,14 +180,13 @@ def _measure(bars: list[dict], live: float | None) -> dict | None:
     )
     price = live if live and live > 0 else closes[-1]
     mom = mom20
-    vol_ma20 = mean(vols[-20:]) if len(vols) >= 20 else None
     day = rets[-1] if rets else None
-    signal = None
-    if day is not None and vol_ma20 and illiq is not None and vols[-1] > 0:
-        if day > 0.03 and vols[-1] < vol_ma20 and illiq > 1.0:
-            signal = "squeeze"
-        elif vols[-1] > 2 * vol_ma20 and -0.01 < day < 0.015 and illiq < 0.1:
-            signal = "distribute"
+    avg_dollar = mean(amounts[-20:]) if len(amounts) >= 20 else None
+    tag = _dollar_chip(day, amounts[-1] if amounts else None, avg_dollar)
+    signal = tag if tag in {"squeeze", "distribute", "shrink_down"} else None
+    ma5 = mean(closes[-5:])
+    ma10 = mean(closes[-10:])
+    macd = _macd_last(closes)
 
     return {
         "as_of": bars[-1]["d"],
@@ -182,7 +194,15 @@ def _measure(bars: list[dict], live: float | None) -> dict | None:
         "high": highs[-1],
         "low": lows[-1],
         "close": closes[-1],
+        "ma5": ma5,
+        "ma10": ma10,
         "ma20": ma20,
+        "ma_order": _ma_order(ma5, ma10, ma20),
+        "boll_upper": ma20 + 2 * sd20,
+        "boll_lower": ma20 - 2 * sd20,
+        "macd_dif": macd[0],
+        "macd_dea": macd[1],
+        "macd": macd[2],
         "vwap20": vwap20,
         "vs_ma20": (price / ma20 - 1) if ma20 else None,
         "vs_vwap": (price / vwap20 - 1) if vwap20 else None,
@@ -205,6 +225,34 @@ def _measure(bars: list[dict], live: float | None) -> dict | None:
     }
 
 
+def _ma_order(ma5: float | None, ma10: float | None, ma20: float | None) -> str | None:
+    if ma5 is None or ma10 is None or ma20 is None:
+        return None
+    if ma5 > ma10 > ma20:
+        return "多头"
+    if ma5 < ma10 < ma20:
+        return "空头"
+    return "交错"
+
+
+def _ma_sentence(order: str | None) -> str:
+    if order == "多头":
+        return "均线是多头排列，MA5 高于 MA10，MA10 高于 MA20。"
+    if order == "空头":
+        return "均线是空头排列，MA5 低于 MA10，MA10 低于 MA20。"
+    if order == "交错":
+        return "均线交错，没有排成多头或空头。"
+    return ""
+
+
+def _pe_sentence(pe: float | None) -> str:
+    if pe is None:
+        return ""
+    if pe < 0:
+        return f"滚动市盈率 {pe:.2f}，是负的。"
+    return f"滚动市盈率 {pe:.2f}。"
+
+
 def _stage(stats: dict, leverage: float | None) -> tuple[str, str]:
     if leverage is not None and leverage < 0:
         return "对冲腿", "info"
@@ -224,7 +272,7 @@ def _stage(stats: dict, leverage: float | None) -> tuple[str, str]:
     return "成本下方", "neutral"
 
 
-def _advice_view(stats: dict, holding: dict, leverage: float | None) -> dict:
+def _advice_view(stats: dict, holding: dict, leverage: float | None, bars: list[dict], pe: float | None = None) -> dict:
     """One conclusion per indicator, plus the stop the user set."""
     price = stats["price"]
     short = leverage is not None and leverage < 0
@@ -237,23 +285,24 @@ def _advice_view(stats: dict, holding: dict, leverage: float | None) -> dict:
     squeeze = stats.get("squeeze") or "未挤压"
     nav_w = holding["nav_weight"]
     cap = holding.get("vol_cap")
-
-    if short:
-        headline = "这是反向仓。它站上自己的成本，只说明对冲腿在起作用，不是看多加仓信号。"
-    elif leverage is not None and abs(leverage) >= 2 and (bandwidth or 0) > 0.8 and (vs_vwap or 0) < 0:
-        headline = "杠杆品种还在均线下方，带宽又很宽。这段来回震荡会磨损，不适合当成趋势仓一直拿。"
-    elif (vs_ma or 0) < -0.15 and (stats.get("day_ret") or 0) > 0:
-        headline = "离 20 日均线还远，今天的上涨只是超跌反弹，不是趋势确认。"
-    elif squeeze in {"120日新低", "接近新低"}:
-        headline = "带宽收到近 120 日低位。方向还没选，不追，等收盘离开这条窄带再动。"
-    elif (vs_vwap or 0) >= 0 and (mom or 0) > 0:
-        headline = "现价在 20 日成本上方，动量也在正的一侧。守住锚定成本就可以拿，跌破再减。"
-    elif (vs_vwap or 0) >= 0:
-        headline = "现价还在 20 日成本上方，但动量不强。只留底仓，不加满。"
-    elif (vs_anchor or 0) >= 0:
-        headline = "20 日滚动成本还在现价上方，锚定成本已经守住。只留底仓，均线没站上之前不加满。"
-    else:
-        headline = "现价还在 20 日成本下方，锚定成本也没守住。这是反弹，不适合追高加满。"
+    swing = _close_swing(bars)
+    defense = _chandelier_state(bars, price, short, stats.get("anchor_vwap"))
+    headline = _opening(
+        short=short,
+        ticker=holding["ticker"],
+        vs_anchor=vs_anchor,
+        mom=mom,
+        swing=swing,
+        chandelier_lost=defense["lost"],
+        extreme_day=defense["extreme_day"],
+        leverage=leverage,
+        bandwidth=bandwidth,
+        vs_vwap=vs_vwap,
+        ma5=stats.get("ma5"),
+        ma10=stats.get("ma10"),
+        ma20=stats.get("ma20"),
+        pe=pe,
+    )
     if cap is not None and nav_w > cap + 0.02:
         headline = (
             f"按 20% 波动目标，这只单独最多占净值 {cap * 100:.0f}%，"
@@ -261,6 +310,20 @@ def _advice_view(stats: dict, holding: dict, leverage: float | None) -> dict:
         )
 
     sections: list[dict] = []
+    order = stats.get("ma_order")
+    if stats.get("ma5") is not None and stats.get("ma10") is not None and stats.get("ma20") is not None:
+        sections.append(
+            {
+                "title": "均线",
+                "trend": (
+                    f"MA5 {_px(stats['ma5'])}，MA10 {_px(stats['ma10'])}，MA20 {_px(stats['ma20'])}。"
+                ),
+                "advice": _ma_sentence(order) or "均线还没排出来。",
+            }
+        )
+    pe_text = _pe_sentence(pe)
+    if pe_text:
+        sections.append({"title": "PE", "trend": pe_text, "advice": "只作估值对照，不单独决定买卖。"})
     if stats.get("anchor_vwap") is not None:
         if vs_ma is not None and vs_ma < 0:
             ma_bit = f"20 日均线 {_px(stats['ma20'])} 还在现价上方。"
@@ -298,6 +361,8 @@ def _advice_view(stats: dict, holding: dict, leverage: float | None) -> dict:
         momentum = "动量在正的一侧，而且不弱。顺势拿，不在加速那天追。"
     elif mom > 0:
         momentum = "动量刚到正的一侧。可以拿着，加仓等回踩锚定成本。"
+    elif swing == "up":
+        momentum = "20 日动量仍是负的，窗口里还有更早的下跌。这几天只持有，不把反弹加成满仓。"
     elif mom > -0.15:
         momentum = "动量在负的一侧，力度还不大。只留底仓或网格，禁止追高。"
     else:
@@ -344,13 +409,13 @@ def _advice_view(stats: dict, holding: dict, leverage: float | None) -> dict:
         chip = "少量买盘就把价格推上去了，抛压偏轻。持有可以，不要在放量滞涨那天追。"
     elif flow == "放量滞涨":
         chip_trend = "最近一个完整交易日放量，但几乎没涨。"
-        chip = "更像换手派发，不是锁仓。不在这一天加。"
+        chip = "放量却几乎没涨。不在这一天加。"
     elif flow == "缩量下跌":
         chip_trend = f"最近一个完整交易日{day_move}，成交额低于近 20 日。"
         chip = "卖盘还没放完。不抄，等放量止跌。"
     else:
         chip_trend = f"最近一个完整交易日{day_move}，成交和近 20 日差不多。"
-        chip = "筹码没有明显的锁仓或派发。按防守线和动量决定，不因为这一天加减。"
+        chip = "成交额没有明显的缩量上涨或放量滞涨。按防守线和动量决定，不因为这一天加减。"
     sections.append({"title": "筹码", "trend": chip_trend, "advice": chip})
 
     bits = [f"占净值 {nav_w * 100:.0f}%"]
@@ -566,6 +631,13 @@ def _fetch_pe(tickers: list[str]) -> dict[str, float]:
         pe = _pe_from_fields(match.group(1).split("~"))
         if pe is not None:
             found[ticker.upper()] = pe
+    missing = [ticker for ticker in symbols if ticker.upper() not in found]
+    if missing:
+        from app.services.data_sources import supplement_pe
+
+        for ticker, (pe, eps, price) in supplement_pe(missing).items():
+            if price > 0 and eps and pe and abs(price / eps - pe) / abs(pe) <= 0.2:
+                found[ticker.upper()] = pe
     return found
 
 
@@ -587,6 +659,17 @@ def _fetch_listed_pe(pairs: list[tuple[str, str]]) -> dict[str, float]:
         pe = _pe_from_fields(match.group(1).split("~"))
         if pe is not None:
             found[ticker.upper()] = pe
+    missing = [
+        f"HKEX:{ticker}"
+        for ticker, code in pairs
+        if code.lower().startswith("hk") and ticker.upper() not in found
+    ]
+    if missing:
+        from app.services.data_sources import supplement_pe
+
+        for ticker, (pe, eps, price) in supplement_pe(missing).items():
+            if price > 0 and eps and pe and abs(price / eps - pe) / abs(pe) <= 0.2:
+                found[ticker.upper()] = pe
     return found
 
 
@@ -600,6 +683,9 @@ def _metrics(stats: dict | None, row: dict, pe: float | None, us10y: float | Non
         "anchor_vwap": None,
         "vs_anchor": None,
         "ma20": None,
+        "ma5": None,
+        "ma10": None,
+        "ma_order": None,
         "bandwidth": None,
         "vol": None,
         "mom": None,
@@ -622,6 +708,9 @@ def _metrics(stats: dict | None, row: dict, pe: float | None, us10y: float | Non
         "anchor_vwap": None if stats.get("anchor_vwap") is None else round(stats["anchor_vwap"], 2),
         "vs_anchor": None if stats.get("vs_anchor") is None else round(stats["vs_anchor"] * 100, 1),
         "ma20": None if stats.get("ma20") is None else round(stats["ma20"], 2),
+        "ma5": None if stats.get("ma5") is None else round(stats["ma5"], 2),
+        "ma10": None if stats.get("ma10") is None else round(stats["ma10"], 2),
+        "ma_order": stats.get("ma_order"),
         "bandwidth": None if stats.get("bandwidth") is None else round(stats["bandwidth"] * 100, 1),
         "vol": None if stats.get("vol") is None else round(stats["vol"] * 100, 1),
         "mom": None if stats.get("mom") is None else round(stats["mom"], 2),
@@ -776,7 +865,7 @@ def build_holdings_advice(db: Session, portfolio_id: int = 1) -> dict:
         stage, tone = _stage(stats, row["leverage"])
         if row["vol_cap"] is not None and row["nav_weight"] > row["vol_cap"] + 0.02:
             stage, tone = "单名超限", "danger"
-        view = _advice_view(stats, row, row["leverage"])
+        view = _advice_view(stats, row, row["leverage"], bars_by_symbol.get(row["symbol"]) or [], pe)
         items.append(
             {
                 "symbol": row["symbol"],
@@ -870,6 +959,14 @@ def _history_point(stats: dict) -> dict:
         "turnover": None if stats.get("turnover") is None else round(stats["turnover"]),
         "illiq": rounded("illiq", 3),
         "ma20": rounded("ma20", 2),
+        "boll_upper": rounded("boll_upper", 2),
+        "boll_lower": rounded("boll_lower", 2),
+        "macd_dif": rounded("macd_dif", 4),
+        "macd_dea": rounded("macd_dea", 4),
+        "macd": rounded("macd", 4),
+        "ma5": rounded("ma5", 2),
+        "ma10": rounded("ma10", 2),
+        "ma_order": stats.get("ma_order"),
         "vs_ma20": None if stats.get("vs_ma20") is None else round(stats["vs_ma20"] * 100, 1),
         "anchor_date": stats.get("oct_low_date"),
         "anchor_vwap": rounded("anchor_vwap", 2),
@@ -907,17 +1004,170 @@ def _shift(points: list[dict], key: str, back: int = 5) -> float | None:
     return latest - earlier
 
 
-def _way(delta: float | None, step: float) -> str:
+def _delta_phrase(delta: float | None, step: float, up: str, down: str) -> str:
     if delta is None:
         return "近几日样本不够，看不出方向"
     if delta >= step:
-        return "近 5 个交易日在走高"
+        return up
     if delta <= -step:
-        return "近 5 个交易日在走低"
-    return "近 5 个交易日基本横着"
+        return down
+    return "近 5 个交易日基本没变"
 
 
-def _trend_brief(bars: list[dict], points: list[dict], ticker: str) -> dict | None:
+def _gap_shift(points: list[dict], key: str, back: int = 5) -> float | None:
+    if len(points) <= back:
+        return None
+    latest, earlier = points[-1].get(key), points[-1 - back].get(key)
+    if latest is None or earlier is None:
+        return None
+    return abs(latest) - abs(earlier)
+
+
+def _swing_clause(swing: str) -> str:
+    if swing == "up":
+        return "较 5 个交易日前收高"
+    if swing == "down":
+        return "较 5 个交易日前收低"
+    return "较 5 个交易日前基本持平"
+
+
+def _chandelier_state(bars: list[dict], price: float | None, short: bool, avwap: float | None) -> dict:
+    """22-session extreme ± 3 × Wilder ATR. The level formula stays fixed."""
+    period = 22
+    empty = {
+        "atr": None,
+        "chandelier": None,
+        "lost": False,
+        "defense_lost": False,
+        "extreme_day": None,
+        "extreme_px": None,
+        "stop_price": None,
+        "target_price": None,
+    }
+    atr = _wilder_atr(bars, period)
+    if atr is None or len(bars) < period or not price:
+        return empty
+    window = bars[-period:]
+    high_bar = _extreme_bar(window, "h")
+    low_bar = _extreme_bar(window, "l")
+    highest, lowest = high_bar["h"], low_bar["l"]
+    extreme_bar = low_bar if short else high_bar
+    extreme_px = lowest if short else highest
+    chandelier = (lowest + 3 * atr) if short else (highest - 3 * atr)
+    if short:
+        defense_lost = avwap is not None and price > avwap
+        lost = price >= chandelier
+        candidates = [level for level in (chandelier, avwap) if level is not None and level > price]
+    else:
+        defense_lost = avwap is not None and price < avwap
+        lost = price <= chandelier
+        candidates = [level for level in (chandelier, avwap) if level is not None and level < price]
+    stop_price = None
+    if defense_lost:
+        stop_price = avwap
+    elif candidates:
+        stop_price = min(candidates) if short else max(candidates)
+    target_price = None
+    risk = abs(price - stop_price) if stop_price is not None else None
+    if risk and risk > 0 and not defense_lost:
+        target_price = price - 2 * risk if short else price + 2 * risk
+    return {
+        "atr": atr,
+        "chandelier": chandelier,
+        "lost": lost,
+        "defense_lost": defense_lost,
+        "extreme_day": str(extreme_bar["d"])[:10],
+        "extreme_px": extreme_px,
+        "stop_price": stop_price,
+        "target_price": target_price,
+    }
+
+
+def _regime_headline(*, short: bool, ticker: str, vs_anchor, mom, swing: str, chandelier_lost: bool, extreme_day: str | None) -> str:
+    if short:
+        return f"{ticker} 是反向工具。下面的止损按空头吊灯算，站上它自己的成本不是看多信号。"
+    lead = _swing_clause(swing)
+    above = vs_anchor is not None and vs_anchor >= 0
+    mom_pos = mom is not None and mom > 0
+    parts = [lead + "。"]
+    if swing == "down" and chandelier_lost and extreme_day:
+        parts.append(
+            f"从 {extreme_day} 高点的回撤已经超过 3 倍 ATR（22 个交易日窗口），吊灯止损破了，不再加仓。"
+        )
+    elif chandelier_lost and extreme_day:
+        parts.append(
+            f"22 个交易日里的高点在 {extreme_day}，现价离那个高点仍超过 3 倍 ATR，旧吊灯还在上方。"
+        )
+    if above and mom_pos and swing != "down":
+        parts.append("价格在锚定成本上方，动量为正。这是右侧趋势，持有可以，加仓不能超过波动上限。")
+    elif above and mom_pos:
+        parts.append("价格还在锚定成本上方，20 日动量仍为正。右侧还在，这几天不加仓。")
+    elif above and swing == "up":
+        parts.append("价格在锚定成本上方。20 日动量仍是负的，窗口里还有更早的下跌。只持有，不把这几天当成趋势转正。")
+    elif above:
+        parts.append("价格还在锚定成本上方，但动量已经转负。趋势在变弱，只持有，不追。")
+    elif swing == "up":
+        parts.append("价格还在锚定成本下方，20 日动量仍是负的，窗口里还有更早的下跌。这是下跌之后的反弹，不是趋势转多。")
+    elif vs_anchor is not None and (mom is None or mom < 0):
+        parts.append("防守线在下方，动量也是负的。这是下跌趋势里的左侧，先处理离场，不谈加仓。")
+    else:
+        parts.append("防守线已经失守。按规则先减，动量是否回正再决定还留不留底仓。")
+    if above and chandelier_lost:
+        parts.append("底仓的止损改看防守线。")
+    return "".join(parts)
+
+
+def _opening(**kwargs) -> str:
+    headline = _regime_headline(
+        short=kwargs["short"],
+        ticker=kwargs["ticker"],
+        vs_anchor=kwargs["vs_anchor"],
+        mom=kwargs["mom"],
+        swing=kwargs["swing"],
+        chandelier_lost=kwargs["chandelier_lost"],
+        extreme_day=kwargs["extreme_day"],
+    )
+    leverage = kwargs.get("leverage")
+    bandwidth = kwargs.get("bandwidth")
+    vs_vwap = kwargs.get("vs_vwap")
+    if (
+        not kwargs["short"]
+        and leverage is not None
+        and abs(leverage) >= 2
+        and (bandwidth or 0) > 0.8
+        and (vs_vwap or 0) < 0
+    ):
+        headline = (
+            headline
+            + "杠杆品种还在 20 日滚动成本下方，带宽又很宽。这段来回震荡会磨损，不适合当成趋势仓一直拿。"
+        )
+    alignment = _ma_sentence(_ma_order(kwargs.get("ma5"), kwargs.get("ma10"), kwargs.get("ma20")))
+    if alignment:
+        headline += alignment
+    pe_text = _pe_sentence(kwargs.get("pe"))
+    if pe_text:
+        headline += pe_text
+    return headline
+
+
+def _close_swing(bars: list[dict], back: int = 5, step: float = 0.01) -> str:
+    """Direction of the last few closes. Separate from the 20-day regime."""
+    if len(bars) <= back or not bars[-1 - back]["c"]:
+        return "flat"
+    delta = bars[-1]["c"] / bars[-1 - back]["c"] - 1
+    if delta >= step:
+        return "up"
+    if delta <= -step:
+        return "down"
+    return "flat"
+
+
+def _extreme_bar(window: list[dict], key: str) -> dict:
+    level = max(bar[key] for bar in window) if key == "h" else min(bar[key] for bar in window)
+    return [bar for bar in window if bar[key] == level][-1]
+
+
+def _trend_brief(bars: list[dict], points: list[dict], ticker: str, pe: float | None = None) -> dict | None:
     """Conclusions by indicator, plus Chandelier stop and a 2R target.
 
     Stop: Chuck LeBeau / StockCharts Chandelier Exit, 22-day extreme minus
@@ -931,6 +1181,8 @@ def _trend_brief(bars: list[dict], points: list[dict], ticker: str) -> dict | No
     price = last.get("close")
     if not price:
         return None
+    swing = _close_swing(bars)
+    measured = _measure(bars, None) or {}
     leverage = LEVERAGE.get(ticker.upper())
     short = leverage is not None and leverage < 0
     mom = last.get("mom")
@@ -938,20 +1190,30 @@ def _trend_brief(bars: list[dict], points: list[dict], ticker: str) -> dict | No
     bandwidth = last.get("bandwidth")
     ma20 = last.get("ma20")
     avwap = last.get("anchor_vwap")
-    mom_way = _way(_shift(points, "mom"), 0.03)
-    anchor_way = _way(_shift(points, "vs_anchor"), 2.0)
-    band_way = _way(_shift(points, "bandwidth"), 3.0)
+    anchor_way = _delta_phrase(
+        _gap_shift(points, "vs_anchor"),
+        2.0,
+        "距锚较 5 个交易日前扩大",
+        "距锚较 5 个交易日前收窄",
+    )
+    band_way = _delta_phrase(
+        _shift(points, "bandwidth"),
+        3.0,
+        "带宽较 5 个交易日前变宽",
+        "带宽较 5 个交易日前变窄",
+    )
+    defense = _chandelier_state(bars, price, short, measured.get("anchor_vwap"))
 
     squeezes = [p["date"] for p in points if p.get("signal") == "squeeze"]
     distributes = [p["date"] for p in points if p.get("signal") == "distribute"]
     if squeezes and (not distributes or squeezes[-1] >= distributes[-1]):
-        chip_trend = f"这 30 个交易日有 {len(squeezes)} 次锁仓逼空，最近一次是 {squeezes[-1]}。"
+        chip_trend = f"这 30 个交易日有 {len(squeezes)} 次缩量上涨，最近一次是 {squeezes[-1]}。"
         chip_advice = "缩量上涨还在，持有可以，不要在放量滞涨那天追。"
     elif distributes:
-        chip_trend = f"这 30 个交易日有 {len(distributes)} 次天量滞涨，最近一次是 {distributes[-1]}。"
+        chip_trend = f"这 30 个交易日有 {len(distributes)} 次放量几乎不涨，最近一次是 {distributes[-1]}。"
         chip_advice = "最近的放量没涨是派发，反弹减仓，不把缩量反弹当成新趋势。"
     else:
-        chip_trend = "这 30 个交易日没有锁仓逼空，也没有天量滞涨。"
+        chip_trend = "这 30 个交易日没有缩量上涨，也没有放量滞涨。"
         chip_advice = "筹码上没有极端信号，仓位跟着防守线和动量走。"
 
     if bandwidth is None:
@@ -991,51 +1253,52 @@ def _trend_brief(bars: list[dict], points: list[dict], ticker: str) -> dict | No
     if mom is None:
         mom_trend = "动量还没算出来。"
         mom_advice = "没有 20 日风险调整动量之前，不区分左右侧。"
+    swing_text = _swing_clause(swing)
+    if mom is None:
+        mom_trend = "动量还没算出来。"
+        mom_advice = "没有 20 日风险调整动量之前，不区分左右侧。"
+    elif mom > 0 and swing == "down":
+        mom_trend = f"风险调整动量 {mom:+.2f}，20 日还在正的一侧。{swing_text}。"
+        mom_advice = "20 日动量还没转负。这几天先不加，等收盘重新抬高。"
     elif mom > 0:
-        mom_trend = f"风险调整动量 {mom:+.2f}，还在正的一侧。{mom_way}。"
+        mom_trend = f"风险调整动量 {mom:+.2f}，还在正的一侧。{swing_text}。"
         mom_advice = "动量允许顺着右侧拿。动量转负之前，不加到波动上限以上。"
+    elif swing == "up":
+        mom_trend = f"风险调整动量 {mom:+.2f}，20 日仍在负的一侧。{swing_text}。"
+        mom_advice = "负的是 20 日窗口，里面还装着更早的下跌。这几天只持有，不把反弹加成满仓。"
     else:
-        mom_trend = f"风险调整动量 {mom:+.2f}，在负的一侧。{mom_way}。"
+        mom_trend = f"风险调整动量 {mom:+.2f}，在负的一侧。{swing_text}。"
         mom_advice = "这是左侧。只留底仓或网格，禁止追高。"
 
-    period = 22
-    atr = _wilder_atr(bars, period)
-    stop_price = None
-    target_price = None
-    defense_lost = False
-    chandelier_lost = False
-    level_note = "止损用 Chuck LeBeau 的吊灯出场：22 日极值减去或加上 3 倍 Wilder ATR。止盈是现价到先执行止损的距离再乘 2。这是离场价，不是预测能涨到那里。"
-    if atr is None or len(bars) < period:
+    atr = defense["atr"]
+    stop_price = defense["stop_price"]
+    target_price = defense["target_price"]
+    defense_lost = defense["defense_lost"]
+    chandelier_lost = defense["lost"]
+    extreme_day = defense["extreme_day"]
+    level_note = "止损用 Chuck LeBeau 的吊灯出场：22 个交易日的极值减去或加上 3 倍 Wilder ATR。止盈是现价到先执行止损的距离再乘 2。这是离场价，不是预测能涨到那里。"
+    if atr is None:
         stop_text = "日线不够 22 根，吊灯止损算不出来。有锚定成本的话，收盘跌破那条线就走。"
         target_text = "止损还没算出来，先不给 2 倍风险的止盈。"
     else:
-        window = bars[-period:]
-        highest = max(bar["h"] for bar in window)
-        lowest = min(bar["l"] for bar in window)
-        chandelier = (lowest + 3 * atr) if short else (highest - 3 * atr)
+        chandelier = defense["chandelier"]
+        extreme_px = defense["extreme_px"]
         side = "空头" if short else "多头"
-        if short:
-            defense_lost = avwap is not None and price > avwap
-            chandelier_lost = price >= chandelier
-            candidates = [level for level in (chandelier, avwap) if level is not None and level > price]
-        else:
-            defense_lost = avwap is not None and price < avwap
-            chandelier_lost = price <= chandelier
-            candidates = [level for level in (chandelier, avwap) if level is not None and level < price]
-        if defense_lost:
-            stop_price = avwap
-        elif candidates:
-            stop_price = min(candidates) if short else max(candidates)
-        risk = abs(price - stop_price) if stop_price is not None else None
-        if risk and risk > 0 and not defense_lost:
-            target_price = price - 2 * risk if short else price + 2 * risk
+        recovering = (short and swing == "down") or (not short and swing == "up")
         stop_bits = [
-            f"{side}吊灯止损 {_px(chandelier)}（22 日{'低点' if short else '高点'} {'+' if short else '−'} 3×ATR {_px(atr)}）。"
+            f"{side}吊灯止损 {_px(chandelier)}（{extreme_day} 的{'低点' if short else '高点'} {_px(extreme_px)}，"
+            f"22 个交易日窗口，{'+' if short else '−'} 3×ATR {_px(atr)}）。"
         ]
         if avwap is not None:
             stop_bits.append(f"锚定防守线 {_px(avwap)}。")
         if defense_lost:
             stop_bits.append("收盘已经在防守线外侧，规则是先离场，不再等吊灯，也不设新的止盈。")
+        elif chandelier_lost and stop_price is not None and recovering:
+            stop_bits.append(
+                f"{swing_text}。吊灯还在现价{'下方' if short else '上方'}，"
+                f"是 {extreme_day} 那个{'低点' if short else '高点'}留下的，不是这几天走出来的。"
+                f"底仓还没破防守线，止损改看 {_px(stop_price)}，收盘过去就走。"
+            )
         elif chandelier_lost and stop_price is not None:
             stop_bits.append(
                 f"吊灯已经在现价{'下方' if short else '上方'}，这段趋势的跟踪止损触发了，不再加仓。"
@@ -1059,33 +1322,70 @@ def _trend_brief(bars: list[dict], points: list[dict], ticker: str) -> dict | No
         else:
             target_text = "当前不新开止盈。先处理已经碰到的止损。"
 
-    if short:
-        headline = f"{ticker} 是反向工具。下面的止损按空头吊灯算，站上它自己的成本不是看多信号。"
-    elif chandelier_lost and vs_anchor is not None and vs_anchor >= 0:
-        headline = "从 22 日高点的回撤已经超过 3 倍 ATR，吊灯止损破了，不再加仓。价格还在锚定成本上方，底仓的止损改看防守线。"
-    elif vs_anchor is not None and vs_anchor < 0 and (mom is None or mom < 0):
-        headline = "防守线在下方，动量也是负的。这是下跌趋势里的左侧，先处理离场，不谈加仓。"
-    elif vs_anchor is not None and vs_anchor >= 0 and mom is not None and mom > 0:
-        headline = "价格在锚定成本上方，动量为正。这是右侧趋势，持有可以，加仓不能超过波动上限。"
-    elif vs_anchor is not None and vs_anchor >= 0:
-        headline = "价格还在锚定成本上方，但动量已经转负。趋势在变弱，只持有，不追。"
-    else:
-        headline = "防守线已经失守。按规则先减，动量是否回正再决定还留不留底仓。"
+    headline = _opening(
+        short=short,
+        ticker=ticker,
+        vs_anchor=measured.get("vs_anchor"),
+        mom=measured.get("mom"),
+        swing=swing,
+        chandelier_lost=chandelier_lost,
+        extreme_day=extreme_day,
+        leverage=leverage,
+        bandwidth=measured.get("bandwidth"),
+        vs_vwap=measured.get("vs_vwap"),
+        ma5=measured.get("ma5"),
+        ma10=measured.get("ma10"),
+        ma20=measured.get("ma20"),
+        pe=pe,
+    )
 
-    return {
-        "headline": headline,
-        "sections": [
+    ma_trend = (
+        f"MA5 {_px(measured.get('ma5'))}，MA10 {_px(measured.get('ma10'))}，MA20 {_px(ma20)}。"
+        if measured.get("ma5") is not None
+        else "短均线还没算出来。"
+    )
+    pe_text = _pe_sentence(pe)
+    sections = [
+        {"title": "均线", "trend": ma_trend, "advice": _ma_sentence(measured.get("ma_order")) or "均线还没排出来。"},
+    ]
+    if pe_text:
+        sections.append({"title": "PE", "trend": pe_text, "advice": "只作估值对照，不单独决定买卖。"})
+    sections.extend(
+        [
             {"title": "防守线", "trend": anchor_trend, "advice": anchor_advice},
             {"title": "动量", "trend": mom_trend, "advice": mom_advice},
             {"title": "带宽", "trend": band_trend, "advice": band_advice},
             {"title": "筹码", "trend": chip_trend, "advice": chip_advice},
             {"title": "止损止盈", "trend": stop_text, "advice": target_text},
-        ],
+        ]
+    )
+
+    return {
+        "headline": headline,
+        "sections": sections,
         "stop_price": None if stop_price is None else round(stop_price, 2),
         "stop_hit": bool(defense_lost) if atr is not None else False,
         "target_price": None if target_price is None else round(target_price, 2),
         "level_note": level_note,
     }
+
+
+def _symbol_pe(symbol: str) -> float | None:
+    from app.services.market_scope import market_of
+    from app.services.symbols import quote_code
+
+    ticker = (symbol or "").split(":")[-1]
+    if not ticker:
+        return None
+    try:
+        if market_of(symbol) == "us":
+            found = _fetch_pe([ticker])
+        else:
+            code = quote_code(symbol)
+            found = _fetch_listed_pe([(ticker, code)]) if code else {}
+    except Exception:
+        return None
+    return found.get(ticker.upper())
 
 
 def build_indicator_history(symbol: str, before: str | None = None, limit: int = 40) -> dict:
@@ -1126,6 +1426,6 @@ def build_indicator_history(symbol: str, before: str | None = None, limit: int =
         "before": points[0]["date"] if points else None,
         "has_more": len(eligible) > len(page),
         "points": points,
-        "brief": _trend_brief(bars, recent, ticker) if newest else None,
+        "brief": _trend_brief(bars, recent, ticker, _symbol_pe(symbol)) if newest else None,
     }
 

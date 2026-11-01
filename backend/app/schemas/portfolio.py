@@ -486,6 +486,9 @@ class AdviceMetrics(BaseModel):
     anchor_vwap: float | None = None
     vs_anchor: float | None = None
     ma20: float | None = None
+    ma5: float | None = None
+    ma10: float | None = None
+    ma_order: str | None = None
     bandwidth: float | None = None
     vol: float | None = None
     mom: float | None = None
@@ -539,7 +542,15 @@ class IndicatorPoint(BaseModel):
     volume: float | None = None
     turnover: float | None = None
     illiq: float | None = None
+    ma5: float | None = None
+    ma10: float | None = None
     ma20: float | None = None
+    boll_upper: float | None = None
+    boll_lower: float | None = None
+    macd_dif: float | None = None
+    macd_dea: float | None = None
+    macd: float | None = None
+    ma_order: str | None = None
     vs_ma20: float | None = None
     anchor_date: str | None = None
     anchor_vwap: float | None = None
@@ -600,6 +611,8 @@ class SentimentIndex(BaseModel):
     last: float | None = None
     day_change: float | None = None
     ret_5d: float | None = None
+    ma20: float | None = None
+    vs_ma20: float | None = None
     history: list[SentimentSeriesPoint] = Field(default_factory=list)
 
 
@@ -613,7 +626,39 @@ class MarketSentiment(BaseModel):
     indexes: list[SentimentIndex] = Field(default_factory=list)
 
 
+class AllocationSleeve(BaseModel):
+    key: str
+    label: str
+    target_pct: float
+    target_amount: Decimal = Decimal("0")
+    current_pct: float = 0
+    current_amount: Decimal = Decimal("0")
+    gap: Decimal = Decimal("0")
+
+
+class AllocationName(BaseModel):
+    symbol: str
+    ticker: str
+    sleeve: str
+    market_value: Decimal = Decimal("0")
+    weight: float = 0
+    room: Decimal = Decimal("0")
+
+
+class StrategyAllocation(BaseModel):
+    equity: Decimal = Decimal("0")
+    cash: Decimal = Decimal("0")
+    holdings_value: Decimal = Decimal("0")
+    single_cap: Decimal = Decimal("0")
+    tranche: Decimal = Decimal("0")
+    loss_cap: Decimal = Decimal("0")
+    sleeves: list[AllocationSleeve] = Field(default_factory=list)
+    names: list[AllocationName] = Field(default_factory=list)
+    note: str = ""
+
+
 class StrategyResponse(ReviewResponse):
     open_positions: list[StrategyOpenPosition] = Field(default_factory=list)
     reentry_candidates: list[ReentryCandidate] = Field(default_factory=list)
     reentry_screened: int = 0
+    allocation: StrategyAllocation | None = None

@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import SummaryCards from '@/components/SummaryCards.vue'
 import { usePortfolioStore } from '@/stores/portfolio'
 import { refreshMarket } from '@/api/portfolio'
-import { isUsMarketOpen } from '@/utils/marketHours'
+import { isMarketOpen } from '@/utils/marketHours'
 
 const store = usePortfolioStore()
 const route = useRoute()
@@ -25,8 +25,11 @@ const activeKey = computed({
 async function switchMarket(id) {
   if (id === store.market) return
   store.setMarket(id)
-  refreshVersion.value += 1
-  await store.loadSummary()
+  if (isMarketOpen(id)) await refreshQuotes()
+  else {
+    refreshVersion.value += 1
+    await store.loadSummary()
+  }
 }
 
 async function refreshQuotes() {
@@ -41,7 +44,7 @@ async function refreshQuotes() {
 }
 
 onMounted(() => {
-  if (isUsMarketOpen()) refreshQuotes()
+  if (isMarketOpen(store.market)) refreshQuotes()
   else store.loadSummary()
 })
 </script>

@@ -89,6 +89,36 @@ def _local_frozen(tz_name: str, open_minute: int, close_minute: int, now: dateti
     return previous_us_session_date(session)
 
 
+def cn_session_closed(now: datetime | None = None) -> bool:
+    """Shanghai cash session is closed, including lunch and weekends."""
+    local = _local_now("Asia/Shanghai", now)
+    if local.weekday() >= 5:
+        return True
+    minutes = local.hour * 60 + local.minute
+    return not (9 * 60 + 30 <= minutes < 11 * 60 + 30 or 13 * 60 <= minutes < 15 * 60)
+
+
+def hk_session_closed(now: datetime | None = None) -> bool:
+    """Hong Kong cash session is closed, including lunch and weekends."""
+    local = _local_now("Asia/Hong_Kong", now)
+    if local.weekday() >= 5:
+        return True
+    minutes = local.hour * 60 + local.minute
+    return not (9 * 60 + 30 <= minutes < 12 * 60 or 13 * 60 <= minutes < 16 * 60)
+
+
+def session_closed(symbol: str, now: datetime | None = None) -> bool:
+    """True when this symbol's cash session is not printing."""
+    from app.services.market_scope import market_of
+
+    kind = market_of(symbol)
+    if kind == "cn":
+        return cn_session_closed(now)
+    if kind == "hk":
+        return hk_session_closed(now)
+    return cash_session_closed(now)
+
+
 def cn_frozen(now: datetime | None = None) -> date:
     """Last completed Shanghai/Shenzhen cash session. Lunch does not freeze the bar."""
     return _local_frozen("Asia/Shanghai", 9 * 60 + 30, 15 * 60, now)
@@ -233,16 +263,13 @@ def load_sina_bars(db: Session, symbol: str) -> list[dict]:
 
 
 def load_symbol_bars(db: Session, symbol: str) -> list[dict]:
-    """US bars stay on Sina. A-share and Hong Kong bars come from Tencent daily klines."""
-    from app.services.market import fetch_tencent_bars
+    """US bars from YFinance. A-share and Hong Kong bars from AkShare, then the fallbacks."""
+    from app.services.data_sources import fetch_daily_bars
     from app.services.market_scope import market_of
 
     kind = market_of(symbol)
-    if kind == "cn":
-        return load_bars(db, symbol, lambda: fetch_tencent_bars(symbol, lot_size=100), frozen=cn_frozen())
-    if kind == "hk":
-        return load_bars(db, symbol, lambda: fetch_tencent_bars(symbol, lot_size=1), frozen=hk_frozen())
-    return load_sina_bars(db, symbol)
+    frozen = cn_frozen() if kind == "cn" else hk_frozen() if kind == "hk" else None
+    return load_bars(db, symbol, lambda: fetch_daily_bars(symbol), frozen=frozen)
 
 
 def _quote_code(symbol: str) -> str:
@@ -251,28 +278,58 @@ def _quote_code(symbol: str) -> str:
 
 
 def open_session_bars(symbols: list[str]) -> dict[str, dict]:
-    """Today's still-open bar from the live quote. Not stored."""
+    """Today's still-open US bar. YFinance first, Sina if that quote is empty. Not stored."""
     if cash_session_closed():
         return {}
     from app.services.ledger import _as_et, _us_session_date_from_et
     from app.services.market import _SINA_QUOTE_URL, _parse_as_of, _request_text
+    from app.services.market_scope import market_of
 
     session = us_equity_session_date()
+    us_symbols = [symbol for symbol in symbols if market_of(symbol) == "us"]
+    found: dict[str, dict] = {}
+    try:
+        from app.services.data_sources import fetch_quotes
+
+        for symbol, quote in fetch_quotes(us_symbols).items():
+            price = quote.get("price")
+            if price is None:
+                continue
+            close = float(price)
+            if close <= 0:
+                continue
+            opened = float(quote["open"]) if quote.get("open") is not None else close
+            high = float(quote["high"]) if quote.get("high") is not None else close
+            low = float(quote["low"]) if quote.get("low") is not None else close
+            volume = float(quote["volume"]) if quote.get("volume") else 0.0
+            found[bar_key(symbol)] = {
+                "d": session.isoformat(),
+                "o": opened,
+                "h": high,
+                "l": low,
+                "c": close,
+                "v": volume,
+                "dol": close * volume,
+            }
+    except Exception:
+        found = {}
+    missing = [symbol for symbol in us_symbols if bar_key(symbol) not in found]
+    if not missing:
+        return found
     codes: dict[str, str] = {}
-    for symbol in symbols:
+    for symbol in missing:
         code = _quote_code(symbol)
         if code:
             codes[code.lower()] = bar_key(symbol)
     if not codes:
-        return {}
+        return found
     try:
         text = _request_text(
             _SINA_QUOTE_URL.format(symbols=",".join(f"gb_{code}" for code in codes)),
             referer="https://finance.sina.com.cn/",
         )
     except Exception:
-        return {}
-    found: dict[str, dict] = {}
+        return found
     for code, key in codes.items():
         match = re.search(rf'var\s+hq_str_gb_{re.escape(code)}="([^"]*)"', text, flags=re.IGNORECASE)
         if not match:

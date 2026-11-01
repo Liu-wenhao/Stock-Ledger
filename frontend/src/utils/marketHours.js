@@ -60,6 +60,54 @@ function usMarketHolidayKeys(year) {
   ])
 }
 
+function zonedClock(now, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(now)
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  let hour = Number(values.hour)
+  if (hour === 24) hour = 0
+  return {
+    weekend: values.weekday === 'Sat' || values.weekday === 'Sun',
+    minutes: hour * 60 + Number(values.minute),
+  }
+}
+
+function inSession(minutes, windows) {
+  return windows.some(([start, end]) => minutes >= start && minutes < end)
+}
+
+/** Shanghai cash session: 09:30-11:30 and 13:00-15:00. Lunch does not poll. */
+export function isCnMarketOpen(now = new Date()) {
+  const clock = zonedClock(now, 'Asia/Shanghai')
+  if (clock.weekend) return false
+  return inSession(clock.minutes, [
+    [9 * 60 + 30, 11 * 60 + 30],
+    [13 * 60, 15 * 60],
+  ])
+}
+
+/** Hong Kong cash session: 09:30-12:00 and 13:00-16:00. */
+export function isHkMarketOpen(now = new Date()) {
+  const clock = zonedClock(now, 'Asia/Hong_Kong')
+  if (clock.weekend) return false
+  return inSession(clock.minutes, [
+    [9 * 60 + 30, 12 * 60],
+    [13 * 60, 16 * 60],
+  ])
+}
+
+/** Live quotes follow the tab that is open: US, Shanghai, or Hong Kong. */
+export function isMarketOpen(market, now = new Date()) {
+  if (market === 'cn') return isCnMarketOpen(now)
+  if (market === 'hk') return isHkMarketOpen(now)
+  return isUsMarketOpen(now)
+}
+
 /** Regular NYSE/Nasdaq session: 09:30-16:00 America/New_York. */
 export function isUsMarketOpen(now = new Date()) {
   const parts = new Intl.DateTimeFormat('en-US', {

@@ -19,6 +19,14 @@ const error = ref('')
 const candidateFilter = ref('ready')
 
 const capital = computed(() => data.value?.capital || {})
+const allocation = computed(() => data.value?.allocation || null)
+const equity = computed(() => Number(allocation.value?.equity || 0))
+const singleCap = computed(() => Number(allocation.value?.single_cap || capital.value.deposits * 0.08 || 0))
+const tranche = computed(() => Number(allocation.value?.tranche || 0))
+const lossCap = computed(() => Number(allocation.value?.loss_cap || 0))
+function sleeveOf(key) {
+  return allocation.value?.sleeves?.find((item) => item.key === key) || {}
+}
 const behavior = computed(() => data.value?.behavior || {})
 const openPositions = computed(() => data.value?.open_positions || [])
 const candidates = computed(() => data.value?.reentry_candidates || [])
@@ -62,6 +70,13 @@ const reviewPeriod = computed(() => {
   if (!meta?.first_trade_at || !meta?.last_trade_at) return '暂无交易记录'
   return `${meta.first_trade_at.slice(0, 10).replaceAll('-', '.')} — ${meta.last_trade_at.slice(0, 10).replaceAll('-', '.')}`
 })
+
+function gapText(gap) {
+  const amount = Number(gap)
+  if (!Number.isFinite(amount) || Math.abs(amount) < 1) return '贴近目标'
+  if (amount > 0) return `还差 ${formatMoney(amount, 'USD', 0)}`
+  return `超出 ${formatMoney(Math.abs(amount), 'USD', 0)}`
+}
 
 function priceText(value) {
   return value == null ? '—' : formatMoney(value, 'USD', 2)
@@ -158,8 +173,8 @@ onMounted(load)
             <p class="eyebrow"><span class="eyebrow-dot"></span>当前执行框架</p>
             <h2>先守住风险，<br /><em>再让收益生长。</em></h2>
             <p class="hero-description">
-              按 {{ formatMoney(capital.deposits, 'USD', 0) }} 本金将资金分成核心、卫星与现金三层，
-              用固定仓位、止损和交易窗口约束每一次决策。
+              按当前权益 {{ formatMoney(equity || capital.deposits, 'USD', 0) }} 分成核心、卫星与现金。
+              目标仍是 60 / 30 / 10，金额跟着现在的持仓和现金走。
             </p>
             <div class="hero-meta">
               <span>{{ data.meta.trades }} 笔历史交易</span>
@@ -175,7 +190,7 @@ onMounted(load)
             </article>
             <article class="hero-metric">
               <span class="metric-icon teal"><AimOutlined /></span>
-              <div><p>单只仓位上限</p><strong>{{ formatMoney(capital.deposits * 0.08, 'USD', 0) }}</strong><span>占账户本金 8%</span></div>
+              <div><p>单只仓位上限</p><strong>{{ formatMoney(singleCap, 'USD', 0) }}</strong><span>占当前权益 8%</span></div>
             </article>
             <article class="hero-metric">
               <span class="metric-icon amber"><SafetyOutlined /></span>
@@ -198,35 +213,55 @@ onMounted(load)
           <router-link to="/review" class="nav-next">回看交易数据 <span>→</span></router-link>
         </nav>
 
-        <h2 id="strategy-allocation" class="section-title"><span class="section-number">01</span>资金配置<span class="section-badge">总仓位 100%</span></h2>
-        <p class="section-sub">先决定每类资金做什么，再决定具体买什么。</p>
+        <h2 id="strategy-allocation" class="section-title"><span class="section-number">01</span>资金配置<span class="section-badge">按当前权益</span></h2>
+        <p class="section-sub">目标仍是核心 60%、卫星 30%、现金 10%。下面用持仓市值加现金，看每一层还差多少。</p>
 
         <div class="alloc-card">
           <div class="alloc-heading">
             <div>
-              <p>目标资金配置</p>
-              <span>按 {{ formatMoney(capital.deposits, 'USD', 0) }} 本金设定，季度检查一次偏离度。</span>
+              <p>当前权益</p>
+              <span>{{ allocation?.note || '按持仓市值加现金计算。' }}</span>
             </div>
-            <strong>100<small>%</small></strong>
+            <strong>{{ formatMoney(equity, 'USD', 0) }}</strong>
           </div>
+          <p class="alloc-kicker">目标</p>
           <div class="alloc-bar" aria-label="核心 60%，卫星 30%，现金 10%">
             <div class="seg core"><span>核心 60%</span></div>
             <div class="seg sat"><span>卫星 30%</span></div>
             <div class="seg cash"><span>10%</span></div>
           </div>
+          <p class="alloc-kicker">现在</p>
+          <div class="alloc-bar" aria-label="当前核心、卫星和现金占比">
+            <div
+              v-for="item in (allocation?.sleeves || []).filter((row) => Number(row.current_pct) >= 0.5)"
+              :key="item.key"
+              class="seg"
+              :class="item.key === 'satellite' ? 'sat' : item.key"
+              :style="{ flex: Math.max(Number(item.current_pct), 0) }"
+            >
+              <span v-if="Number(item.current_pct) >= 8">{{ item.label.replace('仓', '') }} {{ Number(item.current_pct).toFixed(0) }}%</span>
+            </div>
+          </div>
           <div class="alloc-list">
-            <article class="alloc-item core">
-              <span class="alloc-index">01</span>
-              <div><p>核心仓 <strong>60%</strong></p><span>2–3 只宽基或龙头，按月定投，偏离目标 20% 才再平衡。</span></div>
+            <article v-for="item in allocation?.sleeves || []" :key="item.key" class="alloc-item" :class="item.key === 'satellite' ? 'sat' : item.key">
+              <span class="alloc-index">{{ item.target_pct }}</span>
+              <div>
+                <p>{{ item.label }} <strong>{{ item.target_pct }}%</strong></p>
+                <span>目标 {{ formatMoney(item.target_amount, 'USD', 0) }} · 现在 {{ formatMoney(item.current_amount, 'USD', 0) }}</span>
+                <span :class="Number(item.gap) < -1 ? 'pnl-down' : ''">{{ gapText(item.gap) }}</span>
+              </div>
             </article>
-            <article class="alloc-item sat">
-              <span class="alloc-index">02</span>
-              <div><p>卫星仓 <strong>30%</strong></p><span>最多 5 只，单只上限 {{ formatMoney(capital.deposits * 0.08, 'USD', 0) }}，分三批建仓。</span></div>
-            </article>
-            <article class="alloc-item cash">
-              <span class="alloc-index">03</span>
-              <div><p>现金 <strong>10%</strong></p><span>预留弹药，用完即停手，不卖出持仓来凑钱。</span></div>
-            </article>
+          </div>
+          <div v-if="allocation?.names?.length" class="alloc-names">
+            <div v-for="item in allocation.names" :key="item.symbol" class="alloc-name">
+              <b>{{ item.ticker }}</b>
+              <span>{{ item.sleeve }}</span>
+              <span>{{ formatMoney(item.market_value, 'USD', 0) }}</span>
+              <span>{{ Number(item.weight).toFixed(1) }}%</span>
+              <span :class="Number(item.room) < 0 ? 'pnl-down' : ''">
+                {{ Number(item.room) < 0 ? `超上限 ${formatMoney(Math.abs(item.room), 'USD', 0)}` : `距上限 ${formatMoney(item.room, 'USD', 0)}` }}
+              </span>
+            </div>
           </div>
         </div>
 
@@ -238,11 +273,11 @@ onMounted(load)
             <span class="norm">A · 仓位</span>
             <h3>资金分层</h3>
             <ul>
-              <li><b>核心 60%</b>：2–3 只宽基或龙头，按月定投，不择时、不主动止盈，偏离目标 20% 才再平衡。</li>
-              <li><b>卫星 30%</b>：最多 5 只，单只上限 {{ formatMoney(capital.deposits * 0.08, 'USD', 0) }}，单笔新建仓 900–1,200，分三批。</li>
-              <li><b>现金 10%</b>：用完即停手，不允许卖出持仓来凑钱。</li>
+              <li><b>核心 60%</b>：目标 {{ formatMoney(sleeveOf('core').target_amount, 'USD', 0) }}。2–3 只宽基指数，按月定投，偏离目标 20% 才再平衡。</li>
+              <li><b>卫星 30%</b>：目标 {{ formatMoney(sleeveOf('satellite').target_amount, 'USD', 0) }}。最多 5 只，单只上限 {{ formatMoney(singleCap, 'USD', 0) }}，单笔新建仓 {{ formatMoney(tranche, 'USD', 0) }}，分三批。</li>
+              <li><b>现金 10%</b>：目标 {{ formatMoney(sleeveOf('cash').target_amount, 'USD', 0) }}。用完即停手，不允许卖出持仓来凑钱。</li>
             </ul>
-            <p class="foot">单笔最大亏损 = 1,200 × 12% ≈ 145，即账户 0.5%。</p>
+            <p class="foot">单笔最大亏损 = {{ formatMoney(tranche, 'USD', 0) }} × 12% ≈ {{ formatMoney(lossCap, 'USD', 0) }}。</p>
           </article>
 
           <article class="strat">
@@ -675,7 +710,11 @@ h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 27px; 
 .alloc-heading span { font-size: 11px; line-height: 1.6; color: #8490a0; }
 .alloc-heading > strong { color: #296e60; font-size: 26px; line-height: 1; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
 .alloc-heading > strong small { margin-left: 2px; font-size: 11px; font-weight: 500; color: #8797a2; }
-.alloc-bar { display: flex; gap: 4px; height: 38px; margin-top: 22px; overflow: hidden; border-radius: 9px; }
+.alloc-bar { display: flex; gap: 4px; height: 38px; margin-top: 8px; overflow: hidden; border-radius: 9px; }
+.alloc-kicker { margin: 16px 0 0; font-size: 11px; font-weight: 650; color: #7b8b98; }
+.alloc-names { display: grid; gap: 8px; margin-top: 16px; }
+.alloc-name { display: grid; grid-template-columns: 72px 42px 1fr 52px 1.2fr; gap: 8px; align-items: baseline; padding: 8px 2px; border-top: 1px solid #e7eeeb; font-size: 12px; color: #5c6b78; font-variant-numeric: tabular-nums; }
+.alloc-name b { color: #24384a; font-weight: 650; }
 .seg { display: flex; align-items: center; justify-content: center; min-width: 0; overflow: hidden; color: #fff; font-size: 11px; font-weight: 600; white-space: nowrap; }
 .seg.core { flex: 6; background: linear-gradient(90deg, #3d6b61, #4d7c70); }
 .seg.sat { flex: 3; background: linear-gradient(90deg, #6a9aaa, #86adba); }
@@ -1391,6 +1430,8 @@ tbody tr:hover { background: #fafcfb; }
   .section-title { margin-top: 28px; gap: 8px; font-size: 17px; }
   .section-sub { font-size: 11px; }
   .alloc-card { padding: 18px 16px; border-radius: 13px; }
+  .alloc-name { grid-template-columns: 64px 36px 1fr auto; }
+  .alloc-name span:nth-child(4) { display: none; }
   .alloc-heading > strong { font-size: 22px; }
   .alloc-bar { height: 32px; }
   .seg.cash span { display: none; }

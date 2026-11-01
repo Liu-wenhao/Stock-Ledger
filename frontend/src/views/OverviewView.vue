@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { fetchMovers, fetchNav, fetchPeriodPerformance, refreshMarket } from '@/api/portfolio'
 import { formatMoney, formatPct, pnlClass, toNumber } from '@/utils/format'
-import { isUsMarketOpen } from '@/utils/marketHours'
+import { isMarketOpen } from '@/utils/marketHours'
 import {
   axisLabelStyle,
   axisLineStyle,
@@ -194,7 +194,7 @@ async function load() {
 }
 
 async function autoRefreshQuotes() {
-  if (quoteRefreshBusy || !isUsMarketOpen()) return
+  if (quoteRefreshBusy || !isMarketOpen(store.market)) return
   quoteRefreshBusy = true
   try {
     await refreshMarket(true)
