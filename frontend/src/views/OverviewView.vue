@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
-import { fetchMovers, fetchNav, fetchPeriodPerformance, refreshMarket } from '@/api/portfolio'
+import { fetchMovers, fetchNav, fetchPeriodPerformance } from '@/api/portfolio'
 import { formatMoney, formatPct, pnlClass, toNumber } from '@/utils/format'
 import { isMarketOpen } from '@/utils/marketHours'
 import {
@@ -15,7 +15,6 @@ import {
 import SymbolCell from '@/components/SymbolCell.vue'
 import { usePortfolioStore } from '@/stores/portfolio'
 
-const emit = defineEmits(['changed'])
 const store = usePortfolioStore()
 const mode = ref('value')
 const range = ref('1W')
@@ -110,10 +109,6 @@ const closedMovers = computed(() => periodPerformance.value?.closed || { winners
 const totalMovers = computed(() => periodPerformance.value?.cumulative || { winners: [], losers: [] })
 const chartRef = ref(null)
 let chart
-let quoteRefreshTimer
-let quoteRefreshBusy = false
-
-const QUOTE_REFRESH_INTERVAL_MS = 10_000
 
 function moverMetric(item) {
   return mode.value === 'percent' ? toNumber(item.change_percent) : toNumber(item.change)
@@ -194,28 +189,8 @@ async function load() {
 }
 
 async function autoRefreshQuotes() {
-  if (quoteRefreshBusy || !isMarketOpen(store.market)) return
-  quoteRefreshBusy = true
-  try {
-    await refreshMarket(true)
-    await load()
-    emit('changed')
-  } catch {
-    // Keep the timer alive; the next market-open interval can retry.
-  } finally {
-    quoteRefreshBusy = false
-  }
-}
-
-function startQuoteRefreshTimer() {
-  if (quoteRefreshTimer) return
-  quoteRefreshTimer = window.setInterval(autoRefreshQuotes, QUOTE_REFRESH_INTERVAL_MS)
-}
-
-function stopQuoteRefreshTimer() {
-  if (!quoteRefreshTimer) return
-  window.clearInterval(quoteRefreshTimer)
-  quoteRefreshTimer = undefined
+  if (!isMarketOpen(store.market)) return
+  await load()
 }
 
 function formatRangeChip(r) {
@@ -341,13 +316,14 @@ function onResize() {
 }
 
 watch([mode, range], load)
+watch(() => store.quoteTick, () => {
+  autoRefreshQuotes()
+})
 onMounted(() => {
   load()
-  startQuoteRefreshTimer()
   window.addEventListener('resize', onResize)
 })
 onUnmounted(() => {
-  stopQuoteRefreshTimer()
   window.removeEventListener('resize', onResize)
   chart?.dispose()
   chart = null

@@ -74,6 +74,163 @@ def _load_bars(symbol: str) -> list[dict]:
         db.close()
 
 
+def _rsi(closes: list[float], period: int = 14) -> float | None:
+    """Wilder RSI via the same adjusted EMA AlphaEvo uses (alpha = 1/period)."""
+    if period <= 0 or len(closes) <= period:
+        return None
+    decay = 1.0 - 1.0 / period
+    gain_num = gain_den = loss_num = loss_den = 0.0
+    avg_gain = avg_loss = None
+    for index in range(1, len(closes)):
+        change = closes[index] - closes[index - 1]
+        gain = change if change > 0 else 0.0
+        loss = -change if change < 0 else 0.0
+        gain_num = gain + decay * gain_num
+        gain_den = 1.0 + decay * gain_den
+        loss_num = loss + decay * loss_num
+        loss_den = 1.0 + decay * loss_den
+        if index >= period:
+            avg_gain = gain_num / gain_den
+            avg_loss = loss_num / loss_den
+    if avg_gain is None or avg_loss is None:
+        return None
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _stop_candle(bars: list[dict]) -> str | None:
+    """AlphaEvo has_stop_signal: hammer-like lower shadow, else bullish engulfing."""
+    if len(bars) < 2:
+        return None
+    row = bars[-1]
+    opened = row.get("o", row["c"])
+    close = row["c"]
+    body = abs(close - opened)
+    lower_shadow = min(opened, close) - row["l"]
+    if body > 0 and lower_shadow >= 2 * body:
+        return "锤子线"
+    prev = bars[-2]
+    prev_open = prev.get("o", prev["c"])
+    prev_close = prev["c"]
+    if prev_close < prev_open and close > opened and close > prev_open and opened < prev_close:
+        return "看涨吞没"
+    return None
+
+
+def _alpha_strategies(bars: list[dict], rsi: float | None, stop_candle: str | None) -> list[dict]:
+    """OHLCV strategies from AlphaEvo. News, sector flow, and benchmark strength are omitted."""
+    closes = [bar["c"] for bar in bars]
+    highs = [bar["h"] for bar in bars]
+    volumes = [bar["v"] for bar in bars]
+    last = bars[-1]
+    opened = last.get("o", last["c"])
+    close = last["c"]
+    ma5 = mean(closes[-5:])
+    ma10 = mean(closes[-10:])
+    ma20 = mean(closes[-20:])
+    prev_ma5 = mean(closes[-6:-1])
+    prev_ma10 = mean(closes[-11:-1])
+    ma_stack = ma5 >= ma10 or (prev_ma5 < prev_ma10 and ma5 >= ma10 * 0.998)
+    above_ma20 = close > ma20
+    below_ma10 = close < ma10
+    avg5 = mean(volumes[-6:-1])
+    vol_ratio_5 = (volumes[-1] / avg5) if avg5 else 1.0
+    dist_ma20 = abs(close - ma20) / ma20 if ma20 else 1.0
+    deviation = (close - ma20) / ma20 if ma20 else 0.0
+    prior_high = max(highs[-21:-1]) if len(highs) >= 21 else None
+    breakout = prior_high is not None and close > prior_high
+    avg20 = mean(volumes[-21:-1]) if len(volumes) >= 21 else 0.0
+    vol_ratio_20 = (volumes[-1] / avg20) if avg20 else 1.0
+    span = last["h"] - last["l"]
+    body_ratio = abs(close - opened) / span if span else 0.0
+    ma20_prev = mean(closes[-25:-5]) if len(closes) >= 25 else None
+    slope = ((ma20 - ma20_prev) / ma20_prev) if ma20_prev else 0.0
+    window = closes[-120:]
+    low_close, high_close = min(window), max(window)
+    position = 0.5 if high_close == low_close else (close - low_close) / (high_close - low_close)
+    width = (4 * stdev(closes[-20:]) / ma20) if ma20 else None
+    shrink_rise = (
+        len(volumes) >= 4
+        and volumes[-4] > volumes[-3] > volumes[-2]
+        and volumes[-1] > volumes[-2]
+    )
+
+    touched_ma20 = last["h"] >= ma20
+
+    def pack(
+        strategy_id: str,
+        name: str,
+        checks: list[tuple[str, bool]],
+        exit_rule: str,
+        exit_now: str = "",
+    ) -> dict:
+        missed = [label for label, ok in checks if not ok]
+        return {
+            "id": strategy_id,
+            "name": name,
+            "ready": not missed,
+            "detail": "条件都满足" if not missed else "、".join(missed),
+            "exit": exit_rule,
+            "exit_now": exit_now,
+        }
+
+    return [
+        pack(
+            "ma_crossover_v1",
+            "均线交叉",
+            [
+                ("MA5 不低于 MA10", ma_stack),
+                ("收盘在 MA20 上", above_ma20),
+                ("5 日量比不低于 1.2", vol_ratio_5 >= 1.2),
+                ("RSI 低于 70", rsi is not None and rsi < 70),
+                ("没有止损K线", stop_candle is None),
+            ],
+            "买入价下跌 4% 止损，盈利达到 3 倍风险止盈，持有满 15 天卖出",
+        ),
+        pack(
+            "rsi_reversion_v1",
+            "RSI超卖",
+            [
+                ("RSI 低于 30", rsi is not None and rsi < 30),
+                ("收盘离 MA20 不超过 6%", dist_ma20 <= 0.06),
+                ("5 日量比高于 1.3", vol_ratio_5 > 1.3),
+                ("出现止损K线", stop_candle is not None),
+                ("收盘在 MA10 下", below_ma10),
+            ],
+            "买入价下跌 5% 止损，盈利达到 2 倍风险止盈，持有满 10 天卖出",
+        ),
+        pack(
+            "volatility_compression_breakout_v1",
+            "收缩突破",
+            [
+                ("收盘突破前 20 日高点", breakout),
+                ("20 日量比不低于 1.2", vol_ratio_20 >= 1.2),
+                ("实体占振幅至少 45%", body_ratio >= 0.45),
+                ("收盘在 MA20 上", above_ma20),
+                ("MA20 向上", slope > 0),
+                ("处在近 120 日区间上沿", position >= 0.65),
+                ("布林带宽不超过 14%", width is not None and width <= 0.14),
+            ],
+            "收盘跌破 MA20 卖出；买入价下跌 5% 也止损。浮盈达到 8% 后，从最高价回撤 4% 止盈。持有满 20 天卖出",
+            "当天收盘在 MA20 下" if not above_ma20 else "",
+        ),
+        pack(
+            "mean_reversion_oversold_v1",
+            "超跌反弹",
+            [
+                ("RSI 低于 30", rsi is not None and rsi < 30),
+                ("收盘高于 MA20 至少 8%", deviation > 0.08),
+                ("出现止损K线", stop_candle is not None),
+                ("缩量后再放量", shrink_rise),
+            ],
+            "从买入后的最高价回撤 3% 止损，最高价触及 MA20 止盈，持有满 8 天卖出",
+            "当天最高已触及 MA20" if touched_ma20 else "",
+        ),
+    ]
+
+
 def _dollar_chip(day_ret: float | None, dollar: float | None, avg_dollar: float | None) -> str | None:
     """Turnover versus the last 20 sessions. Shared by the price-page note and the chart tags."""
     if day_ret is None or not avg_dollar or not dollar:
@@ -187,6 +344,8 @@ def _measure(bars: list[dict], live: float | None) -> dict | None:
     ma5 = mean(closes[-5:])
     ma10 = mean(closes[-10:])
     macd = _macd_last(closes)
+    rsi = _rsi(closes)
+    stop_candle = _stop_candle(bars)
 
     return {
         "as_of": bars[-1]["d"],
@@ -215,6 +374,9 @@ def _measure(bars: list[dict], live: float | None) -> dict | None:
         "bandwidth": bandwidth,
         "squeeze": squeeze,
         "signal": signal,
+        "rsi": rsi,
+        "stop_candle": stop_candle,
+        "strategies": _alpha_strategies(bars, rsi, stop_candle),
         "flow": _flow(rets, amounts),
         "day_ret": rets[-1] if rets else None,
         "oct_low": low_bar["l"] if low_bar else None,
@@ -976,6 +1138,9 @@ def _history_point(stats: dict) -> dict:
         "mom": rounded("mom", 2),
         "signal": stats.get("signal"),
         "vol_squeeze": stats.get("squeeze") == "120日新低",
+        "rsi": rounded("rsi", 1),
+        "stop_candle": stats.get("stop_candle"),
+        "strategies": stats.get("strategies") or [],
     }
 
 

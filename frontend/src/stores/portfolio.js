@@ -17,14 +17,20 @@ export const usePortfolioStore = defineStore('portfolio', () => {
     localStorage.setItem(MARKET_KEY, next)
   }
 
-  async function loadSummary() {
-    loading.value = true
+  async function loadSummary({ silent = false } = {}) {
+    if (!silent) loading.value = true
     try {
       summary.value = await fetchSummary()
     } finally {
-      loading.value = false
+      if (!silent) loading.value = false
     }
   }
 
-  return { summary, loading, market, setMarket, loadSummary }
+  const quoteTick = ref(0)
+
+  function bumpQuoteTick() {
+    quoteTick.value += 1
+  }
+
+  return { summary, loading, market, quoteTick, setMarket, loadSummary, bumpQuoteTick }
 })

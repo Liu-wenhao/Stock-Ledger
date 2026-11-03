@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Date, DateTime, ForeignKey, Index, Numeric, PrimaryKeyConstraint, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -125,6 +125,57 @@ class MarketBreadth(Base):
     median_change: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
     strong_up: Mapped[int] = mapped_column(nullable=False, default=0)
     strong_down: Mapped[int] = mapped_column(nullable=False, default=0)
+
+
+class BreadthDay(Base):
+    """One completed session of advance/decline and Arms inputs. Written once."""
+
+    __tablename__ = "breadth_day"
+    __table_args__ = (PrimaryKeyConstraint("market", "bar_date"),)
+
+    market: Mapped[str] = mapped_column(String(8), primary_key=True)
+    bar_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    advancers: Mapped[int] = mapped_column(nullable=False, default=0)
+    decliners: Mapped[int] = mapped_column(nullable=False, default=0)
+    unchanged: Mapped[int] = mapped_column(nullable=False, default=0)
+    up_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    breadth: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    arms: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    above_ma20: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+
+
+class ArmsReading(Base):
+    """Arms and advance/decline taken once after a session close. Not rewritten."""
+
+    __tablename__ = "arms_reading"
+    __table_args__ = (PrimaryKeyConstraint("market", "bar_date", "phase"),)
+
+    market: Mapped[str] = mapped_column(String(8), primary_key=True)
+    bar_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    phase: Mapped[str] = mapped_column(String(8), primary_key=True)
+    count: Mapped[int] = mapped_column(nullable=False, default=0)
+    advancers: Mapped[int] = mapped_column(nullable=False, default=0)
+    decliners: Mapped[int] = mapped_column(nullable=False, default=0)
+    unchanged: Mapped[int] = mapped_column(nullable=False, default=0)
+    up_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    arms: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    median_change: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    strong_up: Mapped[int | None] = mapped_column(nullable=True)
+    strong_down: Mapped[int | None] = mapped_column(nullable=True)
+    universe: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    above_ma20: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+
+
+class MaAnchor(Base):
+    """Sum of the 19 completed closes before a session. Morning and afternoon MA20 share it."""
+
+    __tablename__ = "ma_anchor"
+    __table_args__ = (PrimaryKeyConstraint("market", "symbol", "through_date"),)
+
+    market: Mapped[str] = mapped_column(String(8), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    through_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    close_sum: Mapped[Decimal] = mapped_column(Numeric(20, 4), nullable=False)
 
 
 class DailyNav(Base):

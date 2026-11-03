@@ -533,6 +533,15 @@ class HoldingsAdvice(BaseModel):
     items: list[AdviceItem] = Field(default_factory=list)
 
 
+class StrategySignal(BaseModel):
+    id: str
+    name: str
+    ready: bool = False
+    detail: str = ""
+    exit: str = ""
+    exit_now: str = ""
+
+
 class IndicatorPoint(BaseModel):
     date: str
     open: float | None = None
@@ -560,6 +569,9 @@ class IndicatorPoint(BaseModel):
     mom: float | None = None
     signal: str | None = None
     vol_squeeze: bool = False
+    rsi: float | None = None
+    stop_candle: str | None = None
+    strategies: list[StrategySignal] = Field(default_factory=list)
 
 
 class TrendBrief(BaseModel):
@@ -588,9 +600,11 @@ class SentimentBreadth(BaseModel):
     decliners: int = 0
     unchanged: int = 0
     up_ratio: float | None = None
+    arms: float | None = None
     median_change: float | None = None
     strong_up: int | None = None
     strong_down: int | None = None
+    above_ma20: float | None = None
 
 
 class SentimentSeriesPoint(BaseModel):
@@ -624,6 +638,25 @@ class MarketSentiment(BaseModel):
     breadth: SentimentBreadth | None = None
     vix: SentimentVix | None = None
     indexes: list[SentimentIndex] = Field(default_factory=list)
+    arms_index: SentimentIndex | None = None
+
+
+class BreadthHistoryPoint(BaseModel):
+    date: str
+    advancers: int = 0
+    decliners: int = 0
+    unchanged: int = 0
+    up_ratio: float | None = None
+    breadth: float | None = None
+    arms: float | None = None
+    above_ma20: float | None = None
+
+
+class BreadthHistory(BaseModel):
+    universe: str
+    basis: str
+    note: str = ""
+    points: list[BreadthHistoryPoint] = Field(default_factory=list)
 
 
 class AllocationSleeve(BaseModel):

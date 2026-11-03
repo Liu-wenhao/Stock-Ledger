@@ -1,15 +1,36 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import SummaryCards from '@/components/SummaryCards.vue'
 import { usePortfolioStore } from '@/stores/portfolio'
 import { refreshMarket } from '@/api/portfolio'
-import { isMarketOpen } from '@/utils/marketHours'
+import { isCnLunch, isMarketOpen } from '@/utils/marketHours'
 
 const store = usePortfolioStore()
 const route = useRoute()
 const router = useRouter()
 const refreshVersion = ref(0)
+const QUOTE_REFRESH_MS = 10_000
+let quoteTimer
+let quotePollBusy = false
+
+async function pollQuotes() {
+  if (quotePollBusy) return
+  if (!isMarketOpen(store.market)) {
+    if (store.market === 'cn' && isCnLunch()) store.bumpQuoteTick()
+    return
+  }
+  quotePollBusy = true
+  try {
+    await refreshMarket(true)
+    await store.loadSummary({ silent: true })
+    store.bumpQuoteTick()
+  } catch {
+    // The next interval retries while the session is still open.
+  } finally {
+    quotePollBusy = false
+  }
+}
 
 const markets = [
   { id: 'us', label: '美股' },
@@ -46,6 +67,12 @@ async function refreshQuotes() {
 onMounted(() => {
   if (isMarketOpen(store.market)) refreshQuotes()
   else store.loadSummary()
+  quoteTimer = window.setInterval(pollQuotes, QUOTE_REFRESH_MS)
+})
+onUnmounted(() => {
+  if (!quoteTimer) return
+  window.clearInterval(quoteTimer)
+  quoteTimer = undefined
 })
 </script>
 

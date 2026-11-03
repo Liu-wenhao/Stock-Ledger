@@ -91,7 +91,12 @@ export function isCnMarketOpen(now = new Date()) {
   ])
 }
 
-/** Hong Kong cash session: 09:30-12:00 and 13:00-16:00. */
+/** Shanghai lunch, 11:30-13:00. The morning Arms reading is ready; quotes stay still. */
+export function isCnLunch(now = new Date()) {
+  const clock = zonedClock(now, 'Asia/Shanghai')
+  if (clock.weekend) return false
+  return clock.minutes >= 11 * 60 + 30 && clock.minutes < 13 * 60
+}
 export function isHkMarketOpen(now = new Date()) {
   const clock = zonedClock(now, 'Asia/Hong_Kong')
   if (clock.weekend) return false

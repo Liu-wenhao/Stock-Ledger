@@ -5,7 +5,7 @@ import * as echarts from 'echarts'
 import dayjs from 'dayjs'
 import { message, Modal } from 'ant-design-vue'
 import { DashboardOutlined, DownloadOutlined, FallOutlined, LineChartOutlined, QuestionCircleOutlined, RiseOutlined } from '@ant-design/icons-vue'
-import { fetchHoldings, fetchHoldingsAdvice, fetchIndicatorHistory, fetchMarketSentiment, fetchTrades, refreshMarket, updateHoldingLimit, updateHoldingStop } from '@/api/portfolio'
+import { fetchHoldings, fetchHoldingsAdvice, fetchIndicatorHistory, fetchBreadthHistory, fetchMarketSentiment, fetchTrades, updateHoldingLimit, updateHoldingStop } from '@/api/portfolio'
 import SymbolCell from '@/components/SymbolCell.vue'
 import { formatMoney, formatPct, formatQty, pnlClass, tickerOf, toNumber } from '@/utils/format'
 import { isMarketOpen } from '@/utils/marketHours'
@@ -92,10 +92,6 @@ const SIDE_STEP_STATUS = {
 }
 
 let priceChart
-let quoteRefreshTimer
-let quoteRefreshBusy = false
-
-const QUOTE_REFRESH_INTERVAL_MS = 10_000
 
 async function onTableChange(pag, _filters, sorter) {
   if (pag) {
@@ -142,28 +138,8 @@ async function load({ silent = false } = {}) {
 }
 
 async function autoRefreshQuotes() {
-  if (quoteRefreshBusy || loading.value || !isMarketOpen(store.market)) return
-  quoteRefreshBusy = true
-  try {
-    await refreshMarket(true)
-    await load({ silent: true })
-    emit('changed')
-  } catch {
-    // Keep the timer alive; the next market-open interval can retry.
-  } finally {
-    quoteRefreshBusy = false
-  }
-}
-
-function startQuoteRefreshTimer() {
-  if (quoteRefreshTimer) return
-  quoteRefreshTimer = window.setInterval(autoRefreshQuotes, QUOTE_REFRESH_INTERVAL_MS)
-}
-
-function stopQuoteRefreshTimer() {
-  if (!quoteRefreshTimer) return
-  window.clearInterval(quoteRefreshTimer)
-  quoteRefreshTimer = undefined
+  if (loading.value || !isMarketOpen(store.market)) return
+  await load({ silent: true })
 }
 
 function tradeInCycle(t, startMs, endMs) {
@@ -1021,6 +997,8 @@ const trendColumns = [
   { title: '带宽', key: 'bandwidth', align: 'right', width: 84 },
   { title: '波动', key: 'vol', align: 'right', width: 84 },
   { title: '动量', key: 'mom', align: 'right', width: 80 },
+  { title: 'RSI', key: 'rsi', align: 'right', width: 72 },
+  { title: '止损K线', key: 'stop_candle', align: 'right', width: 96 },
 ]
 
 const trendCursor = ref(null)
@@ -1029,6 +1007,9 @@ const trendLatest = computed(() => {
   const points = trendBook.value?.points || []
   return points.length ? points[points.length - 1] : null
 })
+const trendReadyStrategies = computed(() =>
+  (trendCursor.value?.strategies || []).filter((item) => item.ready),
+)
 const indicatorHints = {
   volume: {
     text: '已收盘交易日的成交股数。',
@@ -1108,6 +1089,18 @@ const indicatorHints = {
     range: '走低是安静的区间；走高往往是要选择方向。',
     down: '波动走高更差。走低只说明跌势变慢，不是已经见底。',
   },
+  rsi: {
+    text: '14 日 RSI，用 AlphaEvo 的 Wilder 平滑。30 以下是超卖，70 以上是超买。',
+    up: '从 30 以下往上拐，超卖在修复。',
+    range: '停在 30 到 70 之间，没有极端读数。',
+    down: '高于 70 是超买；继续掉到 30 以下仍是杀跌。',
+  },
+  stop_candle: {
+    text: 'AlphaEvo 的止损 K 线：下影线至少是实体的 2 倍，记为锤子线；或前一天收阴、当天收阳并包住前一天实体，记为看涨吞没。',
+    up: '出现锤子线或看涨吞没，当天卖压有停住的样子。',
+    range: '没有这两种形态。',
+    down: '没有长下影，也没有吞没前一根阴线。',
+  },
   mom: {
     text: '近 20 日累计涨跌幅除以年化波动。大于 0 为顺势，图底淡绿；小于 0 为左侧博弈，图底淡黄。',
     up: '大于 0 并且继续走高更好。',
@@ -1169,17 +1162,597 @@ function disposeTrendChart() {
   trendChart = null
 }
 
-async function loadSentiment() {
+function breadthWidth(breadth) {
+  if (!breadth?.count) return null
+  return ((Number(breadth.advancers) - Number(breadth.decliners)) / Number(breadth.count)) * 100
+}
+
+const armsOpen = ref(false)
+const armsLoading = ref(false)
+const armsHistory = ref(null)
+const armsChartRef = ref(null)
+let armsChart
+const ARMS_INDEX = { us: '纳斯达克 100', cn: '中证全指', hk: '恒生指数' }
+const ARMS_UP = '#10b981'
+const ARMS_DOWN = '#ef4444'
+
+function disposeArmsChart() {
+  if (!armsChart) return
+  armsChart.dispose()
+  armsChart = null
+}
+
+function armsPosition(upRatio) {
+  if (upRatio == null || !Number.isFinite(upRatio)) return null
+  if (upRatio >= 80) return { badge: '极度亢奋 (超买预警)', tone: 'hot' }
+  if (upRatio >= 50) return { badge: '健康多头趋势', tone: 'up' }
+  if (upRatio >= 20) return { badge: '弱势结构分化', tone: 'down' }
+  return { badge: '冰点超卖区 (左侧机会)', tone: 'ice' }
+}
+
+function armsTrinBadge(arms) {
+  if (arms == null || !Number.isFinite(arms)) return { text: '没有读数', tone: 'flat' }
+  if (arms < 0.45) return { text: '买盘过热 (短期超买)', tone: 'hot' }
+  if (arms < 0.9) return { text: '多头资金强劲流入', tone: 'up' }
+  if (arms <= 1.1) return { text: '多空资金均衡', tone: 'flat' }
+  if (arms < 2) return { text: '空头抛压主导', tone: 'down' }
+  return { text: '恐慌宣泄 (极度超卖底)', tone: 'ice' }
+}
+
+function armsPanelVerdict(adRatio, arms, ma20) {
+  const ad = adRatio ?? 0
+  const trin = arms ?? 0
+  const width = ma20 == null || !Number.isFinite(Number(ma20)) ? null : Number(ma20)
+  const widthText = width == null ? '还没有算出' : `${width.toFixed(1)}%`
+  if (width != null && ad >= 1.5 && trin > 0 && trin < 0.85 && width >= 50) {
+    return {
+      icon: '🚀',
+      tone: 'up',
+      title: '真突破共振（高胜率顺势做多信号）',
+      desc: `涨跌比达 ${ad.toFixed(2)} 且 TRIN 低至 ${trin.toFixed(2)}，高于 MA20 成分股占 ${widthText}。广度与真金白银买盘高度同步，并非少数权重虚拉，适合顺势持仓。`,
+    }
+  }
+  if (ad >= 1.1 && trin > 1.15) {
+    return {
+      icon: '⚠️',
+      tone: 'hot',
+      title: '量价背离 / 虚胖式反弹（警惕暗中出货）',
+      desc: `虽然表面上涨家数多于下跌家数（A/D=${ad.toFixed(2)}），但 TRIN 高达 ${trin.toFixed(2)} (>1.0)，且 MA20 宽度 ${widthText}，说明上涨股普遍缩量，而大资金正集中在下跌股中放量派发。`,
+    }
+  }
+  if (width != null && trin >= 2 && width <= 25) {
+    return {
+      icon: '💎',
+      tone: 'ice',
+      title: '恐慌抛售极值（左侧反转 / 黄金坑信号）',
+      desc: `高于 MA20 的比例跌至 ${widthText}，同时 TRIN 飙升至 ${trin.toFixed(2)} 极值，代表空头恐慌盘无差别涌出。此类极值后往往伴随超跌反弹。`,
+    }
+  }
+  if (ad < 0.8 && trin > 1.1) {
+    return {
+      icon: '🛡️',
+      tone: 'down',
+      title: '空头占优 / 资金持续流出（防守阶段）',
+      desc: `下跌家数明显多于上涨家数，且 TRIN (${trin.toFixed(2)}) 位于 1.0 上方但尚未达到 2.0 极值出清区，说明属于阴跌或空头趋势宣泄中途，建议控制仓位等待极值或宽度企稳。`,
+    }
+  }
+  return {
+    icon: '⚖️',
+    tone: 'flat',
+    title: '多空均衡拉锯（结构性分化震荡）',
+    desc: `当前涨跌比 (${ad.toFixed(2)}) 与 TRIN (${trin.toFixed(2)}) 均处于中性平衡区间，市场缺乏单边增量资金驱动，以板块轮动与存量博弈为主。`,
+  }
+}
+
+function armsPathNote(diverged, thrust) {
+  const bits = []
+  if (diverged?.kind === 'top') bits.push('这段里指数在高位，上涨占比却从高点收窄了')
+  if (diverged?.kind === 'bottom') bits.push('指数在这段低点，累计涨跌家数没有再创新低')
+  if (diverged?.kind === 'sync') bits.push('指数和腾落线一起停在这段高位')
+  if (thrust?.from) {
+    bits.push(
+      `${String(thrust.from.date).slice(5)} 到 ${String(thrust.to.date).slice(5)} 上涨占比从 ${thrust.from.up_ratio.toFixed(1)}% 拉到 ${thrust.to.up_ratio.toFixed(1)}%`,
+    )
+  }
+  return bits.length ? bits.join('。') + '。' : ''
+}
+
+function armsThrust(points) {
+  const n = points.length
+  for (let end = n - 1; end >= Math.max(0, n - 2); end -= 1) {
+    const high = points[end].up_ratio
+    if (high == null || high <= 70) continue
+    for (let start = Math.max(0, end - 10); start < end; start += 1) {
+      const low = points[start].up_ratio
+      if (low != null && low < 30) return { from: points[start], to: points[end] }
+    }
+  }
+  if (n >= 20) {
+    const recent = points.slice(-10)
+    const ratios = recent
+      .map((point) => (point.decliners > 0 ? point.advancers / point.decliners : null))
+      .filter((value) => value != null)
+    const priorMin = Math.min(
+      ...points
+        .slice(-20, -10)
+        .map((point) => point.up_ratio)
+        .filter((value) => value != null && Number.isFinite(value)),
+    )
+    if (ratios.length >= 8 && Number.isFinite(priorMin) && priorMin < 30) {
+      const avg = ratios.reduce((sum, value) => sum + value, 0) / ratios.length
+      if (avg >= 1.9) return { ma: avg }
+    }
+  }
+  return null
+}
+
+function armsDivergence(points, closes) {
+  const rows = points
+    .map((point, index) => ({ ...point, close: closes[index] }))
+    .filter((row) => row.close != null && row.up_ratio != null)
+  if (rows.length < 8) return { kind: null }
+  const last = rows[rows.length - 1]
+  const maxClose = Math.max(...rows.map((row) => row.close))
+  const minClose = Math.min(...rows.map((row) => row.close))
+  let net = 0
+  const line = rows.map((row) => {
+    net += row.advancers - row.decliners
+    return net
+  })
+  const lastNet = line[line.length - 1]
+  const maxNet = Math.max(...line)
+  const minNet = Math.min(...line)
+  const peak = Math.max(...rows.map((row) => row.up_ratio))
+  const peakAt = rows.findIndex((row) => row.up_ratio === peak)
+  const atHigh = last.close >= maxClose * 0.997
+  const atLow = last.close <= minClose * 1.003
+  const faded = peakAt <= rows.length - 4 && last.up_ratio <= peak - 15
+  if (atHigh && faded) return { kind: 'top', peak, now: last.up_ratio }
+  if (atLow && lastNet > minNet && line.indexOf(minNet) <= rows.length - 3) return { kind: 'bottom' }
+  if (atHigh && lastNet >= maxNet && last.up_ratio >= peak - 3) return { kind: 'sync' }
+  return { kind: null }
+}
+
+function armsVerdict(input) {
+  const { adRatio, arms, upRatio, indexUp, diverged, thrust, position } = input
+  const adText = adRatio == null ? '—' : adRatio.toFixed(2)
+  const armsText = arms == null ? '—' : Number(arms).toFixed(2)
+  const upText = upRatio == null ? '—' : Number(upRatio).toFixed(1)
+  const indexText = indexUp == null ? '指数涨跌这次没对上' : indexUp ? '指数在涨' : '指数在跌'
+  const extra = armsPathNote(diverged, thrust)
+  const prev = input.previous
+  if (
+    prev?.up_ratio != null &&
+    prev.up_ratio < 15 &&
+    prev.arms != null &&
+    prev.arms > 2.5 &&
+    upRatio != null &&
+    upRatio > prev.up_ratio
+  ) {
+    return {
+      icon: '💎',
+      tone: 'ice',
+      title: '真见底：冰点之后宽度回升',
+      desc: `${String(prev.date).slice(5)} 上涨占比 ${prev.up_ratio.toFixed(1)}%，阿姆士 ${Number(prev.arms).toFixed(2)}。今天回到 ${upText}%。这是当日上涨占比，不是站上 20 日均线的比例。${extra}`,
+    }
+  }
+  if (upRatio != null && upRatio < 15 && arms != null && arms > 2.5) {
+    return {
+      icon: '💎',
+      tone: 'ice',
+      title: '真见底：恐慌盘带量涌出',
+      desc: `当日上涨占比 ${upText}%，低于 15%，阿姆士 ${armsText}，高于 2.5。等下一个交易日宽度回升，这个左侧信号才算走出来。${extra}`,
+    }
+  }
+  if (indexUp && adRatio > 2 && arms != null && arms < 0.8) {
+    return {
+      icon: '🚀',
+      tone: 'up',
+      title: '真突破：家数和成交一起偏向多头',
+      desc: `${indexText}，涨跌家数比 ${adText}，大于 2，阿姆士 ${armsText}，小于 0.8。上涨的股票多，成交也堆在上涨的一边。${extra}`,
+    }
+  }
+  if (indexUp && adRatio > 1.5 && arms != null && arms > 1.2) {
+    return {
+      icon: '⚠️',
+      tone: 'hot',
+      title: '假反弹：家数在涨，成交在下跌股里',
+      desc: `${indexText}，涨跌家数比 ${adText}，大于 1.5，但阿姆士 ${armsText}，大于 1.2。看起来涨得多，下跌股票的平均成交更重。${extra}`,
+    }
+  }
+  if (diverged?.kind === 'top') {
+    return {
+      icon: '⚠️',
+      tone: 'hot',
+      title: '虚胖：指数在高位，内部在变窄',
+      desc: `指数停在这段高位，上涨占比从 ${diverged.peak.toFixed(1)}% 收到 ${upText}%。权重还撑着，多数股票已经不跟。`,
+    }
+  }
+  if (diverged?.kind === 'bottom') {
+    return {
+      icon: '🛡️',
+      tone: 'ice',
+      title: '底背离：指数在低位，内部不再创新低',
+      desc: '指数还在这段低点，累计涨跌家数已经不再跟着创新低。多数股票先止住了。',
+    }
+  }
+  if (thrust?.from) {
+    return {
+      icon: '🚀',
+      tone: 'up',
+      title: '宽度冲力：十日内从冰点拉到普涨',
+      desc: `${String(thrust.from.date).slice(5)} 上涨占比 ${thrust.from.up_ratio.toFixed(1)}%，${String(thrust.to.date).slice(5)} 升到 ${thrust.to.up_ratio.toFixed(1)}%。`,
+    }
+  }
+  if (thrust?.ma) {
+    return {
+      icon: '🚀',
+      tone: 'up',
+      title: '宽度冲力：十日涨跌比抬过 1.9',
+      desc: `近十个交易日涨跌家数比均值 ${thrust.ma.toFixed(2)}，再往前上涨占比曾经低于 30%。`,
+    }
+  }
+  if (diverged?.kind === 'sync') {
+    return {
+      icon: '🚀',
+      tone: 'up',
+      title: '同步：指数和内部一起在高位',
+      desc: `指数创这段新高时，上涨占比 ${upText}%，腾落线也在高位。上涨不是只靠少数权重。`,
+    }
+  }
+  if (adRatio != null && adRatio < 0.8 && arms != null && arms > 1.1 && arms < 2) {
+    return {
+      icon: '🛡️',
+      tone: 'down',
+      title: '空头占优，还没到宣泄极值',
+      desc: `涨跌家数比 ${adText}，阿姆士 ${armsText}。跌的更多，但还不是恐慌出清。`,
+    }
+  }
+  return {
+    icon: '⚖️',
+    tone: 'flat',
+    title: position ? `位置在${position.badge}，交叉还不极端` : '多空拉锯',
+    desc: `${indexText}。涨跌家数比 ${adText}，阿姆士 ${armsText}，当日上涨占比 ${upText}%。没有同时落到真突破、假反弹或真见底。`,
+  }
+}
+
+function buildArmsBoard(history, book, market) {
+  const stored = history?.points || []
+  const live = book?.breadth || null
+  const index =
+    (book?.arms_index?.history?.length ? book.arms_index : null) ||
+    (book?.indexes || []).find((item) => item.name === ARMS_INDEX[market]) ||
+    book?.indexes?.[0] ||
+    null
+  const path = stored.map((point) => ({ ...point }))
+  if (live && book?.as_of && live.arms != null) {
+    const reading = {
+      date: book.as_of,
+      advancers: live.advancers,
+      decliners: live.decliners,
+      unchanged: live.unchanged,
+      up_ratio: live.up_ratio,
+      breadth: live.count ? ((live.advancers - live.decliners) / live.count) * 100 : null,
+      arms: live.arms,
+    }
+    if (live.above_ma20 != null) reading.above_ma20 = live.above_ma20
+    if (!path.length || path[path.length - 1].date < book.as_of) path.push(reading)
+    else if (path[path.length - 1].date === book.as_of) Object.assign(path[path.length - 1], reading)
+  }
+  const source =
+    [...path].reverse().find((point) => point.arms != null || point.above_ma20 != null) ||
+    path[path.length - 1]
+  let headlineArms = source?.arms ?? null
+  let headlineMa20 = source?.above_ma20 ?? null
+  if (source) {
+    const earlier = [...path].reverse().find((point) => point.date < source.date)
+    if (earlier) {
+      if (headlineArms == null) headlineArms = earlier.arms
+      if (headlineMa20 == null) headlineMa20 = earlier.above_ma20
+    }
+  }
+  if (!source) {
+    return { ready: false, plotted: [], indexName: index?.name || '', note: history?.note || '' }
+  }
+  const advancers = Number(source.advancers) || 0
+  const decliners = Number(source.decliners) || 0
+  const unchanged = Number(source.unchanged) || 0
+  const total = advancers + decliners + unchanged
+  const upRatio = source.up_ratio == null ? (total ? (advancers / total) * 100 : null) : Number(source.up_ratio)
+  const arms = headlineArms == null ? null : Number(headlineArms)
+  const adRatio = decliners > 0 ? advancers / decliners : null
+  const volRatio = adRatio != null && arms > 0 ? adRatio / arms : null
+  const intensity = arms > 0 ? 1 / arms : null
+  const closesByDate = new Map((index?.history || []).map((point) => [point.date, point.close]))
+  const plotted = path.map((point) => ({ ...point, indexClose: closesByDate.get(point.date) ?? null }))
+  const indexUp = index?.day_change == null ? null : Number(index.day_change) > 0
+  const ma20 = headlineMa20 == null ? null : Number(headlineMa20)
+  const position = armsPosition(ma20)
+  const verdict = armsPanelVerdict(adRatio, arms, ma20)
+  const net = advancers - decliners
+  return {
+    ready: true,
+    universe: live?.universe || history?.universe || '',
+    count: live?.count || total,
+    basis: history?.basis || (market === 'us' ? '成交量' : '成交额'),
+    note: history?.note || '',
+    indexName: index?.name || '',
+    indexUp,
+    advancers,
+    decliners,
+    unchanged,
+    total,
+    pctAdv: total ? (advancers / total) * 100 : 0,
+    pctUnch: total ? (unchanged / total) * 100 : 0,
+    pctDec: total ? (decliners / total) * 100 : 0,
+    net,
+    upRatio,
+    aboveMa20: headlineMa20 == null ? null : Number(headlineMa20),
+    ma20: headlineMa20 == null ? null : Number(headlineMa20),
+    adRatio,
+    volRatio,
+    arms,
+    intensity,
+    position,
+    trin: armsTrinBadge(arms),
+    verdict,
+    plotted,
+    trinLeft: armsPointer(arms),
+  }
+}
+
+const armsBoard = computed(() => buildArmsBoard(armsHistory.value, sentiment.value, store.market))
+
+function armsPointer(arms) {
+  const clamped = Math.min(Math.max(arms ?? 1, 0.2), 3)
+  return `${(((clamped - 0.2) / 2.8) * 100).toFixed(1)}%`
+}
+
+function renderArmsChart(retry = 0) {
+  const board = armsBoard.value
+  const points = board.plotted || []
+  const host = armsChartRef.value?.isConnected
+    ? armsChartRef.value
+    : document.querySelector('.arms-modal .arms-chart')
+  if (!host || !points.length) {
+    if (retry < 8) requestAnimationFrame(() => renderArmsChart(retry + 1))
+    else if (!points.length) disposeArmsChart()
+    return
+  }
+  if (!armsChart || armsChart.getDom() !== host) {
+    disposeArmsChart()
+    armsChart = echarts.init(host)
+  }
+  const indexLabel = board.indexName || '大盘指数'
+  const labels = points.map((point) => String(point.date).slice(5))
+  const todayKey = new Intl.DateTimeFormat('en-CA', {
+    timeZone: store.market === 'us' ? 'America/New_York' : store.market === 'hk' ? 'Asia/Hong_Kong' : 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date())
+  const ma5 = points.map((_, index) => {
+    if (index < 4) return null
+    const slice = points.slice(index - 4, index + 1).map((point) => point.arms).filter((value) => value != null)
+    if (slice.length < 5) return null
+    return Math.round((slice.reduce((sum, value) => sum + Number(value), 0) / 5) * 100) / 100
+  })
+  const armsValues = points.map((point) => (point.arms == null ? null : Number(point.arms)))
+  const peakArms = Math.max(3, ...armsValues.filter((value) => value != null))
+  const narrow = viewportWidth.value <= 800
+  const side = narrow ? 34 : 52
+  const labelSize = narrow ? 10 : 11
+  armsChart.setOption(
+    {
+      backgroundColor: 'transparent',
+      animationDuration: 280,
+      axisPointer: { link: [{ xAxisIndex: 'all' }] },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: '#ffffff',
+        borderColor: 'rgba(0, 0, 0, 0.12)',
+        borderWidth: 1,
+        padding: 10,
+        extraCssText: 'border-radius:8px;box-shadow:0 8px 24px rgba(15, 23, 42, 0.12);',
+        textStyle: { color: '#131722', fontSize: 12 },
+        formatter: (params) => {
+          const index = params[0]?.dataIndex
+          const point = points[index]
+          if (!point) return ''
+          const day = String(point.date).slice(0, 10)
+          const title = day === todayKey ? `${day.slice(5)}(今)` : day.slice(5)
+          const above = point.above_ma20 == null ? '—' : Number(point.above_ma20).toFixed(1)
+          const close = point.indexClose == null ? '—' : Number(point.indexClose).toLocaleString('en-US', { maximumFractionDigits: 2 })
+          const arms = point.arms == null ? '—' : Number(point.arms).toFixed(2)
+          const smooth = ma5[index]
+          const trinColor = point.arms == null ? '#94a3b8' : point.arms >= 2 ? '#a855f7' : point.arms <= 1 ? '#10b981' : '#ef4444'
+          const line = (color, name, value, hollow = false) =>
+            `<div style="display:flex;justify-content:space-between;gap:22px;align-items:center;color:#3d4452;font-size:12px;line-height:1.85"><span style="display:flex;align-items:center;gap:6px"><i style="width:8px;height:8px;border-radius:50%;box-sizing:border-box;border:2px solid ${color};background:${hollow ? 'transparent' : color}"></i>${name}</span><b style="font-weight:650;font-variant-numeric:tabular-nums;color:#131722">${value}</b></div>`
+          return [
+            `<div style="color:#131722;font-size:13px;font-weight:650;margin-bottom:2px">${title}</div>`,
+            line('#38bdf8', '高于MA20占比(%)', above),
+            line('#fbbf24', indexLabel, close),
+            line(trinColor, '单日 TRIN', arms),
+            line('#64748b', 'TRIN MA5', smooth == null ? '—' : smooth.toFixed(2), true),
+          ].join('')
+        },
+      },
+      grid: [
+        { left: side, right: side, top: narrow ? 22 : 28, height: '42%' },
+        { left: side, right: side, top: '62%', height: narrow ? '26%' : '28%' },
+      ],
+      xAxis: [
+        {
+          type: 'category',
+          data: labels,
+          gridIndex: 0,
+          axisLabel: { show: false },
+          axisTick: { show: false },
+          axisLine: { lineStyle: { color: '#e2e8f0' } },
+        },
+        {
+          type: 'category',
+          data: labels,
+          gridIndex: 1,
+          axisTick: { show: false },
+          axisLine: { lineStyle: { color: '#e2e8f0' } },
+          axisLabel: { color: '#64748b', fontSize: labelSize, interval: narrow ? 3 : 'auto', showMinLabel: true, showMaxLabel: true },
+        },
+      ],
+      yAxis: [
+        {
+          name: '% Above MA20',
+          gridIndex: 0,
+          min: 0,
+          max: 100,
+          interval: 25,
+          axisLabel: { color: '#38bdf8', fontSize: labelSize, formatter: '{value}%' },
+          nameTextStyle: { color: '#38bdf8', fontSize: labelSize },
+          splitLine: { lineStyle: { color: '#eef2f6', type: 'dashed' } },
+        },
+        {
+          name: indexLabel,
+          gridIndex: 0,
+          scale: true,
+          position: 'right',
+          axisLabel: { color: '#fbbf24', fontSize: labelSize },
+          nameTextStyle: { color: '#fbbf24', fontSize: labelSize },
+          splitLine: { show: false },
+        },
+        {
+          name: 'TRIN (阿姆士)',
+          gridIndex: 1,
+          min: 0,
+          max: Math.ceil(peakArms * 10) / 10,
+          axisLabel: { color: '#64748b', fontSize: labelSize },
+          nameTextStyle: { color: '#64748b', fontSize: labelSize },
+          splitLine: { lineStyle: { color: '#eef2f6', type: 'dashed' } },
+        },
+      ],
+      series: [
+        {
+          name: '高于MA20占比(%)',
+          type: 'line',
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          data: points.map((point) => point.above_ma20),
+          smooth: true,
+          symbol: 'circle',
+          symbolSize: 5,
+          lineStyle: { color: '#38bdf8', width: 2 },
+          itemStyle: { color: '#38bdf8' },
+          areaStyle: {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: 'rgba(56, 189, 248, 0.35)' },
+              { offset: 1, color: 'rgba(56, 189, 248, 0.02)' },
+            ]),
+          },
+          markLine: {
+            symbol: 'none',
+            silent: true,
+            data: [
+              { yAxis: 80, lineStyle: { color: '#f59e0b', type: 'dashed', width: 1 }, label: { formatter: '80% 超买区', color: '#f59e0b', fontSize: 10, position: 'insideEndTop' } },
+              { yAxis: 20, lineStyle: { color: '#c084fc', type: 'dashed', width: 1 }, label: { formatter: '20% 冰点底', color: '#c084fc', fontSize: 10, position: 'insideEndBottom' } },
+            ],
+          },
+        },
+        {
+          name: indexLabel,
+          type: 'line',
+          xAxisIndex: 0,
+          yAxisIndex: 1,
+          data: points.map((point) => point.indexClose),
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: '#fbbf24', width: 2 },
+          itemStyle: { color: '#fbbf24' },
+        },
+        {
+          name: '单日 TRIN',
+          type: 'bar',
+          xAxisIndex: 1,
+          yAxisIndex: 2,
+          data: armsValues,
+          barMaxWidth: 16,
+          itemStyle: {
+            borderRadius: [3, 3, 0, 0],
+            color: (params) => {
+              const value = armsValues[params.dataIndex]
+              if (value == null) return '#64748b'
+              if (value >= 2) return '#a855f7'
+              return value <= 1 ? ARMS_UP : ARMS_DOWN
+            },
+          },
+          markLine: {
+            symbol: 'none',
+            silent: true,
+            data: [
+              { yAxis: 1, lineStyle: { color: '#94a3b8', width: 1 }, label: { formatter: '1.0 多空均衡', color: '#64748b', fontSize: 10, position: narrow ? 'insideStartTop' : 'insideEndTop' } },
+              { yAxis: 2, lineStyle: { color: '#a855f7', type: 'dashed', width: 1 }, label: { formatter: '2.0 恐慌超卖线', color: '#7c3aed', fontSize: 10, position: narrow ? 'insideStartTop' : 'insideEndTop' } },
+            ],
+          },
+        },
+        {
+          name: 'TRIN MA5',
+          type: 'line',
+          xAxisIndex: 1,
+          yAxisIndex: 2,
+          data: ma5,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: '#64748b', width: 1.5, type: 'dotted' },
+          itemStyle: { color: '#64748b' },
+        },
+      ],
+    },
+    true,
+  )
+  armsChart.resize()
+}
+
+async function openArmsHistory() {
+  armsOpen.value = true
+  armsLoading.value = true
+  armsHistory.value = null
+  try {
+    armsHistory.value = await fetchBreadthHistory()
+  } catch {
+    armsHistory.value = null
+  } finally {
+    armsLoading.value = false
+  }
+  await nextTick()
+  renderArmsChart()
+}
+
+watch(armsOpen, (open) => {
+  if (!open) disposeArmsChart()
+})
+
+watch(armsBoard, () => {
+  if (!armsOpen.value || armsLoading.value) return
+  nextTick(() => renderArmsChart())
+})
+
+let sentimentBusy = false
+
+async function loadSentiment({ silent = false } = {}) {
   if (!isPricePage.value && subTab.value !== 'price') return
-  sentimentState.value = 'loading'
+  if (sentimentBusy) return
+  sentimentBusy = true
+  if (!silent) sentimentState.value = 'loading'
   try {
     sentiment.value = await fetchMarketSentiment()
     sentimentState.value = 'ready'
     await nextTick()
     renderSentimentChart()
   } catch {
-    sentiment.value = null
-    sentimentState.value = 'error'
+    if (!silent) {
+      sentiment.value = null
+      sentimentState.value = 'error'
+    }
+  } finally {
+    sentimentBusy = false
   }
 }
 
@@ -1837,12 +2410,13 @@ function bindTrendSlider(el) {
 
 function trendCell(record, key) {
   const value = record[key]
-  if (key === 'ma_order') return value || '—'
+  if (key === 'ma_order' || key === 'stop_candle') return value || '—'
   if (key === 'volume' || key === 'turnover') return formatCount(value)
   if (key === 'illiq') return adviceNum(value, 3)
   if (key === 'vs_ma20' || key === 'vs_anchor') return adviceSignedPct(value)
   if (key === 'bandwidth' || key === 'vol') return advicePct(value)
   if (key === 'mom') return adviceNum(value, 2)
+  if (key === 'rsi') return adviceNum(value, 1)
   return adviceNum(value)
 }
 
@@ -2449,8 +3023,10 @@ function onViewportResize() {
   viewportWidth.value = window.innerWidth
   priceChart?.resize()
   sentimentChart?.resize()
+  armsChart?.resize()
   trendChart?.resize()
   if (priceModalOpen.value) renderPriceChart()
+  if (armsOpen.value) renderArmsChart()
 }
 
 watch(
@@ -2483,14 +3059,16 @@ watch(trendOpen, (open) => {
 watch(trendSymbol, () => {
   if (trendOpen.value) loadTrend()
 })
+watch(() => store.quoteTick, () => {
+  autoRefreshQuotes()
+  if (isPricePage.value || subTab.value === 'price') loadSentiment({ silent: true })
+})
 onMounted(() => {
   subTab.value = route.name === 'prices' ? 'price' : 'positions'
   load()
-  startQuoteRefreshTimer()
   window.addEventListener('resize', onViewportResize)
 })
 onUnmounted(() => {
-  stopQuoteRefreshTimer()
   window.removeEventListener('resize', onViewportResize)
   disposePriceChart()
   disposeSentimentChart()
@@ -2789,7 +3367,7 @@ onUnmounted(() => {
       </header>
       <section v-if="isPricePage" class="price-hero">
         <div class="price-hero-copy">
-          <p class="price-kicker"><span class="price-kicker-dot"></span>当前市场情绪</p>
+          <p class="price-kicker"><span class="price-kicker-dot"></span>市场宽度</p>
           <h2 v-if="sentiment">{{ sentiment.label }}</h2>
           <h2 v-else-if="sentimentState !== 'error'">读取中</h2>
           <h2 v-else>暂时没有取到</h2>
@@ -2804,7 +3382,8 @@ onUnmounted(() => {
             <span v-if="sentiment.breadth?.strong_down != null">跌超 2% {{ sentiment.breadth.strong_down }}</span>
           </div>
         </div>
-        <div v-if="sentiment?.breadth" class="price-metrics">
+        <div v-if="sentiment?.breadth || (sentiment && store.market !== 'hk')" class="price-metrics">
+          <template v-if="sentiment.breadth">
           <article>
             <span class="price-metric-icon teal"><RiseOutlined /></span>
             <div>
@@ -2829,6 +3408,16 @@ onUnmounted(() => {
               <span>{{ sentiment.breadth.universe }}里上涨所占的比例</span>
             </div>
           </article>
+          <article v-if="breadthWidth(sentiment.breadth) != null">
+            <span class="price-metric-icon blue"><LineChartOutlined /></span>
+            <div>
+              <p>市场宽度</p>
+              <strong :class="pnlClass(breadthWidth(sentiment.breadth))">
+                {{ `${breadthWidth(sentiment.breadth) > 0 ? '+' : ''}${breadthWidth(sentiment.breadth).toFixed(1)}%` }}
+              </strong>
+              <span>上涨家数减下跌家数，再除以总家数</span>
+            </div>
+          </article>
           <article v-if="sentiment.breadth.median_change != null">
             <span class="price-metric-icon violet"><DashboardOutlined /></span>
             <div>
@@ -2837,6 +3426,29 @@ onUnmounted(() => {
                 {{ `${sentiment.breadth.median_change > 0 ? '+' : ''}${sentiment.breadth.median_change.toFixed(2)}%` }}
               </strong>
               <span>{{ sentiment.breadth.universe }}的中位数</span>
+            </div>
+          </article>
+          </template>
+          <article
+            v-if="store.market !== 'hk'"
+            class="is-arms"
+            title="查看宽广度和阿姆士"
+            @click="openArmsHistory"
+          >
+            <span class="price-metric-icon violet"><DashboardOutlined /></span>
+            <div>
+              <p>阿姆士</p>
+              <strong
+                v-if="sentiment.breadth?.arms == null"
+              >—</strong>
+              <strong
+                v-else
+                :class="sentiment.breadth.arms < 1 ? 'pnl-up' : sentiment.breadth.arms > 1 ? 'pnl-down' : ''"
+              >
+                {{ sentiment.breadth.arms.toFixed(2) }}
+              </strong>
+              <span v-if="sentiment.breadth?.arms == null">收盘后才有当天的数，点开可看以前的</span>
+              <span v-else>{{ store.market === 'us' ? '小于 1 表示上涨股票的成交量更大' : '小于 1 表示上涨股票的成交额更大' }}</span>
             </div>
           </article>
         </div>
@@ -3082,6 +3694,126 @@ onUnmounted(() => {
     </template>
 
     <a-modal
+      v-model:open="armsOpen"
+      wrap-class-name="arms-modal"
+      :width="viewportWidth > 800 ? 1120 : '100%'"
+      centered
+      destroy-on-close
+      :footer="null"
+    >
+      <template #title>
+        <span class="arms-modal-title">市场宽广度与阿姆士指数</span>
+      </template>
+      <div v-if="armsLoading" class="arms-empty">正在读取最近 22 个交易日</div>
+      <div v-else-if="!armsBoard.ready" class="arms-empty">这段行情还没有汇总出来</div>
+      <div v-else class="arms-board">
+        <section class="arms-cards">
+          <article>
+            <div class="arms-card-head">
+              <h3>市场宽广度 <small>(Market Breadth)</small></h3>
+              <span class="arms-tag">正向指标</span>
+              <em v-if="armsBoard.position" :class="`is-${armsBoard.position.tone}`">{{ armsBoard.position.badge }}</em>
+            </div>
+            <div class="arms-card-main">
+              <div>
+                <p>高于 MA20 成分股占比 (% Above MA20)</p>
+                <div class="arms-figure">
+                  <strong>{{ armsBoard.ma20 == null ? '—' : `${armsBoard.ma20.toFixed(1)}%` }}</strong>
+                  <span :class="armsBoard.net > 0 ? 'is-up' : armsBoard.net < 0 ? 'is-down' : ''">
+                    净涨跌 (A-D): {{ armsBoard.net > 0 ? '+' : '' }}{{ armsBoard.net }}
+                  </span>
+                </div>
+              </div>
+              <div class="is-side">
+                <p>涨跌家数比 (A/D Ratio)</p>
+                <b>{{ armsBoard.adRatio == null ? '—' : armsBoard.adRatio.toFixed(2) }}</b>
+              </div>
+            </div>
+            <div class="arms-split">
+              <span class="is-up">上涨 (A): {{ armsBoard.advancers }} ({{ armsBoard.pctAdv.toFixed(1) }}%)</span>
+              <span>平盘 (U): {{ armsBoard.unchanged }} ({{ armsBoard.pctUnch.toFixed(1) }}%)</span>
+              <span class="is-down">下跌 (D): {{ armsBoard.decliners }} ({{ armsBoard.pctDec.toFixed(1) }}%)</span>
+            </div>
+            <div class="arms-bar">
+              <i class="is-up" :style="{ width: `${armsBoard.pctAdv}%` }"></i>
+              <i class="is-flat" :style="{ width: `${armsBoard.pctUnch}%` }"></i>
+              <i class="is-down" :style="{ width: `${armsBoard.pctDec}%` }"></i>
+            </div>
+          </article>
+          <article>
+            <div class="arms-card-head">
+              <h3>阿姆士指数 <small>(Arms Index / TRIN)</small></h3>
+              <span class="arms-tag is-reverse">反向指标</span>
+              <em :class="`is-${armsBoard.trin.tone}`">{{ armsBoard.trin.text }}</em>
+            </div>
+            <div class="arms-card-main">
+              <div>
+                <p>实时 TRIN = (A / D) ÷ (AV / DV)</p>
+                <div class="arms-figure">
+                  <strong>{{ armsBoard.arms == null ? '—' : armsBoard.arms.toFixed(2) }}</strong>
+                  <span v-if="armsBoard.adRatio != null && armsBoard.volRatio != null">
+                    涨跌比 {{ armsBoard.adRatio.toFixed(2) }} ÷ 量比 {{ armsBoard.volRatio.toFixed(2) }}
+                  </span>
+                </div>
+              </div>
+              <div class="is-side">
+                <p>涨跌量比 (AV / DV)</p>
+                <b>{{ armsBoard.volRatio == null ? '—' : armsBoard.volRatio.toFixed(2) }}</b>
+              </div>
+            </div>
+            <div class="arms-gauge-scale">
+              <span>0.2 极度超买</span>
+              <span>0.6 多头强势</span>
+              <span>1.0 多空均衡</span>
+              <span>1.6 空头抛压</span>
+              <span class="is-panic">2.0+ 恐慌超卖底</span>
+            </div>
+            <div class="arms-gauge">
+              <i class="is-one"></i>
+              <i class="is-two"></i>
+              <b :style="{ left: armsBoard.trinLeft }"></b>
+            </div>
+          </article>
+        </section>
+        <section v-if="armsBoard.verdict" class="arms-synergy" :class="`is-${armsBoard.verdict.tone}`">
+          <span class="arms-synergy-icon">{{ armsBoard.verdict.icon }}</span>
+          <div>
+            <p>
+              宽广度 × TRIN 交叉验证结论：
+              <strong>{{ armsBoard.verdict.title }}</strong>
+            </p>
+            <span>{{ armsBoard.verdict.desc }}</span>
+          </div>
+          <div v-if="armsBoard.intensity != null" class="arms-intensity">
+            <p>人均获配资金强度 (AV/A vs DV/D)</p>
+            <b :class="armsBoard.intensity >= 1 ? 'is-up' : 'is-down'">
+              {{
+                armsBoard.intensity >= 1
+                  ? `上涨股单票平均吸筹是下跌股的 ${armsBoard.intensity.toFixed(2)} 倍`
+                  : `下跌股单票平均出逃量是上涨股的 ${(1 / armsBoard.intensity).toFixed(2)} 倍`
+              }}
+            </b>
+          </div>
+        </section>
+        <section class="arms-chart-card">
+          <div class="arms-chart-head">
+            <div>
+              <h3>历史 20 日时序背离与共振分析（主图：{{ armsBoard.indexName || '大盘指数' }} vs % Above MA20 | 副图：TRIN 柱状图与 5 日均线）</h3>
+              <p>紫色柱代表 TRIN ≥ 2.0 的恐慌宣泄极值。</p>
+            </div>
+            <div class="arms-legend">
+              <span><i class="is-index"></i>{{ armsBoard.indexName || '大盘指数' }}</span>
+              <span><i class="is-ratio"></i>% Above MA20</span>
+              <span><i class="is-panic"></i>TRIN≥2.0 恐慌底</span>
+            </div>
+          </div>
+          <div v-if="!armsBoard.plotted.length" class="arms-empty">日线还没有回到库里，图先空着</div>
+          <div v-else ref="armsChartRef" class="arms-chart"></div>
+        </section>
+      </div>
+    </a-modal>
+
+    <a-modal
       v-model:open="adviceOpen"
       :title="selectedAdvice ? `${selectedAdvice.ticker} 建议` : '建议'"
       :footer="null"
@@ -3197,6 +3929,23 @@ onUnmounted(() => {
         <span class="is-ma"><em>MA20</em><b>{{ adviceNum(trendCursor.ma20) }}</b></span>
         <span class="is-vwap"><em>AVWAP</em><b>{{ adviceNum(trendCursor.anchor_vwap) }}</b></span>
         <span><em>Amihud</em><b>{{ adviceNum(trendCursor.illiq, 3) }}</b></span>
+        <span><em>RSI</em><b>{{ adviceNum(trendCursor.rsi, 1) }}</b></span>
+        <span><em>止损K线</em><b>{{ trendCursor.stop_candle || '—' }}</b></span>
+      </div>
+      <div v-if="trendReadyStrategies.length" class="trend-strategies">
+        <article
+          v-for="item in trendReadyStrategies"
+          :key="item.id"
+          class="trend-strategy is-ready"
+          :title="item.detail"
+        >
+          <header>
+            <em>{{ item.name }}</em>
+            <b>买入{{ item.ready ? '满足' : '未满足' }}</b>
+          </header>
+          <p>卖出 {{ item.exit }}</p>
+          <p v-if="item.exit_now" class="is-exit">{{ item.exit_now }}</p>
+        </article>
       </div>
       <div ref="trendChartRef" class="trend-chart"></div>
       <a-table
@@ -3207,7 +3956,7 @@ onUnmounted(() => {
         row-key="date"
         size="small"
         :pagination="false"
-        :scroll="{ x: 1100, y: 280 }"
+        :scroll="{ x: 1280, y: 280 }"
       >
         <template #headerCell="{ column }">
           <span class="col-head">
@@ -4239,6 +4988,354 @@ onUnmounted(() => {
   box-shadow: 0 5px 18px rgba(46, 70, 105, 0.035);
 }
 
+.price-metrics article.is-arms {
+  cursor: pointer;
+}
+
+.price-metrics article.is-arms:hover {
+  border-color: #c9d7ee;
+}
+
+.arms-modal-title {
+  color: #131722;
+  font-weight: 700;
+}
+
+.arms-board {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: #1e293b;
+}
+
+.arms-kicker,
+.arms-note {
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.arms-cards,
+.arms-views {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.arms-cards article,
+.arms-views article,
+.arms-chart-card,
+.arms-synergy {
+  border: 1px solid #e6ebf2;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.arms-cards article,
+.arms-views article,
+.arms-chart-card {
+  padding: 16px;
+}
+
+.arms-card-head,
+.arms-chart-head,
+.arms-card-main,
+.arms-split,
+.arms-gauge-scale,
+.arms-legend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.arms-card-head h3 small {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.arms-tag {
+  color: #64748b;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+}
+
+.arms-tag.is-reverse {
+  color: #fbbf24;
+  padding: 1px 6px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.arms-figure {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.arms-figure strong {
+  display: inline;
+}
+
+.arms-card-head h3,
+.arms-chart-head h3,
+.arms-views h3,
+.arms-synergy h3 {
+  margin: 0;
+  color: #131722;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.arms-card-head span,
+.arms-card-main p,
+.arms-views p,
+.arms-synergy p,
+.arms-intensity p,
+.arms-chart-head p,
+.arms-gauge-scale,
+.arms-legend {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.arms-card-head em {
+  margin-left: auto;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-style: normal;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.arms-card-head em.is-up { color: #10b981; background: rgba(16, 185, 129, 0.12); border-color: rgba(16, 185, 129, 0.4); }
+.arms-card-head em.is-down { color: #f87171; background: rgba(239, 68, 68, 0.12); border-color: rgba(239, 68, 68, 0.4); }
+.arms-card-head em.is-hot { color: #fbbf24; background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.4); }
+.arms-card-head em.is-ice { color: #c084fc; background: rgba(168, 85, 247, 0.16); border-color: rgba(168, 85, 247, 0.45); }
+.arms-card-head em.is-flat { color: #475569; background: #f1f5f9; border-color: #e2e8f0; }
+
+.arms-synergy.is-up { background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.4); }
+.arms-synergy.is-down { background: rgba(239, 68, 68, 0.08); border-color: rgba(239, 68, 68, 0.4); }
+.arms-synergy.is-hot { background: rgba(245, 158, 11, 0.08); border-color: rgba(245, 158, 11, 0.4); }
+.arms-synergy.is-ice { background: rgba(168, 85, 247, 0.1); border-color: rgba(168, 85, 247, 0.45); }
+.arms-synergy.is-flat { background: #f8fafc; border-color: #e2e8f0; }
+.arms-synergy p strong {
+  margin-left: 6px;
+  font-size: 14px;
+}
+
+.arms-synergy.is-up p strong { color: #10b981; }
+.arms-synergy.is-down p strong { color: #f87171; }
+.arms-synergy.is-hot p strong { color: #fbbf24; }
+.arms-synergy.is-ice p strong { color: #c084fc; }
+.arms-synergy.is-flat p strong { color: #131722; }
+
+.arms-gauge-scale {
+  font-size: 11px;
+}
+
+.arms-gauge-scale .is-panic {
+  color: #c084fc;
+  font-weight: 650;
+}
+
+.arms-card-main {
+  align-items: flex-end;
+  margin: 14px 0;
+}
+
+.arms-card-main strong,
+.arms-card-main b {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.arms-card-main strong {
+  display: block;
+  color: #131722;
+  font-size: 36px;
+  line-height: 1.1;
+}
+
+.arms-figure strong {
+  display: inline;
+}
+
+.arms-card-main b {
+  color: #38bdf8;
+  font-size: 24px;
+}
+
+.arms-card-main .is-side {
+  text-align: right;
+}
+
+.arms-card-main span,
+.arms-split span {
+  color: #334155;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.arms-card-main span {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: #f1f5f9;
+}
+
+.arms-split {
+  margin-bottom: 8px;
+}
+
+.arms-split .is-up,
+.arms-intensity .is-up,
+.arms-card-main span.is-up {
+  color: #10b981;
+}
+
+.arms-split .is-down,
+.arms-intensity .is-down,
+.arms-card-main span.is-down {
+  color: #f87171;
+}
+
+.arms-bar,
+.arms-gauge {
+  position: relative;
+  display: flex;
+  gap: 2px;
+  height: 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e8edf3;
+}
+
+.arms-bar i {
+  display: block;
+  height: 100%;
+}
+
+.arms-bar .is-up { background: #10b981; }
+.arms-bar .is-flat { background: #64748b; }
+.arms-bar .is-down { background: #ef4444; }
+
+.arms-gauge {
+  margin-top: 6px;
+  overflow: visible;
+  background: linear-gradient(90deg, #f59e0b 0%, #10b981 20%, #64748b 30%, #ef4444 58%, #a855f7 100%);
+}
+
+.arms-gauge i,
+.arms-gauge b {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+}
+
+.arms-gauge .is-one { left: 28.57%; background: rgba(255, 255, 255, 0.7); }
+.arms-gauge .is-two { left: 64.28%; background: rgba(216, 180, 254, 0.85); }
+
+.arms-gauge b {
+  width: 12px;
+  height: 20px;
+  margin-top: -4px;
+  border: 2px solid #020617;
+  border-radius: 4px;
+  background: #fff;
+  transform: translateX(-50%);
+}
+
+.arms-synergy {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+}
+
+.arms-synergy-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: #f1f5f9;
+  font-size: 18px;
+}
+
+.arms-synergy h3 {
+  margin: 2px 0;
+}
+
+.arms-synergy span,
+.arms-views span {
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.arms-intensity {
+  margin-left: auto;
+  max-width: 220px;
+  text-align: right;
+}
+
+.arms-intensity b {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.arms-views article {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.arms-chart-head {
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.arms-chart-head p {
+  margin: 4px 0 0;
+}
+
+.arms-legend {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.arms-legend i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 4px;
+  border-radius: 2px;
+  vertical-align: -1px;
+}
+
+.arms-legend .is-index { background: #fbbf24; }
+.arms-legend .is-ratio { background: #38bdf8; }
+.arms-legend .is-panic { background: #a855f7; }
+
+.arms-empty {
+  padding: 48px 0;
+  text-align: center;
+  color: #64748b;
+}
+
+.arms-chart {
+  height: 430px;
+}
+
 .price-metric-icon {
   display: grid;
   place-items: center;
@@ -4713,6 +5810,47 @@ onUnmounted(() => {
   font-weight: 650;
 }
 
+.trend-strategies {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0 10px 6px;
+}
+
+.trend-strategy {
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: #f3f5f8;
+  color: #667085;
+  font-size: 12px;
+}
+
+.trend-strategy header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.trend-strategy em,
+.trend-strategy b {
+  font-style: normal;
+  font-weight: 650;
+}
+
+.trend-strategy p {
+  margin: 4px 0 0;
+  color: #243047;
+  line-height: 1.4;
+}
+
+.trend-strategy .is-exit {
+  color: #b52f27;
+}
+
+.trend-strategy.is-ready header b {
+  color: #067a5a;
+}
+
 .trend-chart {
   width: 100%;
   height: 640px;
@@ -4852,6 +5990,10 @@ onUnmounted(() => {
     grid-template-columns: 1fr;
   }
 
+  .trend-strategies {
+    grid-template-columns: 1fr;
+  }
+
   .trend-chart {
     height: 500px;
   }
@@ -4957,5 +6099,128 @@ onUnmounted(() => {
 
 .toolbar-actions .advice-note {
   max-width: 420px;
+}
+
+@media (max-width: 800px) {
+  .arms-cards,
+  .arms-views,
+  .arms-synergy,
+  .arms-chart-head {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .arms-card-head,
+  .arms-chart-head,
+  .arms-split,
+  .arms-gauge-scale,
+  .arms-legend,
+  .arms-figure,
+  .arms-card-main {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .arms-cards article,
+  .arms-views article,
+  .arms-chart-card {
+    padding: 12px;
+  }
+
+  .arms-card-head h3,
+  .arms-chart-head h3 {
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  .arms-card-head em {
+    margin-left: 0;
+  }
+
+  .arms-card-main .is-side {
+    text-align: left;
+  }
+
+  .arms-card-main strong {
+    font-size: 28px;
+  }
+
+  .arms-gauge-scale {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 2px 10px;
+    font-size: 10px;
+    line-height: 1.4;
+  }
+
+  .arms-gauge-scale span {
+    white-space: nowrap;
+  }
+
+  .arms-intensity {
+    margin-left: 0;
+    max-width: none;
+    text-align: left;
+  }
+
+  .arms-chart {
+    height: 320px;
+  }
+}
+</style>
+
+<style>
+.arms-modal .ant-modal {
+  max-width: calc(100vw - 16px);
+}
+
+.arms-modal .ant-modal-content {
+  background: #fff;
+  color: #1e293b;
+  border: 1px solid #e6ebf2;
+}
+
+.arms-modal .ant-modal-header {
+  background: transparent;
+}
+
+.arms-modal .ant-modal-close {
+  color: #64748b;
+}
+
+.arms-modal .ant-modal-body {
+  max-height: calc(100vh - 140px);
+  overflow: auto;
+}
+
+@media (max-width: 800px) {
+  .arms-modal .ant-modal {
+    top: 8px;
+    margin: 0 auto;
+    max-width: calc(100vw - 12px);
+    padding-bottom: 8px;
+  }
+
+  .arms-modal .ant-modal-content {
+    padding: 0;
+    border-radius: 12px;
+  }
+
+  .arms-modal .ant-modal-header {
+    padding: 12px 40px 8px 14px;
+  }
+
+  .arms-modal .ant-modal-title {
+    font-size: 15px;
+    line-height: 1.4;
+    white-space: normal;
+  }
+
+  .arms-modal .ant-modal-body {
+    padding: 8px 12px 14px;
+    max-height: calc(100vh - 72px);
+  }
 }
 </style>

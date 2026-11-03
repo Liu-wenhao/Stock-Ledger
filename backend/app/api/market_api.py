@@ -4,10 +4,10 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.models.entities import SymbolMeta, Trade
-from app.schemas.portfolio import MarketSentiment, QuoteOut, SymbolSearchItem
+from app.schemas.portfolio import BreadthHistory, MarketSentiment, QuoteOut, SymbolSearchItem
 from app.services.market import get_quotes, refresh_quotes_sync
 from app.services.market_scope import current_market, in_market
-from app.services.sentiment import build_market_sentiment
+from app.services.sentiment import breadth_history_payload, build_market_sentiment
 
 router = APIRouter(prefix="/api", tags=["market"])
 settings = get_settings()
@@ -17,6 +17,12 @@ settings = get_settings()
 def market_sentiment(db: Session = Depends(get_db)):
     """Breadth and index paths for the selected market."""
     return build_market_sentiment(db, current_market())
+
+
+@router.get("/market/breadth-history", response_model=BreadthHistory)
+def market_breadth_history(db: Session = Depends(get_db)):
+    """Recent advance/decline and Arms readings for the selected market."""
+    return breadth_history_payload(db, current_market())
 
 
 @router.get("/market/quote", response_model=list[QuoteOut])

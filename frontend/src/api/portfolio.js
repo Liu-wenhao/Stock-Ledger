@@ -18,6 +18,7 @@ export const fetchHoldingsAdvice = () => http.get('/api/holdings/advice').then((
 export const fetchIndicatorHistory = (symbol, params = {}) =>
   http.get('/api/holdings/indicator-history', { params: { symbol, limit: 40, ...params } }).then((r) => r.data)
 export const fetchMarketSentiment = () => http.get('/api/market/sentiment').then((r) => r.data)
+export const fetchBreadthHistory = () => http.get('/api/market/breadth-history').then((r) => r.data)
 export const updateHoldingStop = (data) =>
   http.put('/api/holdings/stop', data).then((r) => r.data)
 export const updateHoldingLimit = (data) =>

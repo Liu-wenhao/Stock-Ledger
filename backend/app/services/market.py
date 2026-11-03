@@ -497,10 +497,30 @@ def _fetch_us_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
 def _fetch_global_stock_data_batch(
     symbols: list[str],
 ) -> dict[str, dict[str, Any]]:
-    """YFinance for US, AkShare for A-share/HK. Sina/Tencent fill whatever is still empty."""
+    """US from YFinance. Open A-share and Hong Kong sessions use the Tencent quote."""
+    from app.services.bars import cn_session_closed, hk_session_closed
     from app.services.data_sources import fetch_quotes
 
-    out = fetch_quotes(symbols)
+    cn_open = not cn_session_closed()
+    hk_open = not hk_session_closed()
+    live: list[str] = []
+    rest: list[str] = []
+    for symbol in symbols:
+        kind = market_of(symbol)
+        if (kind == "cn" and cn_open) or (kind == "hk" and hk_open):
+            live.append(symbol)
+        else:
+            rest.append(symbol)
+    out: dict[str, dict[str, Any]] = {symbol: {} for symbol in symbols}
+    if live:
+        for symbol, quote in _fetch_cn_hk_quotes(live).items():
+            if quote.get("price") is not None:
+                out[symbol] = quote
+        rest.extend(symbol for symbol in live if out.get(symbol, {}).get("price") is None)
+    if rest:
+        for symbol, quote in fetch_quotes(rest).items():
+            if quote.get("price") is not None:
+                out[symbol] = quote
     missing_us = [
         symbol
         for symbol in symbols
