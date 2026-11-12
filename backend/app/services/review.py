@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
+import calendar
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -18,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.models.entities import Trade
 from app.services import market
-from app.services.ledger import load_trades, trade_us_session_date, us_equity_session_date
+from app.services.ledger import load_trades, period_holdings, trade_us_session_date, us_equity_session_date
 
 ZERO = Decimal("0")
 _EPS = Decimal("0.0000001")
@@ -218,90 +219,151 @@ def _q(value: Decimal, places: str = "0.01") -> Decimal:
     return value.quantize(Decimal(places))
 
 
-def build_review(db: Session, portfolio_id: int = 1) -> dict:
+def _month_ago(day: date) -> date:
+    month = day.month - 1 or 12
+    year = day.year - (1 if day.month == 1 else 0)
+    last = calendar.monthrange(year, month)[1]
+    return date(year, month, min(day.day, last))
+
+
+def _resolve_range(start: date | None, end: date | None) -> tuple[date, date]:
+    today = us_equity_session_date()
+    end = end or today
+    start = start or _month_ago(end)
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def _month_slices(start: date, end: date) -> list[tuple[date, date]]:
+    cursor = date(start.year, start.month, 1)
+    slices: list[tuple[date, date]] = []
+    while cursor <= end:
+        last = calendar.monthrange(cursor.year, cursor.month)[1]
+        month_end = date(cursor.year, cursor.month, last)
+        slices.append((max(start, cursor), min(end, month_end)))
+        cursor = month_end + timedelta(days=1)
+    return slices
+
+
+def build_review(
+    db: Session,
+    portfolio_id: int = 1,
+    start: date | None = None,
+    end: date | None = None,
+) -> dict:
+    start, end = _resolve_range(start, end)
     trades = load_trades(db, portfolio_id)
     state = _replay(trades)
 
+    def in_range(day: date) -> bool:
+        return start <= day <= end
+
     closed: list[Cycle] = state["closed"]
-    priced = [c for c in closed if c.cost > ZERO]
+    priced = [
+        c for c in closed
+        if c.cost > ZERO and in_range(trade_us_session_date(c.ended_at))
+    ]
     wins = [c for c in priced if c.realized > ZERO]
     losses = [c for c in priced if c.realized <= ZERO]
 
-    t_trades = state["same_day_flips"]
+    t_trades = [
+        t for t in state["same_day_flips"]
+        if in_range(date.fromisoformat(t["date"]))
+    ]
     t_wins = [t for t in t_trades if t["pnl"] > ZERO]
     t_losses = [t for t in t_trades if t["pnl"] <= ZERO]
     t_pnl = sum((t["pnl"] for t in t_trades), ZERO)
 
-    realized = sum((c.realized for c in priced), ZERO)
     win_sum = sum((c.realized for c in wins), ZERO)
     loss_sum = sum((c.realized for c in losses), ZERO)
     avg_win = win_sum / len(wins) if wins else ZERO
     avg_loss = abs(loss_sum / len(losses)) if losses else ZERO
 
-    deposits = state["deposits"]
-    buy_notional = state["buy_notional"]
+    window_trades = [
+        t for t in trades
+        if t.side in ("Buy", "Sell")
+        and (t.symbol or "").strip()
+        and in_range(trade_us_session_date(t.closing_time))
+    ]
+    deposits = ZERO
+    for t in trades:
+        if t.side not in ("Deposit", "Withdrawal"):
+            continue
+        if trade_us_session_date(t.closing_time) > end:
+            continue
+        amount = Decimal(t.fill_price or 0)
+        if amount == ZERO:
+            amount = Decimal(t.qty or 0)
+        deposits += amount if t.side == "Deposit" else -amount
+    buy_notional = sum(
+        (Decimal(t.qty or 0) * Decimal(t.fill_price or 0) for t in window_trades if t.side == "Buy"),
+        ZERO,
+    )
+    sell_notional = sum(
+        (Decimal(t.qty or 0) * Decimal(t.fill_price or 0) for t in window_trades if t.side == "Sell"),
+        ZERO,
+    )
+    commissions = sum((Decimal(t.commission or 0) for t in window_trades), ZERO)
 
-    # ---- per symbol -------------------------------------------------------
-    by_symbol: dict[str, dict] = defaultdict(
-        lambda: {"realized": ZERO, "cost": ZERO, "cycles": 0, "days": 0,
-                 "addon_below": 0, "trades": 0}
+    # Mark-to-market for the window: names still held and names closed inside it.
+    slices = _month_slices(start, end)
+    month_books = [period_holdings(db, left, right, portfolio_id) for left, right in slices]
+    whole = month_books[0] if len(slices) == 1 else period_holdings(db, start, end, portfolio_id)
+    holding_pnl = sum(
+        (item["day_pnl"] for item in whole["items"] if item["status"] == "持仓" and item["day_pnl"] is not None),
+        ZERO,
+    )
+    closed_pnl = sum(
+        (item["day_pnl"] for item in whole["items"] if item["status"] != "持仓" and item["day_pnl"] is not None),
+        ZERO,
+    )
+    realized = Decimal(whole["total_pnl"] or 0)
+
+    cycle_stats: dict[str, dict] = defaultdict(
+        lambda: {"cycles": 0, "days": 0, "addon_below": 0}
     )
     for c in priced:
-        b = by_symbol[c.symbol]
-        b["realized"] += c.realized
-        b["cost"] += c.cost
+        b = cycle_stats[c.symbol]
         b["cycles"] += 1
         b["days"] += c.holding_days
         b["addon_below"] += c.addon_below_avg
-    for t in trades:
-        sym = (t.symbol or "").strip().upper()
-        if sym and t.side in ("Buy", "Sell"):
-            by_symbol[sym]["trades"] += 1
 
     symbols = []
-    for sym, b in by_symbol.items():
+    for item in whole["items"]:
+        pnl = item["day_pnl"]
+        if pnl is None:
+            continue
+        stats = cycle_stats[item["symbol"]]
         symbols.append(
             {
-                "symbol": sym,
-                "realized": _q(b["realized"]),
-                "cost": _q(b["cost"]),
-                "return_pct": _q(b["realized"] / b["cost"] * Decimal("100"))
-                if b["cost"] > ZERO else ZERO,
-                "cycles": b["cycles"],
-                "trades": b["trades"],
-                "avg_holding_days": _q(Decimal(b["days"]) / Decimal(b["cycles"]))
-                if b["cycles"] else ZERO,
-                "addon_below_avg": b["addon_below"],
+                "symbol": item["symbol"],
+                "realized": _q(pnl),
+                "cost": ZERO,
+                "return_pct": _q(item["day_pnl_percent"]) if item["day_pnl_percent"] is not None else ZERO,
+                "cycles": stats["cycles"],
+                "trades": item["trade_count"],
+                "avg_holding_days": _q(Decimal(stats["days"]) / Decimal(stats["cycles"]))
+                if stats["cycles"] else ZERO,
+                "addon_below_avg": stats["addon_below"],
+                "status": item["status"],
             }
         )
     symbols.sort(key=lambda r: r["realized"])
 
-    # ---- monthly ----------------------------------------------------------
-    monthly: dict[str, dict] = defaultdict(
-        lambda: {"trades": 0, "realized": ZERO, "wins": 0, "losses": 0}
-    )
-    for t in trades:
-        sym = (t.symbol or "").strip().upper()
-        if sym and t.side in ("Buy", "Sell"):
-            monthly[t.closing_time.strftime("%Y-%m")]["trades"] += 1
-    for c in priced:
-        m = monthly[c.ended_at.strftime("%Y-%m")]
-        m["realized"] += c.realized
-        if c.realized > ZERO:
-            m["wins"] += 1
-        else:
-            m["losses"] += 1
-
-    monthly_items = [
-        {
-            "month": key,
-            "trades": val["trades"],
-            "realized": _q(val["realized"]),
-            "wins": val["wins"],
-            "losses": val["losses"],
-        }
-        for key, val in sorted(monthly.items())
-    ]
+    monthly_items = []
+    for (left, _right), book in zip(slices, month_books):
+        key = left.strftime("%Y-%m")
+        month_cycles = [c for c in priced if c.ended_at.strftime("%Y-%m") == key]
+        monthly_items.append(
+            {
+                "month": key,
+                "trades": sum(1 for t in window_trades if trade_us_session_date(t.closing_time).strftime("%Y-%m") == key),
+                "realized": _q(Decimal(book["total_pnl"] or 0)),
+                "wins": sum(1 for c in month_cycles if c.realized > ZERO),
+                "losses": sum(1 for c in month_cycles if c.realized <= ZERO),
+            }
+        )
 
     # ---- cycle level ------------------------------------------------------
     cycles = [
@@ -326,20 +388,24 @@ def build_review(db: Session, portfolio_id: int = 1) -> dict:
 
     return {
         "meta": {
-            "trades": len([t for t in trades if t.side in ("Buy", "Sell")]),
-            "symbols": len({(t.symbol or "").upper() for t in trades if t.symbol}),
-            "first_trade_at": trades[0].closing_time if trades else None,
-            "last_trade_at": trades[-1].closing_time if trades else None,
+            "trades": len(window_trades),
+            "symbols": len({row["symbol"] for row in symbols}),
+            "first_trade_at": window_trades[0].closing_time if window_trades else None,
+            "last_trade_at": window_trades[-1].closing_time if window_trades else None,
+            "start_date": start,
+            "end_date": end,
         },
         "capital": {
             "deposits": _q(deposits),
             "buy_notional": _q(buy_notional),
-            "sell_notional": _q(state["sell_notional"]),
+            "sell_notional": _q(sell_notional),
             "turnover_x": _q(buy_notional / deposits) if deposits > ZERO else ZERO,
-            "commissions": _q(state["commissions"]),
+            "commissions": _q(commissions),
             "realized": _q(realized),
             "realized_pct": _q(realized / deposits * Decimal("100"))
             if deposits > ZERO else ZERO,
+            "closed_pnl": _q(closed_pnl),
+            "holding_pnl": _q(holding_pnl),
         },
         "behavior": {
             "closed_cycles": len(priced),
@@ -356,7 +422,7 @@ def build_review(db: Session, portfolio_id: int = 1) -> dict:
             "avg_loss_days": _q(Decimal(sum(loss_days)) / Decimal(len(loss_days)))
             if loss_days else ZERO,
             "addon_below_avg": sum(c.addon_below_avg for c in priced),
-            "same_day_flips": len(state["same_day_flips"]),
+            "same_day_flips": len(t_trades),
             "t_trades": len(t_trades),
             "t_wins": len(t_wins),
             "t_losses": len(t_losses),
@@ -694,9 +760,13 @@ def enrich_holding_stop_levels(items: list[dict]) -> list[dict]:
 
 
 def _latest_closed_cycles(
-    cycles: list[dict], open_symbols: set[str], today: date
+    cycles: list[dict],
+    open_symbols: set[str],
+    today: date,
+    cutoff: date | None = None,
 ) -> list[dict]:
-    cutoff = today - timedelta(days=REENTRY_LOOKBACK_DAYS)
+    if cutoff is None:
+        cutoff = today - timedelta(days=REENTRY_LOOKBACK_DAYS)
     latest: dict[str, dict] = {}
     for cycle in cycles:
         symbol = cycle["symbol"]
@@ -720,9 +790,10 @@ def _build_reentry_candidates(
     today: date,
     quotes: dict[str, dict],
     histories: dict[str, dict[str, Decimal]],
+    cutoff: date | None = None,
 ) -> list[dict]:
     candidates = []
-    for cycle in _latest_closed_cycles(cycles, open_symbols, today):
+    for cycle in _latest_closed_cycles(cycles, open_symbols, today, cutoff):
         symbol = cycle["symbol"]
         exit_day = trade_us_session_date(cycle["ended_at"])
         closes = histories.get(symbol, {})
@@ -884,9 +955,14 @@ def _build_allocation(positions: list[dict], cash: Decimal) -> dict:
     }
 
 
-def build_strategy(db: Session, portfolio_id: int = 1) -> dict:
+def build_strategy(
+    db: Session,
+    portfolio_id: int = 1,
+    start: date | None = None,
+    end: date | None = None,
+) -> dict:
     """Review data plus live position actions and post-exit re-entry candidates."""
-    data = build_review(db, portfolio_id)
+    data = build_review(db, portfolio_id, start, end)
     today = us_equity_session_date()
     open_symbols = {row["symbol"] for row in data["open_positions"]}
     candidate_cycles = _latest_closed_cycles(data["cycles"], open_symbols, today)
@@ -919,6 +995,7 @@ def build_strategy(db: Session, portfolio_id: int = 1) -> dict:
         today,
         quotes,
         histories,
+        cutoff=data["meta"]["start_date"],
     )
     try:
         from app.services.ledger import compute_summary

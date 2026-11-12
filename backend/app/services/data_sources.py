@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 _settings_lock = threading.Lock()
 _ak_gate: threading.BoundedSemaphore | None = None
 _eastmoney_down_until = 0.0
+_yahoo_down_until = 0.0
+_YAHOO_TIMEOUT_SECONDS = 12
+_YAHOO_COOLDOWN_SECONDS = 60
 _longbridge_down_until = 0.0
 _longbridge_ctx: Any = None
 _longbridge_skip_logged = False
@@ -106,7 +109,7 @@ def _run_eastmoney(action: Callable[[], Any]) -> Any:
             if not patched_retry:
                 logger.warning(
                     "东财接口失败（%s）。可在 .env 设置 ENABLE_EASTMONEY_PATCH=true、"
-                    "MAX_WORKERS=1；已配置 TUSHARE_TOKEN 时 A 股会改走 Tushare。",
+                    "MAX_WORKERS=1；A 股日线不足时会改走 Baostock。",
                     exc,
                 )
             raise
@@ -201,13 +204,53 @@ def _bars_from_frame(frame, volume_scale: float = 1.0) -> list[dict]:
     return bars
 
 
+def _mark_yahoo_down() -> None:
+    global _yahoo_down_until
+    _yahoo_down_until = time.time() + _YAHOO_COOLDOWN_SECONDS
+
+
+def _run_yahoo(fn: Callable, label: str):
+    """Yahoo first. A timeout or a failed call skips it for a minute."""
+    if time.time() < _yahoo_down_until:
+        return None
+    holder: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            holder["value"] = fn()
+        except Exception as exc:
+            holder["error"] = exc
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    thread.join(_YAHOO_TIMEOUT_SECONDS)
+    if thread.is_alive():
+        _mark_yahoo_down()
+        logger.warning(
+            "Yahoo 超过 %s 秒没有返回（%s），改走下一级数据源。",
+            _YAHOO_TIMEOUT_SECONDS,
+            label,
+        )
+        return None
+    if "error" in holder:
+        _mark_yahoo_down()
+        logger.warning("Yahoo 失败（%s）: %s", label, holder["error"])
+        return None
+    return holder.get("value")
+
+
 def _yf_bars(symbol: str) -> list[dict]:
     yahoo = _yahoo_symbol(symbol)
     if not yahoo:
         return []
     import yfinance as yf
 
-    frame = yf.Ticker(yahoo).history(period="2y", auto_adjust=False, actions=False)
+    frame = _run_yahoo(
+        lambda: yf.Ticker(yahoo).history(period="2y", auto_adjust=False, actions=False),
+        symbol,
+    )
+    if frame is None:
+        return []
     return _bars_from_frame(frame)
 
 
@@ -247,27 +290,6 @@ def _scale_cn_lots(bars: list[dict]) -> list[dict]:
             bar["v"] *= 100
             if bar["dol"] <= 0:
                 bar["dol"] = bar["c"] * bar["v"]
-    return bars
-
-
-def _tushare_bars(symbol: str) -> list[dict]:
-    token = (_settings().tushare_token or "").strip()
-    coded = _cn_code(symbol)
-    if not token or not coded:
-        return []
-    import tushare as ts
-
-    ticker, suffix = coded
-    pro = ts.pro_api(token)
-    start = (datetime.now() - timedelta(days=800)).strftime("%Y%m%d")
-    frame = pro.daily(ts_code=f"{ticker}.{suffix}", start_date=start)
-    bars = _bars_from_frame(frame, volume_scale=100)
-    for bar in bars:
-        # tushare amount is in thousands of yuan
-        if bar["dol"] > 0:
-            bar["dol"] *= 1000
-        elif bar["v"] > 0:
-            bar["dol"] = bar["c"] * bar["v"]
     return bars
 
 
@@ -372,20 +394,12 @@ def fetch_daily_bars(symbol: str) -> list[dict]:
         logger.warning("AkShare 日线失败 %s: %s", symbol, exc)
         bars = []
     if kind == "cn" and len(bars) < 30:
-        if (_settings().tushare_token or "").strip():
-            try:
-                replacement = _tushare_bars(symbol)
-                if len(replacement) > len(bars):
-                    bars = replacement
-            except Exception as exc:
-                logger.warning("Tushare 日线失败 %s: %s", symbol, exc)
-        if len(bars) < 30:
-            try:
-                replacement = _baostock_bars(symbol)
-                if len(replacement) > len(bars):
-                    bars = replacement
-            except Exception as exc:
-                logger.warning("Baostock 日线失败 %s: %s", symbol, exc)
+        try:
+            replacement = _baostock_bars(symbol)
+            if len(replacement) > len(bars):
+                bars = replacement
+        except Exception as exc:
+            logger.warning("Baostock 日线失败 %s: %s", symbol, exc)
     if kind == "hk" and len(bars) < 30:
         extra = _longbridge_bars(symbol)
         if len(extra) > len(bars):
@@ -434,15 +448,19 @@ def _yf_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
     out = {symbol: {} for symbol in symbols}
     if not mapping:
         return out
-    frame = yf.download(
-        list(dict.fromkeys(mapping.values())),
-        period="5d",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
+    tickers = list(dict.fromkeys(mapping.values()))
+    frame = _run_yahoo(
+        lambda: yf.download(
+            tickers,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        ),
+        ",".join(tickers),
     )
-    if frame is None or frame.empty:
+    if frame is None or getattr(frame, "empty", True):
         return out
     for symbol, yahoo in mapping.items():
         try:

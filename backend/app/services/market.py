@@ -497,26 +497,28 @@ def _fetch_us_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
 def _fetch_global_stock_data_batch(
     symbols: list[str],
 ) -> dict[str, dict[str, Any]]:
-    """US from YFinance. Open A-share and Hong Kong sessions use the Tencent quote."""
+    """US quotes try Yahoo first, then Sina and Tencent. Open A-share and Hong Kong sessions use Tencent."""
     from app.services.bars import cn_session_closed, hk_session_closed
     from app.services.data_sources import fetch_quotes
 
     cn_open = not cn_session_closed()
     hk_open = not hk_session_closed()
-    live: list[str] = []
+    live_local: list[str] = []
     rest: list[str] = []
     for symbol in symbols:
         kind = market_of(symbol)
-        if (kind == "cn" and cn_open) or (kind == "hk" and hk_open):
-            live.append(symbol)
+        if kind == "cn" and cn_open:
+            live_local.append(symbol)
+        elif kind == "hk" and hk_open:
+            live_local.append(symbol)
         else:
             rest.append(symbol)
     out: dict[str, dict[str, Any]] = {symbol: {} for symbol in symbols}
-    if live:
-        for symbol, quote in _fetch_cn_hk_quotes(live).items():
+    if live_local:
+        for symbol, quote in _fetch_cn_hk_quotes(live_local).items():
             if quote.get("price") is not None:
                 out[symbol] = quote
-        rest.extend(symbol for symbol in live if out.get(symbol, {}).get("price") is None)
+        rest.extend(symbol for symbol in live_local if out.get(symbol, {}).get("price") is None)
     if rest:
         for symbol, quote in fetch_quotes(rest).items():
             if quote.get("price") is not None:

@@ -12,4 +12,4 @@ alembic==1.15.2
 yfinance==0.2.66
 akshare==1.17.5
 baostock==0.8.9
-tushare==1.4.21
+akquant==0.3.76

@@ -169,8 +169,8 @@ const cards = computed(() => {
 }
 
 .kpi-card {
-  background: #fff;
-  border: 1px solid #e0e3eb;
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 16px 18px;
   min-height: 108px;
@@ -179,7 +179,7 @@ const cards = computed(() => {
 
 .label {
   font-size: 12px;
-  color: #787b86;
+  color: var(--muted);
   margin-bottom: 8px;
 }
 
@@ -188,7 +188,7 @@ const cards = computed(() => {
   font-weight: 700;
   line-height: 1.25;
   letter-spacing: -0.02em;
-  color: #131722;
+  color: var(--text);
 }
 
 .value .currency,
@@ -207,7 +207,7 @@ const cards = computed(() => {
 .secondary {
   margin-top: 8px;
   font-size: 12px;
-  color: #787b86;
+  color: var(--muted);
 }
 
 .secondary .prefix {

@@ -187,7 +187,26 @@ def _save_frozen(db: Session, symbol: str, bars: list[dict], frozen: date) -> No
         )
     if not fresh:
         return
-    db.add_all(fresh)
+    from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+    # Another request can insert the same symbol and date between the read and
+    # this write. IGNORE keeps the row already stored and writes the rest.
+    stmt = mysql_insert(DailyBar).prefix_with("IGNORE").values(
+        [
+            {
+                "symbol": row.symbol,
+                "bar_date": row.bar_date,
+                "open": row.open,
+                "high": row.high,
+                "low": row.low,
+                "close": row.close,
+                "volume": row.volume,
+                "dollar": row.dollar,
+            }
+            for row in fresh
+        ]
+    )
+    db.execute(stmt)
     db.commit()
 
 
@@ -277,9 +296,12 @@ def _quote_code(symbol: str) -> str:
     return key[1:] if key.startswith(".") else key
 
 
-def open_session_bars(symbols: list[str]) -> dict[str, dict]:
-    """Today's still-open US bar. YFinance first, Sina if that quote is empty. Not stored."""
-    if cash_session_closed():
+def open_session_bars(symbols: list[str], *, when_closed: bool = False) -> dict[str, dict]:
+    """Today's US bar from the live quote. YFinance first, Sina if that quote is empty. Not stored.
+
+    Closed sessions return nothing unless the caller still needs a bar the daily series missed.
+    """
+    if cash_session_closed() and not when_closed:
         return {}
     from app.services.ledger import _as_et, _us_session_date_from_et
     from app.services.market import _SINA_QUOTE_URL, _parse_as_of, _request_text
@@ -360,6 +382,70 @@ def open_session_bars(symbols: list[str]) -> dict[str, dict]:
             "dol": close * volume,
         }
     return found
+
+
+def chart_session_bar(symbol: str, bars: list[dict]) -> dict | None:
+    """Today's bar for the indicator chart when the stored series stops before that session. Not stored."""
+    from app.services.market_scope import market_of
+
+    kind = market_of(symbol)
+    if kind == "hk":
+        return None
+    if kind == "cn":
+        return _cn_chart_bar(symbol, bars)
+    session = us_equity_session_date().isoformat()
+    if bars and bars[-1]["d"] >= session:
+        return None
+    return open_session_bars([symbol], when_closed=True).get(bar_key(symbol))
+
+
+def _cn_chart_bar(symbol: str, bars: list[dict]) -> dict | None:
+    """A-share print for the current Shanghai session, including lunch. Not stored."""
+    from app.services.market import _TENCENT_QUOTE_URL, _parse_as_of, _request_text
+    from app.services.symbols import quote_code
+
+    local = _local_now("Asia/Shanghai", None)
+    session = _local_session(local, 9 * 60 + 30)
+    if bars and bars[-1]["d"] >= session.isoformat():
+        return None
+    code = quote_code(symbol)
+    if not code:
+        return None
+    try:
+        text = _request_text(_TENCENT_QUOTE_URL.format(symbols=code))
+    except Exception:
+        return None
+    match = re.search(rf'v_{re.escape(code)}="([^"]*)"', text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    fields = match.group(1).split("~")
+    if len(fields) < 35:
+        return None
+    stamp = _parse_as_of(fields[30] if len(fields) > 30 else None)
+    if stamp is None or stamp.date() != session:
+        return None
+    try:
+        close = float(fields[3])
+        opened = float(fields[5] or close)
+        high = float(fields[33] or close)
+        low = float(fields[34] or close)
+        lots = float(fields[6] or 0)
+        amount_wan = float(fields[37] or 0) if len(fields) > 37 else 0.0
+    except (TypeError, ValueError):
+        return None
+    if close <= 0:
+        return None
+    volume = lots * 100
+    dollar = amount_wan * 10000 if amount_wan > 0 else close * volume
+    return {
+        "d": session.isoformat(),
+        "o": opened,
+        "h": high,
+        "l": low,
+        "c": close,
+        "v": volume,
+        "dol": dollar,
+    }
 
 
 def append_open_bar(bars: list[dict], bar: dict | None) -> list[dict]:

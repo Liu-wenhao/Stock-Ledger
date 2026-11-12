@@ -8,6 +8,7 @@ history file. Index paths are the Sina daily bars for the S&P 500 and Nasdaq.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -19,7 +20,10 @@ from statistics import median, mean
 from app.services.bars import chart_since
 from app.services.market import _request_text
 
+logger = logging.getLogger(__name__)
+
 _CACHE_SECONDS = 600
+_LIVE_BREADTH_SECONDS = 180
 _lock = threading.Lock()
 _caches: dict[str, dict] = {}
 
@@ -555,9 +559,9 @@ def arms_due(market: str, now: datetime | None = None) -> tuple[date, str] | Non
         return day, "pm"
     local = _new_york_now(now)
     minutes = local.hour * 60 + local.minute
-    if local.weekday() < 5 and 9 * 60 + 30 <= minutes < 16 * 60:
+    if local.weekday() < 5 and 9 * 60 + 30 <= minutes < 17 * 60 + 30:
         return None
-    if local.weekday() < 5 and minutes >= 16 * 60:
+    if local.weekday() < 5 and minutes >= 17 * 60 + 30:
         return local.date(), "pm"
     day = local.date()
     if local.weekday() < 5:
@@ -590,7 +594,121 @@ def _reading_dict(row) -> dict:
         "strong_up": row.strong_up,
         "strong_down": row.strong_down,
         "above_ma20": num(row.above_ma20),
+        "ma_valid": row.ma_valid,
+        "ma_total": row.ma_total,
     }
+
+
+def _remember_breadth_day(db, market: str, day: date, fresh: dict, *, phase: str = "pm", book: str = "legacy") -> None:
+    """One chart row per session. Am fills a blank day; pm overwrites that day's point."""
+    from decimal import Decimal
+
+    from app.models.entities import BreadthDay
+
+    def dec(value, digits="0.01"):
+        if value is None:
+            return None
+        return Decimal(str(value)).quantize(Decimal(digits))
+
+    advancers = int(fresh.get("advancers") or 0)
+    decliners = int(fresh.get("decliners") or 0)
+    unchanged = int(fresh.get("unchanged") or 0)
+    count = advancers + decliners + unchanged
+    breadth = None if not count else round((advancers - decliners) / count * 100, 1)
+    up_ratio = fresh.get("up_ratio")
+    if up_ratio is None and count:
+        up_ratio = round(advancers / count * 100, 1)
+    row = (
+        db.query(BreadthDay)
+        .filter(BreadthDay.market == market, BreadthDay.bar_date == day, BreadthDay.book == book)
+        .one_or_none()
+    )
+    if row is None:
+        db.add(
+            BreadthDay(
+                market=market,
+                bar_date=day,
+                book=book,
+                advancers=advancers,
+                decliners=decliners,
+                unchanged=unchanged,
+                up_ratio=dec(up_ratio),
+                breadth=dec(breadth),
+                arms=dec(fresh.get("arms")),
+                above_ma20=dec(fresh.get("above_ma20")),
+            )
+        )
+        return
+    if phase != "pm":
+        if row.above_ma20 is None and fresh.get("above_ma20") is not None:
+            row.above_ma20 = dec(fresh.get("above_ma20"))
+        return
+    row.advancers = advancers
+    row.decliners = decliners
+    row.unchanged = unchanged
+    row.up_ratio = dec(up_ratio)
+    row.breadth = dec(breadth)
+    if fresh.get("arms") is not None:
+        row.arms = dec(fresh.get("arms"))
+    if fresh.get("above_ma20") is not None:
+        row.above_ma20 = dec(fresh.get("above_ma20"))
+
+
+def _sync_breadth_days_from_arms(db, market: str) -> None:
+    """Pull closed Arms checkpoints into the chart table when a day is still missing."""
+    from app.models.entities import ArmsReading, BreadthDay
+
+    have = {
+        (row.bar_date, row.book)
+        for row in db.query(BreadthDay.bar_date, BreadthDay.book).filter(BreadthDay.market == market).all()
+    }
+    readings = (
+        db.query(ArmsReading)
+        .filter(ArmsReading.market == market, ArmsReading.book != "legacy")
+        .order_by(ArmsReading.bar_date.asc(), ArmsReading.phase.asc())
+        .all()
+    )
+    best: dict[tuple, object] = {}
+    for row in readings:
+        key = (row.bar_date, row.book or "legacy")
+        prior = best.get(key)
+        if prior is None or row.phase == "pm":
+            best[key] = row
+    changed = False
+    for (day, book), row in best.items():
+        if (day, book) in have:
+            if row.above_ma20 is None:
+                continue
+            chart = (
+                db.query(BreadthDay)
+                .filter(BreadthDay.market == market, BreadthDay.bar_date == day, BreadthDay.book == book)
+                .one_or_none()
+            )
+            if chart is not None and chart.above_ma20 is None:
+                from decimal import Decimal
+
+                chart.above_ma20 = Decimal(str(row.above_ma20))
+                changed = True
+            continue
+        _remember_breadth_day(
+            db,
+            market,
+            day,
+            {
+                "advancers": row.advancers,
+                "decliners": row.decliners,
+                "unchanged": row.unchanged,
+                "up_ratio": None if row.up_ratio is None else float(row.up_ratio),
+                "arms": None if row.arms is None else float(row.arms),
+                "above_ma20": None if row.above_ma20 is None else float(row.above_ma20),
+            },
+            phase=row.phase,
+            book=book,
+        )
+        changed = True
+        have.add((day, book))
+    if changed:
+        db.commit()
 
 
 def _save_arms_reading(db, market: str, day: date, phase: str, fresh: dict):
@@ -615,16 +733,50 @@ def _save_arms_reading(db, market: str, day: date, phase: str, fresh: dict):
         strong_up=None if fresh.get("strong_up") is None else int(fresh["strong_up"]),
         strong_down=None if fresh.get("strong_down") is None else int(fresh["strong_down"]),
         universe=str(fresh.get("universe") or ""),
+        above_ma20=dec(fresh.get("above_ma20")),
+        book=str(fresh.get("book") or "legacy"),
     )
     db.add(row)
+    _remember_breadth_day(db, market, day, fresh, phase=phase, book=row.book)
     db.commit()
     return row
 
 
-def _cn_live_prices() -> list[tuple[str, float]]:
+_MA_COVERAGE = 0.9
+_CN_LIST = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
+_LISTS = {
+    "cn": _CN_LIST,
+    "us": "m:105,m:106,m:107",
+}
+
+
+def _is_bse(code: str) -> bool:
+    """Beijing Stock Exchange. These codes share Shenzhen's venue number."""
+    return code.startswith(("92", "8", "4"))
+
+
+def _quote_books(market: str, venue: int) -> list[str]:
+    if market == "cn":
+        books = ["cn_all"]
+        if venue == 1:
+            books.append("sse")
+        elif venue == 0:
+            books.append("szse")
+        return books
+    books = ["us_all"]
+    if venue == 105:
+        books.append("nyse")
+    elif venue == 106:
+        books.append("nasdaq")
+    return books
+
+
+def _live_prices(market: str) -> list[dict]:
     """Names that traded today, with the latest print. Lunch still shows the morning print."""
     url = "https://push2.eastmoney.com/api/qt/clist/get"
-    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+    fs = _LISTS.get(market)
+    if not fs:
+        return []
     page_size = 100
 
     def page(pn: int) -> dict:
@@ -651,6 +803,8 @@ def _cn_live_prices() -> list[tuple[str, float]]:
 
     first = page(1)
     rows = list(first.get("diff") or [])
+    if isinstance(rows, dict):
+        rows = list(rows.values())
     try:
         total = int(first.get("total") or 0)
     except (TypeError, ValueError):
@@ -658,25 +812,116 @@ def _cn_live_prices() -> list[tuple[str, float]]:
     pages = max(1, (total + page_size - 1) // page_size)
     if pages > 1:
         with ThreadPoolExecutor(max_workers=8) as pool:
-            for batch in pool.map(page, range(2, pages + 1)):
-                rows.extend(batch.get("diff") or [])
-    prices: list[tuple[str, float]] = []
+            for batch in pool.map(page, range(2, min(pages, 160) + 1)):
+                diff = batch.get("diff") or []
+                if isinstance(diff, dict):
+                    diff = list(diff.values())
+                rows.extend(diff)
+    prices: list[dict] = []
+    seen: set[str] = set()
     for row in rows:
-        code = str(row.get("f12") or "")
-        if not code:
+        code = str(row.get("f12") or "").strip().upper()
+        if not code or code in seen:
             continue
-        prefix = "sh" if str(row.get("f13")) == "1" else "sz" if str(row.get("f13")) == "0" else ""
-        if not prefix:
-            continue
+        raw_venue = row.get("f13")
         try:
+            venue = int(float(raw_venue)) if raw_venue not in (None, "") else -1
             price = float(row.get("f2"))
             volume = float(row.get("f5") or 0)
         except (TypeError, ValueError):
             continue
         if price <= 0 or volume <= 0:
             continue
-        prices.append((f"{prefix}{code}", price))
+        if market == "cn" and _is_bse(code):
+            venue = 2
+        elif market == "cn" and venue not in {0, 1}:
+            if code.startswith(("6", "9")):
+                venue = 1
+            elif code.startswith(("0", "3")):
+                venue = 0
+            else:
+                continue
+        if market == "us" and venue not in {105, 106, 107}:
+            continue
+        seen.add(code)
+        if market == "cn":
+            prefix = "sh" if venue == 1 else "bj" if venue == 2 else "sz"
+            symbol = f"{prefix}{code}"
+        else:
+            symbol = code
+        prices.append({"symbol": symbol, "code": code, "venue": venue, "price": price})
+    if market == "cn" and len(prices) < 1000:
+        return _cn_sina_prices()
     return prices
+
+
+def _cn_sina_prices() -> list[dict]:
+    """A-share prints when the Eastmoney list is short. Same shape as `_live_prices`.
+    Sina's ticktime is only a clock, so the last trade is the current session's print.
+    """
+    prices: list[dict] = []
+    seen: set[str] = set()
+    for item in _sina_pages(_sina_cn_page, 80, 80):
+        symbol = str(item.get("symbol") or "").strip().lower()
+        code = str(item.get("code") or "").strip().upper()
+        if not symbol or not code or code in seen:
+            continue
+        try:
+            price = float(item.get("trade") or 0)
+            volume = float(item.get("volume") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or volume <= 0:
+            continue
+        if symbol.startswith("sh"):
+            venue = 1
+        elif symbol.startswith("sz"):
+            venue = 0
+        elif symbol.startswith("bj") or _is_bse(code):
+            venue = 2
+        else:
+            continue
+        seen.add(code)
+        prices.append({"symbol": symbol, "code": code, "venue": venue, "price": price})
+    return prices
+
+
+def _us_anchor_sum(code: str, venue: int, through: date) -> float | None:
+    """Sum of the 19 completed US closes on or before `through`. Raw prices, same list as the quote."""
+    try:
+        text = _request_text(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={
+                "secid": f"{venue}.{code}",
+                "klt": "101",
+                "fqt": "0",
+                "beg": (through - timedelta(days=70)).strftime("%Y%m%d"),
+                "end": through.strftime("%Y%m%d"),
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f53",
+            },
+            referer="https://quote.eastmoney.com/",
+            encoding="utf-8",
+            timeout=8,
+        )
+        klines = ((json.loads(text).get("data") or {}).get("klines")) or []
+    except Exception:
+        return None
+    limit = through.isoformat()
+    closes: list[float] = []
+    for row in klines:
+        parts = str(row).split(",")
+        if len(parts) < 2 or parts[0] > limit:
+            continue
+        try:
+            price = float(parts[1])
+        except ValueError:
+            continue
+        if price > 0:
+            closes.append(price)
+    if len(closes) < 19:
+        return None
+    return sum(closes[-19:])
 
 
 def _anchor_sum(code: str, through: date) -> float | None:
@@ -687,142 +932,616 @@ def _anchor_sum(code: str, through: date) -> float | None:
     return sum(closes[-19:])
 
 
-def _fill_cn_above_ma20(day: date, phase: str) -> None:
+def _fill_above_ma20(market: str, day: date, phase: str) -> None:
+    """Per-book share of names above their own MA20. Written only at 90% coverage."""
     from decimal import Decimal
 
     from app.core.database import SessionLocal
-    from app.models.entities import ArmsReading, MaAnchor
+    from app.models.entities import ArmsReading, BreadthDay, MaAnchor
 
+    if market not in _LISTS:
+        return
     through = _previous_weekday(day)
-    prices = _cn_live_prices()
-    if len(prices) < 1000:
+    prices = _live_prices(market)
+    minimum = 1000 if market == "cn" else 800
+    if len(prices) < minimum:
         return
     db = SessionLocal()
     try:
-        db.query(MaAnchor).filter(MaAnchor.market == "cn", MaAnchor.through_date != through).delete()
+        db.query(MaAnchor).filter(MaAnchor.market == market, MaAnchor.through_date != through).delete()
         stored = {
             row.symbol: float(row.close_sum)
-            for row in db.query(MaAnchor).filter(MaAnchor.market == "cn", MaAnchor.through_date == through).all()
+            for row in db.query(MaAnchor).filter(MaAnchor.market == market, MaAnchor.through_date == through).all()
         }
-        missing = [symbol for symbol, _price in prices if symbol not in stored]
-        if missing:
+        missing = [item for item in prices if item["symbol"] not in stored]
+
+        def anchor(item: dict) -> tuple[str, float | None]:
+            if market == "cn":
+                return item["symbol"], _anchor_sum(item["symbol"], through)
+            return item["symbol"], _us_anchor_sum(item["code"], item["venue"], through)
+
+        def remember(found: list[tuple[str, float]]) -> None:
+            if not found:
+                return
+            db.add_all(
+                [
+                    MaAnchor(market=market, symbol=symbol, through_date=through, close_sum=Decimal(str(round(total, 4))))
+                    for symbol, total in found
+                ]
+            )
+            db.commit()
+            stored.update(found)
+
+        def fetch(items: list[dict]) -> None:
             found: list[tuple[str, float]] = []
             with ThreadPoolExecutor(max_workers=16) as pool:
-                for symbol, total in zip(missing, pool.map(lambda code: _anchor_sum(code, through), missing)):
-                    if total is not None:
-                        found.append((symbol, total))
-            if found:
-                db.add_all(
-                    [
-                        MaAnchor(market="cn", symbol=symbol, through_date=through, close_sum=Decimal(str(round(total, 4))))
-                        for symbol, total in found
-                    ]
+                for symbol, total in pool.map(anchor, items):
+                    if total is None:
+                        continue
+                    found.append((symbol, total))
+                    if len(found) >= 250:
+                        remember(found)
+                        found = []
+            remember(found)
+
+        if missing:
+            fetch(missing)
+            missing = [item for item in prices if item["symbol"] not in stored]
+            if missing and len(stored) >= len(prices) * 0.5:
+                fetch(missing)
+        buckets = {
+            key: {"above": 0, "valid": 0, "total": 0}
+            for key, _label, _pair in _BOOKS[market]
+        }
+        for item in prices:
+            total = stored.get(item["symbol"])
+            above = total is not None and item["price"] > (total + item["price"]) / 20
+            for book in _quote_books(market, item["venue"]):
+                slot = buckets[book]
+                slot["total"] += 1
+                if total is None:
+                    continue
+                slot["valid"] += 1
+                if above:
+                    slot["above"] += 1
+        for book, slot in buckets.items():
+            row = (
+                db.query(ArmsReading)
+                .filter(
+                    ArmsReading.market == market,
+                    ArmsReading.bar_date == day,
+                    ArmsReading.phase == phase,
+                    ArmsReading.book == book,
                 )
-                db.commit()
-                stored.update(found)
-        above = valid = 0
-        for symbol, price in prices:
-            total = stored.get(symbol)
-            if total is None:
+                .one_or_none()
+            )
+            if row is None:
                 continue
-            valid += 1
-            if price > (total + price) / 20:
-                above += 1
-        if valid < 50 or valid < len(prices) * 0.6:
-            return
-        row = (
-            db.query(ArmsReading)
-            .filter(ArmsReading.market == "cn", ArmsReading.bar_date == day, ArmsReading.phase == phase)
-            .one_or_none()
-        )
-        if row is None or row.above_ma20 is not None:
-            return
-        row.above_ma20 = Decimal(str(round(above / valid * 100, 1)))
+            covered = slot["total"] > 0 and slot["valid"] >= 50 and slot["valid"] >= slot["total"] * _MA_COVERAGE
+            if not covered and slot["valid"] < slot["total"] * 0.5:
+                continue
+            row.ma_valid = slot["valid"]
+            row.ma_total = slot["total"]
+            if row.above_ma20 is None and covered:
+                row.above_ma20 = Decimal(str(round(slot["above"] / slot["valid"] * 100, 1)))
+            chart = (
+                db.query(BreadthDay)
+                .filter(BreadthDay.market == market, BreadthDay.bar_date == day, BreadthDay.book == book)
+                .one_or_none()
+            )
+            if chart is not None and chart.above_ma20 is None and row.above_ma20 is not None:
+                chart.above_ma20 = row.above_ma20
         db.commit()
     finally:
         db.close()
 
 
-_ma20_running = False
+_ma20_running: set[str] = set()
 
 
-def _schedule_cn_above_ma20(day: date, phase: str) -> None:
-    global _ma20_running
-    if _ma20_running:
+def _schedule_above_ma20(market: str, day: date, phase: str) -> None:
+    if market in _ma20_running:
         return
-    _ma20_running = True
+    _ma20_running.add(market)
 
     def work() -> None:
-        global _ma20_running
         try:
-            _fill_cn_above_ma20(day, phase)
+            _fill_above_ma20(market, day, phase)
         finally:
-            _ma20_running = False
+            _ma20_running.discard(market)
 
-    threading.Thread(target=work, daemon=True, name="cn-above-ma20").start()
+    threading.Thread(target=work, daemon=True, name=f"{market}-above-ma20").start()
+
+
+_BOOKS = {
+    "us": (
+        ("us_all", "美股全市场", ""),
+        ("nyse", "纽交所", "标普 500"),
+        ("nasdaq", "纳斯达克", "纳斯达克"),
+    ),
+    "cn": (
+        ("cn_all", "沪深全A", "中证全指"),
+        ("sse", "上证", "上证指数"),
+        ("szse", "深市", "深证成指"),
+    ),
+}
+
+
+def _default_book(market: str) -> str:
+    books = _BOOKS.get(market) or ()
+    return books[0][0] if books else ""
+
+
+def _book_meta(book: str) -> tuple[str, str]:
+    for books in _BOOKS.values():
+        for key, label, pair in books:
+            if key == book:
+                return label, pair
+    return book, ""
+
+
+def _clist_page(fs: str, fields: str, page: int) -> dict | None:
+    try:
+        text = _request_text(
+            "https://push2.eastmoney.com/api/qt/clist/get",
+            params={
+                "pn": str(page),
+                "pz": "100",
+                "po": "1",
+                "np": "1",
+                "fltt": "2",
+                "invt": "2",
+                "fid": "f12",
+                "fs": fs,
+                "fields": fields,
+            },
+            referer="https://quote.eastmoney.com/",
+            encoding="utf-8",
+            timeout=12,
+        )
+        return json.loads(text).get("data") or {}
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _clist_rows(fs: str, fields: str) -> list[dict]:
+    """One page at a time. A failed page is retried once, then the scan stops."""
+    rows: list[dict] = []
+    total = None
+    for page in range(1, 121):
+        data = _clist_page(fs, fields, page)
+        if data is None:
+            time.sleep(2)
+            data = _clist_page(fs, fields, page)
+        if not data:
+            break
+        if total is None:
+            try:
+                total = int(data.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+        batch = data.get("diff") or []
+        if isinstance(batch, dict):
+            batch = list(batch.values())
+        if not batch:
+            break
+        rows.extend(batch)
+        if total and len(rows) >= total:
+            break
+        if len(batch) < 100:
+            break
+        time.sleep(0.5)
+    return rows
+
+
+def _change_and_size(row: dict, amount: bool) -> tuple[float, float, float] | None:
+    try:
+        if "f3" in row:
+            change = float(row.get("f3"))
+            volume = float(row.get("f5") or 0)
+            size = float(row.get("f6") or 0) if amount else volume
+        else:
+            raw_change = row.get("chg")
+            if raw_change in (None, ""):
+                raw_change = row.get("changepercent")
+            change = float(raw_change)
+            volume = float(row.get("volume") or 0)
+            turnover = float(row.get("amount") or 0)
+            size = turnover if amount and turnover > 0 else volume
+    except (TypeError, ValueError):
+        return None
+    return change, volume, size
+
+
+def _tally_rows(rows: list[dict], *, amount: bool, label: str) -> dict | None:
+    up = down = flat = 0
+    up_size = down_size = 0.0
+    for row in rows:
+        parsed = _change_and_size(row, amount)
+        if parsed is None:
+            continue
+        change, volume, size = parsed
+        if volume <= 0:
+            continue
+        if change > 0:
+            up += 1
+            up_size += size
+        elif change < 0:
+            down += 1
+            down_size += size
+        else:
+            flat += 1
+    return _breadth_payload(label, up, down, flat, _arms_value(up, down, up_size, down_size), minimum=80)
+
+
+_SINA_US_LIST = (
+    "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/"
+    "IO.XSRV2.CallbackList/US_CategoryService.getList"
+)
+_SINA_CN_LIST = (
+    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    "Market_Center.getHQNodeData"
+)
+
+
+def _sina_us_page(page: int) -> list[dict]:
+    """One page of the Sina US list. The body is JSONP, sometimes preceded by a redirect stub."""
+    text = _request_text(
+        _SINA_US_LIST,
+        params={"page": str(page), "num": "20", "sort": "", "asc": "0", "market": "", "id": ""},
+        referer="https://finance.sina.com.cn/",
+        encoding="utf-8",
+        timeout=8,
+    )
+    match = re.search(r"\((\{.*\})\)", text, flags=re.DOTALL)
+    if not match:
+        return []
+    payload = json.loads(match.group(1))
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    return [row for row in rows or [] if isinstance(row, dict)]
+
+
+def _sina_cn_page(page: int) -> list[dict]:
+    """One page of Sina's Shanghai and Shenzhen A-share list, including Beijing names."""
+    text = _request_text(
+        _SINA_CN_LIST,
+        params={"page": str(page), "num": "80", "sort": "symbol", "asc": "1", "node": "hs_a"},
+        referer="https://finance.sina.com.cn/",
+        encoding="utf-8",
+        timeout=8,
+    )
+    rows = json.loads(text)
+    return [row for row in rows or [] if isinstance(row, dict)]
+
+
+def _sina_pages(fetch, page_size: int, limit: int) -> list[dict]:
+    rows: list[dict] = []
+    for page in range(1, limit + 1):
+        try:
+            batch = fetch(page)
+        except Exception:
+            time.sleep(2)
+            try:
+                batch = fetch(page)
+            except Exception:
+                break
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        time.sleep(0.5)
+    return rows
+
+
+def _scan_us_sina() -> dict[str, list]:
+    groups = {"us_all": [], "nyse": [], "nasdaq": []}
+    for item in _sina_pages(_sina_us_page, 20, 80):
+        groups["us_all"].append(item)
+        venue = str(item.get("market") or item.get("exchange") or "").upper()
+        if "NASDAQ" in venue:
+            groups["nasdaq"].append(item)
+        elif "NYSE" in venue:
+            groups["nyse"].append(item)
+    if not groups["nyse"] or not groups["nasdaq"]:
+        return {"us_all": [], "nyse": [], "nasdaq": []}
+    return groups
+
+
+def _scan_us_groups() -> dict[str, list]:
+    rows = _clist_rows("m:105,m:106,m:107", "f3,f5,f13")
+    groups = {"us_all": [], "nyse": [], "nasdaq": []}
+    for row in rows:
+        groups["us_all"].append(row)
+        try:
+            venue = int(float(row.get("f13") or 0))
+        except (TypeError, ValueError):
+            venue = 0
+        if venue == 105:
+            groups["nyse"].append(row)
+        elif venue == 106:
+            groups["nasdaq"].append(row)
+    if len(groups["us_all"]) < 800 or not groups["nyse"] or not groups["nasdaq"]:
+        return _scan_us_sina()
+    return groups
+
+
+def _scan_cn_sina() -> list[dict]:
+    rows = []
+    for item in _sina_pages(_sina_cn_page, 80, 80):
+        change = item.get("changepercent")
+        rows.append(
+            {
+                "symbol": item.get("symbol") or "",
+                "code": item.get("code") or "",
+                "chg": change,
+                "volume": item.get("volume") or 0,
+                "amount": item.get("amount") or 0,
+            }
+        )
+    return rows
+
+
+def _scan_cn_groups() -> dict[str, list]:
+    rows = _clist_rows(_CN_LIST, "f3,f5,f6,f12,f13")
+    if len(rows) < 1000:
+        rows = _scan_cn_sina()
+    groups = {"cn_all": [], "sse": [], "szse": []}
+    for row in rows:
+        groups["cn_all"].append(row)
+        code = str(row.get("f12") or row.get("code") or row.get("symbol") or "")
+        if _is_bse(code):
+            continue
+        raw_venue = row.get("f13")
+        venue = "" if raw_venue in (None, "") else str(raw_venue)
+        if venue in {"1", "1.0"} or code.startswith(("sh", "6")):
+            groups["sse"].append(row)
+        elif venue in {"0", "0.0"} or code.startswith(("sz", "0", "3")):
+            groups["szse"].append(row)
+    return groups
+
+
+_book_cache: dict[str, tuple[float, list]] = {}
+_scan_threads: dict[str, threading.Thread] = {}
+_scan_lock = threading.Lock()
+
+
+def _store_books(market: str, groups: dict[str, list]) -> list[dict]:
+    amount = market == "cn"
+    books = []
+    for key, label, pair in _BOOKS[market]:
+        payload = _tally_rows(groups.get(key) or [], amount=amount, label=label)
+        if not payload:
+            continue
+        payload["book"] = key
+        payload["key"] = key
+        payload["pair"] = pair
+        payload["universe"] = f"{label} {payload['count']} 家"
+        books.append(payload)
+    if books:
+        _book_cache[market] = (time.time(), books)
+    return books
+
+
+def _fill_book_cache(market: str) -> None:
+    try:
+        groups = _scan_us_groups() if market == "us" else _scan_cn_groups()
+        _store_books(market, groups)
+    finally:
+        with _scan_lock:
+            _scan_threads.pop(market, None)
+
+
+def scan_market_books(market: str) -> list[dict]:
+    """Return the cached split. A cold or stale cache starts one sequential scan and does not wait on it."""
+    if market not in _BOOKS:
+        return []
+    now = time.time()
+    cached = _book_cache.get(market)
+    if cached and now - cached[0] < _LIVE_BREADTH_SECONDS:
+        return cached[1]
+    with _scan_lock:
+        if market not in _scan_threads:
+            thread = threading.Thread(target=_fill_book_cache, args=(market,), daemon=True, name=f"breadth-{market}")
+            _scan_threads[market] = thread
+            thread.start()
+    return cached[1] if cached else []
+
+
+def scan_pending(market: str) -> bool:
+    return market in _scan_threads
 
 
 _arms_compute_lock = threading.Lock()
 
 
+def _public_reading(row) -> dict:
+    data = _reading_dict(row)
+    label, pair = _book_meta(getattr(row, "book", "") or "")
+    data["key"] = getattr(row, "book", "") or ""
+    data["pair"] = pair
+    if label and data.get("count"):
+        data["universe"] = f"{label} {data['count']} 家"
+    return data
+
+
 def ensure_arms_reading(market: str, now: datetime | None = None):
-    """Return the stored close reading. Scan the market only when that close has no row yet."""
+    """Return the full-market close, plus the other books saved at the same checkpoint."""
     from app.core.database import SessionLocal
     from app.models.entities import ArmsReading
     from app.services.bars import cash_session_closed, remember_breadth
     from app.services.ledger import us_equity_session_date
 
     if market == "hk":
-        return None, ""
+        return None, "", []
     db = SessionLocal()
     try:
         due = arms_due(market, now)
-        row = None
+        rows = []
         if due:
             day, phase = due
-            row = (
-                db.query(ArmsReading)
-                .filter(ArmsReading.market == market, ArmsReading.bar_date == day, ArmsReading.phase == phase)
-                .one_or_none()
-            )
-            if row is None:
-                with _arms_compute_lock:
-                    row = (
-                        db.query(ArmsReading)
-                        .filter(ArmsReading.market == market, ArmsReading.bar_date == day, ArmsReading.phase == phase)
-                        .one_or_none()
+            wanted = {key for key, _label, _pair in _BOOKS.get(market, ())}
+
+            def saved():
+                return (
+                    db.query(ArmsReading)
+                    .filter(
+                        ArmsReading.market == market,
+                        ArmsReading.bar_date == day,
+                        ArmsReading.phase == phase,
+                        ArmsReading.book.in_(wanted),
                     )
-                    if row is None:
-                        fresh = _breadth_a_shares() if market == "cn" else _breadth()
-                        if fresh:
+                    .all()
+                )
+
+            rows = saved()
+            if wanted - {row.book for row in rows}:
+                with _arms_compute_lock:
+                    rows = saved()
+                    missing = wanted - {row.book for row in rows}
+                    if missing:
+                        for fresh in scan_market_books(market):
+                            if fresh["book"] not in missing:
+                                continue
                             row = _save_arms_reading(db, market, day, phase, fresh)
+                            rows.append(row)
                             if (
                                 market == "us"
                                 and phase == "pm"
+                                and fresh["book"] == "us_all"
                                 and cash_session_closed(now)
                                 and us_equity_session_date(now) == day
                             ):
                                 remember_breadth(db, fresh)
-        if row is None:
-            row = (
+        if not rows:
+            latest = (
                 db.query(ArmsReading)
-                .filter(ArmsReading.market == market)
+                .filter(ArmsReading.market == market, ArmsReading.book == _default_book(market))
                 .order_by(ArmsReading.bar_date.desc(), ArmsReading.phase.desc())
                 .first()
             )
-        if row is None:
-            return None, ""
-        if (
-            market == "cn"
-            and due
-            and row.above_ma20 is None
-            and row.bar_date == due[0]
-            and row.phase == due[1]
-        ):
-            _schedule_cn_above_ma20(due[0], due[1])
-        return _reading_dict(row), _arms_caption(row.phase)
+            if latest is not None:
+                rows = (
+                    db.query(ArmsReading)
+                    .filter(
+                        ArmsReading.market == market,
+                        ArmsReading.bar_date == latest.bar_date,
+                        ArmsReading.phase == latest.phase,
+                        ArmsReading.book != "legacy",
+                    )
+                    .all()
+                )
+        primary = next((row for row in rows if row.book == _default_book(market)), None)
+        if primary is None:
+            return None, "", []
+        pending = bool(due) and any(
+            row.ma_total is None and row.bar_date == due[0] and row.phase == due[1]
+            for row in rows
+        )
+        if pending:
+            _schedule_above_ma20(market, due[0], due[1])
+        books = [_public_reading(row) for row in rows]
+        if pending:
+            for item in books:
+                if item.get("ma_total") is None:
+                    item["ma_pending"] = True
+        books.sort(key=lambda item: _book_order(market, item.get("key")))
+        return _public_reading(primary), _arms_caption(primary.phase), books
     finally:
         db.close()
+
+
+_close_stop = threading.Event()
+_close_thread: threading.Thread | None = None
+_CLOSE_MARKETS = ("cn", "us")
+
+
+def _checkpoint_gaps(market: str, day: date, phase: str) -> tuple[bool, bool]:
+    """Whether this close still needs a name list, and whether MA20 is still open."""
+    from app.core.database import SessionLocal
+    from app.models.entities import ArmsReading
+
+    wanted = {key for key, _label, _pair in _BOOKS.get(market, ())}
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(ArmsReading.book, ArmsReading.ma_total)
+            .filter(
+                ArmsReading.market == market,
+                ArmsReading.bar_date == day,
+                ArmsReading.phase == phase,
+                ArmsReading.book.in_(wanted),
+            )
+            .all()
+        )
+    finally:
+        db.close()
+    found = {row.book for row in rows}
+    return bool(wanted - found), any(row.ma_total is None for row in rows)
+
+
+def capture_due_close(market: str) -> None:
+    """Store the finished session once. A later pass only fills MA20."""
+    due = arms_due(market)
+    if not due or market not in _BOOKS:
+        return
+    day, phase = due
+    missing, ma_pending = _checkpoint_gaps(market, day, phase)
+    if not missing and not ma_pending:
+        return
+    if missing:
+        cached = _book_cache.get(market)
+        fresh = bool(cached) and time.time() - cached[0] < _LIVE_BREADTH_SECONDS
+        if not fresh:
+            with _scan_lock:
+                if market in _scan_threads:
+                    return
+                _scan_threads[market] = threading.current_thread()
+            try:
+                logger.warning("close capture scan %s %s %s", market, day.isoformat(), phase)
+                groups = _scan_us_groups() if market == "us" else _scan_cn_groups()
+                _store_books(market, groups)
+            finally:
+                with _scan_lock:
+                    _scan_threads.pop(market, None)
+    elif ma_pending:
+        logger.warning("close capture ma20 %s %s %s", market, day.isoformat(), phase)
+    ensure_arms_reading(market)
+
+
+def _close_loop() -> None:
+    while not _close_stop.is_set():
+        for market in _CLOSE_MARKETS:
+            if _close_stop.is_set():
+                return
+            try:
+                capture_due_close(market)
+            except Exception:
+                logger.exception("close capture failed for %s", market)
+        _close_stop.wait(60)
+
+
+def start_close_capture() -> None:
+    """After each cash close, store breadth, Arms, and MA20 without a page visit."""
+    global _close_thread
+    if _close_thread and _close_thread.is_alive():
+        return
+    _close_stop.clear()
+    _close_thread = threading.Thread(target=_close_loop, daemon=True, name="close-capture")
+    _close_thread.start()
+    logger.warning("close capture started")
+
+
+def stop_close_capture() -> None:
+    _close_stop.set()
+
+
+def _book_order(market: str, key: str | None) -> int:
+    keys = [item[0] for item in _BOOKS.get(market, ())]
+    try:
+        return keys.index(key or "")
+    except ValueError:
+        return len(keys)
 
 
 _open_counts_cache: dict[str, tuple[float, dict | None]] = {}
@@ -854,7 +1573,7 @@ def _stored_session_counts(market: str) -> dict | None:
     try:
         row = (
             db.query(BreadthDay)
-            .filter(BreadthDay.market == market)
+            .filter(BreadthDay.market == market, BreadthDay.book == _default_book(market))
             .order_by(BreadthDay.bar_date.desc())
             .first()
         )
@@ -866,7 +1585,8 @@ def _stored_session_counts(market: str) -> dict | None:
     count = up + down + flat
     if count <= 0:
         return None
-    universe = "市值前 500 只美股" if market == "us" else "沪深A股"
+    label, _pair = _book_meta(_default_book(market))
+    universe = label or ("美股" if market == "us" else "沪深A股")
     return {
         "universe": universe,
         "count": count,
@@ -882,55 +1602,61 @@ def _stored_session_counts(market: str) -> dict | None:
     }
 
 
-def _open_session_counts(market: str) -> dict | None:
-    """上涨、下跌、占比、宽度 while the session is still printing. Arms stays empty."""
+def _open_session_counts(market: str) -> list[dict] | None:
+    """Live advance/decline and Arms. This print is not written onto the daily chart."""
     if arms_due(market) is not None:
         return None
     now = time.time()
+    live = [dict(item) for item in scan_market_books(market)]
+    if live:
+        return live
     cached = _open_counts_cache.get(market)
-    if cached and now - cached[0] < _CACHE_SECONDS:
+    if cached and now - cached[0] < 30:
         return cached[1]
-    fresh = _breadth() if market == "us" else _cn_board_counts()
-    prior = None
-    if fresh:
-        fresh = dict(fresh)
-        fresh["arms"] = None
-    else:
-        prior = _stored_session_counts(market)
-        fresh = prior
-    _open_counts_cache[market] = (now if fresh else now - _CACHE_SECONDS + 30, fresh)
-    return fresh
+    prior = _stored_session_counts(market)
+    if prior:
+        prior["key"] = _default_book(market)
+        prior["pair"] = _book_meta(prior["key"])[1]
+        live = [prior]
+    _open_counts_cache[market] = (now if live else now - 15, live)
+    return live
 
 
 def _attach_arms_reading(payload: dict, market: str) -> None:
-    live = _open_session_counts(market)
-    if live:
-        breadth = {key: value for key, value in live.items() if key != "prior_date"}
+    def finish(breadth: dict | None, books: list[dict], extra: str) -> None:
         if market == "us":
             label, tone, note = _read(breadth, payload.get("vix") or {})
         else:
-            label, tone, note = _read_ratio(breadth, breadth.get("universe") or "沪深A股")
-        if live.get("prior_date"):
-            note = f"{note}涨跌家数是 {live['prior_date']} 的。"
-        note = f"{note}阿姆士收盘后才计算。"
+            label, tone, note = _read_ratio(breadth, (breadth or {}).get("universe") or "沪深A股")
+        if extra:
+            note = f"{note}{extra}"
+        if market == "us" and breadth and breadth.get("arms") is not None:
+            note = f"{note}按成分自算，不是交易所发布的 TRIN。"
         payload["breadth"] = breadth
+        payload["books"] = books
         payload["label"] = label
         payload["tone"] = tone
         payload["note"] = note
+
+    live = _open_session_counts(market)
+    if live is not None:
+        if not live and scan_pending(market):
+            finish(None, [], "正在分批读取涨跌家数和阿姆士。")
+            return
+        books = [{key: value for key, value in item.items() if key != "prior_date"} for item in live]
+        primary = next((item for item in books if item.get("key") == _default_book(market)), books[0] if books else None)
+        extra = "这是盘中这一刻，历史图仍用收盘。"
+        dated = next((item.get("prior_date") for item in live if item.get("prior_date")), None)
+        if dated:
+            extra = f"涨跌家数是 {dated} 的。阿姆士收盘后才写入历史。"
+        finish(primary, books, extra)
         return
-    breadth, caption = ensure_arms_reading(market)
-    if market == "us":
-        label, tone, note = _read(breadth, payload.get("vix") or {})
+    breadth, caption, books = ensure_arms_reading(market)
+    if breadth is None and scan_pending(market):
+        extra = "正在分批读取这一套的涨跌家数。"
     else:
-        label, tone, note = _read_ratio(breadth, "沪深A股")
-    if breadth is None:
-        note = "还没有收盘结果，阿姆士先空着。"
-    elif caption:
-        note = f"{note}{caption}"
-    payload["breadth"] = breadth
-    payload["label"] = label
-    payload["tone"] = tone
-    payload["note"] = note
+        extra = caption if breadth else "还没有收盘结果，阿姆士先空着。"
+    finish(breadth, books, extra)
 
 
 def _read_ratio(breadth: dict | None, name: str) -> tuple[str, str, str]:
@@ -948,7 +1674,7 @@ def _read_ratio(breadth: dict | None, name: str) -> tuple[str, str, str]:
 def _breadth_a_shares_eastmoney() -> dict | None:
     """All Shanghai and Shenzhen A-shares. TRIN uses turnover, not share volume."""
     url = "https://push2.eastmoney.com/api/qt/clist/get"
-    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+    fs = _CN_LIST
     page_size = 100
 
     def page(pn: int) -> dict:
@@ -1106,7 +1832,7 @@ def _breadth_hk() -> dict | None:
     return _breadth_payload("港股", up, down, flat, _arms_value(up, down, up_amount, down_amount))
 
 
-_HISTORY_DAYS = 22
+_HISTORY_DAYS = 45
 
 
 def _history_codes(market: str) -> tuple[list[str], bool, float]:
@@ -1305,23 +2031,38 @@ def _aggregate_arms_history(codes: list[str], amount: bool, share_lot: float) ->
 
 
 def fill_above_ma20(db, market: str) -> int:
-    """Write the MA20 breadth onto stored sessions without rewriting Arms."""
+    """Write MA20 breadth onto days that still lack it. Do not rewrite Arms or existing MA20."""
     from decimal import Decimal
 
-    from app.models.entities import BreadthDay
+    from app.models.entities import ArmsReading, BreadthDay
 
     fresh = build_arms_history(market)
+    book = _default_book(market)
     rows = {
         row.bar_date.isoformat(): row
-        for row in db.query(BreadthDay).filter(BreadthDay.market == market).all()
+        for row in db.query(BreadthDay).filter(BreadthDay.market == market, BreadthDay.book == book).all()
     }
+    readings = (
+        db.query(ArmsReading)
+        .filter(ArmsReading.market == market, ArmsReading.book == book, ArmsReading.above_ma20.is_(None))
+        .all()
+    )
+    by_day: dict[str, list] = {}
+    for row in readings:
+        by_day.setdefault(row.bar_date.isoformat(), []).append(row)
     changed = 0
     for point in fresh:
-        row = rows.get(point["date"])
-        if row is None or point.get("above_ma20") is None:
+        value = point.get("above_ma20")
+        if value is None:
             continue
-        row.above_ma20 = Decimal(str(point["above_ma20"]))
-        changed += 1
+        number = Decimal(str(value))
+        row = rows.get(point["date"])
+        if row is not None and row.above_ma20 is None:
+            row.above_ma20 = number
+            changed += 1
+        for reading in by_day.get(point["date"], []):
+            reading.above_ma20 = number
+            changed += 1
     if changed:
         db.commit()
     return changed
@@ -1351,50 +2092,26 @@ def build_arms_history(market: str) -> list[dict]:
     return points
 
 
-def breadth_history_payload(db, market: str) -> dict:
-    from decimal import Decimal
-
+def breadth_history_payload(db, market: str, book: str = "") -> dict:
     from app.models.entities import BreadthDay
 
     market = market if market in {"us", "cn", "hk"} else "us"
+    book = book or _default_book(market)
+    _sync_breadth_days_from_arms(db, market)
     stored = (
         db.query(BreadthDay)
-        .filter(BreadthDay.market == market)
+        .filter(BreadthDay.market == market, BreadthDay.book == book)
         .order_by(BreadthDay.bar_date.asc())
         .all()
     )
-    if len(stored) < 15:
-        fresh = build_arms_history(market)
-        have = {row.bar_date.isoformat() for row in stored}
-        for point in fresh:
-            if point["date"] in have:
-                continue
-            db.add(
-                BreadthDay(
-                    market=market,
-                    bar_date=point["date"],
-                    advancers=point["advancers"],
-                    decliners=point["decliners"],
-                    unchanged=point["unchanged"],
-                    up_ratio=None if point["up_ratio"] is None else Decimal(str(point["up_ratio"])),
-                    breadth=None if point["breadth"] is None else Decimal(str(point["breadth"])),
-                    arms=None if point["arms"] is None else Decimal(str(point["arms"])),
-                    above_ma20=None if point.get("above_ma20") is None else Decimal(str(point["above_ma20"])),
-                )
-            )
-        if fresh:
-            db.commit()
-            stored = (
-                db.query(BreadthDay)
-                .filter(BreadthDay.market == market)
-                .order_by(BreadthDay.bar_date.asc())
-                .all()
-            )
     basis = "成交量" if market == "us" else "成交额"
-    universe = {"us": "市值前 500 只美股", "cn": "沪深A股", "hk": "港股"}[market]
+    label, pair = _book_meta(book)
+    universe = label or {"us": "美股", "cn": "沪深A股", "hk": "港股"}[market]
+    if pair:
+        universe = f"{universe}，对照{pair}"
     notes = {
-        "us": "阿姆士按成交股数计算。高于 MA20 用未复权收盘价，上市不满 20 天和当日没有成交的不计入。",
-        "cn": "历史成交额按收盘价乘成交股数，和卡片上的交易所成交额会有一点差别。高于 MA20 用未复权收盘价，上市不满 20 天和当日没有成交的不计入。",
+        "us": "按这一套成分的涨跌家数和成交股数自算，不是交易所发布的 TRIN。高于 MA20 用未复权收盘价，样本太大时这一格先空着。",
+        "cn": "按这一套成分的涨跌家数和成交额自算。高于 MA20 用未复权收盘价，样本太大时这一格先空着。",
         "hk": "港股日线这会儿没有返回，历史图先空着。",
     }
     note = notes[market]

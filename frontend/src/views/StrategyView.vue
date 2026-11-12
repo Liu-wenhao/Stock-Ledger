@@ -1,22 +1,38 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import dayjs from 'dayjs'
 import {
   AimOutlined,
   ArrowRightOutlined,
-  CalendarOutlined,
   CheckCircleOutlined,
   ClockCircleOutlined,
   PieChartOutlined,
   ReloadOutlined,
   SafetyOutlined,
 } from '@ant-design/icons-vue'
-import { fetchTradingStrategy } from '@/api/portfolio'
+import { fetchTradingStrategy, fetchBacktest } from '@/api/portfolio'
 import { formatMoney, formatPct, pnlClass, tickerOf } from '@/utils/format'
 
 const data = ref(null)
 const loading = ref(true)
 const error = ref('')
+const range = ref([dayjs().subtract(1, 'month'), dayjs()])
+const rangePresets = [
+  { label: '近1个月', value: [dayjs().subtract(1, 'month'), dayjs()] },
+  { label: '近3个月', value: [dayjs().subtract(3, 'month'), dayjs()] },
+  { label: '今年', value: [dayjs().startOf('year'), dayjs()] },
+]
 const candidateFilter = ref('ready')
+const backtest = ref(null)
+const backtestLoading = ref(false)
+const backtestError = ref('')
+const backtestRange = ref(range.value.map((day) => day.clone()))
+const backtestPresets = rangePresets
+let backtestRangeCustom = false
+watch(range, (value) => {
+  if (backtestRangeCustom || !value?.[0] || !value?.[1]) return
+  backtestRange.value = value.map((day) => day.clone())
+})
 
 const capital = computed(() => data.value?.capital || {})
 const allocation = computed(() => data.value?.allocation || null)
@@ -65,11 +81,11 @@ const filteredCandidates = computed(() => {
   if (candidateFilter.value === 'watching') return watchingCandidates.value
   return candidates.value.filter((c) => c.status === candidateFilter.value)
 })
-const reviewPeriod = computed(() => {
-  const meta = data.value?.meta
-  if (!meta?.first_trade_at || !meta?.last_trade_at) return '暂无交易记录'
-  return `${meta.first_trade_at.slice(0, 10).replaceAll('-', '.')} — ${meta.last_trade_at.slice(0, 10).replaceAll('-', '.')}`
-})
+function rangeParams() {
+  const [start, end] = range.value || []
+  if (!start || !end) return {}
+  return { start: start.format('YYYY-MM-DD'), end: end.format('YYYY-MM-DD') }
+}
 
 function gapText(gap) {
   const amount = Number(gap)
@@ -128,7 +144,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const result = await fetchTradingStrategy()
+    const result = await fetchTradingStrategy(rangeParams())
     data.value = result
     if (candidateFilter.value === 'ready' && !result.reentry_candidates?.some((c) => c.status === 'ready')) {
       candidateFilter.value = 'all'
@@ -139,6 +155,47 @@ async function load() {
     loading.value = false
   }
 }
+
+async function runBacktest() {
+  backtestLoading.value = true
+  backtestError.value = ''
+  try {
+    const [start, end] = backtestRange.value || []
+    const params = {}
+    if (start && end) {
+      params.start = start.format('YYYY-MM-DD')
+      params.end = end.format('YYYY-MM-DD')
+    }
+    backtest.value = await fetchBacktest(params)
+  } catch (e) {
+    backtestError.value = e?.message || '回测没有跑完'
+  } finally {
+    backtestLoading.value = false
+  }
+}
+
+function signedPct(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—'
+  const number = Number(value)
+  return `${number > 0 ? '+' : ''}${number.toFixed(2)}%`
+}
+
+function plain(value, digits) {
+  if (value == null || Number.isNaN(Number(value))) return '—'
+  return Number(value).toFixed(digits)
+}
+
+function dotDate(value) {
+  return value ? String(value).slice(0, 10).replaceAll('-', '.') : '—'
+}
+
+const backtestTrades = computed(() => {
+  const rows = []
+  for (const item of backtest.value?.items || []) {
+    for (const trade of item.trades || []) rows.push(trade)
+  }
+  return rows
+})
 
 onMounted(load)
 </script>
@@ -153,7 +210,14 @@ onMounted(load)
       </div>
       <div class="header-actions">
         <router-link class="review-link" to="/review">查看复盘 <span>→</span></router-link>
-        <span v-if="data" class="period-label"><CalendarOutlined />{{ reviewPeriod }}</span>
+        <a-range-picker
+          v-model:value="range"
+          class="period-range"
+          :allow-clear="false"
+          format="YYYY.MM.DD"
+          :presets="rangePresets"
+          @change="load"
+        />
         <a-button class="refresh-button" :loading="loading" @click="load">
           <template #icon><ReloadOutlined /></template>
           刷新策略
@@ -210,6 +274,7 @@ onMounted(load)
           <a href="#strategy-positions">持仓动作</a>
           <a href="#strategy-reentry">再买入观察</a>
           <a href="#strategy-checklist">下单清单</a>
+          <a href="#strategy-backtest">历史回测</a>
           <router-link to="/review" class="nav-next">回看交易数据 <span>→</span></router-link>
         </nav>
 
@@ -531,7 +596,7 @@ onMounted(load)
         </div>
 
         <h2 id="strategy-reentry" class="section-title"><span class="section-number">04</span>清仓后再买入<span class="section-badge">{{ readyCandidates.length }} 只条件满足</span></h2>
-        <p class="section-sub">筛选近 180 天已清仓标的，优先显示满足企稳或突破条件的股票；这是待复核观察名单，不是自动买入。</p>
+        <p class="section-sub">筛选所选区间里已经清仓、现在没有持仓的标的，优先显示满足企稳或突破条件的股票。这是待复核观察名单，不是自动买入。当前持仓的处理不随日期改变。</p>
 
         <div class="reentry-callout" :class="{ positive: readyCandidates.length }">
           <span class="callout-icon">
@@ -641,6 +706,70 @@ onMounted(load)
           <li><span>今天下了几笔？现在是不是 22:30–23:10 之外？</span></li>
         </ol>
 
+        <h2 id="strategy-backtest" class="section-title"><span class="section-number">06</span>历史回测<span class="section-badge">AKQuant</span></h2>
+        <p class="section-sub">一条规则最多缺一项就买入。均线交叉还要近 5 日涨幅超过 4%。持有满 2 日后收盘跌破 20 日线也卖。亏损卖出后，这只暂停 5 个交易日。在选定的日期之间重跑。清空日期则用全部已有日线。每只单独 10 万。这列数字不进累计盈亏。</p>
+        <div class="backtest-bar">
+          <a-range-picker
+            v-model:value="backtestRange"
+            class="period-range backtest-range"
+            format="YYYY.MM.DD"
+            :presets="backtestPresets"
+            :placeholder="['开始日期', '结束日期']"
+            @change="backtestRangeCustom = true"
+          />
+          <a-button class="refresh-button backtest-run" :loading="backtestLoading" @click="runBacktest">重跑一遍</a-button>
+        </div>
+        <a-alert v-if="backtestError" type="error" :message="backtestError" show-icon class="err" />
+        <p v-if="backtest" class="section-sub">{{ backtest.profile }}。{{ backtest.note }}</p>
+        <div v-if="backtest?.items?.length" class="bt-grid">
+          <article v-for="item in backtest.items" :key="item.symbol" class="hero-metric">
+            <span class="metric-icon teal"><AimOutlined /></span>
+            <div>
+              <p>{{ tickerOf(item.symbol) }}<template v-if="item.name"> · {{ item.name }}</template></p>
+              <strong :class="pnlClass(item.return_pct)">{{ item.error && item.return_pct == null ? '—' : signedPct(item.return_pct) }}</strong>
+              <span v-if="item.error && item.return_pct == null">{{ item.error }}</span>
+              <span v-else>{{ item.rule }} · 回撤 {{ item.max_drawdown_pct == null ? '—' : `${item.max_drawdown_pct.toFixed(1)}%` }} · {{ item.closed_trades }} 笔 · 胜率 {{ item.win_rate == null ? '—' : `${item.win_rate.toFixed(0)}%` }}</span>
+            </div>
+          </article>
+        </div>
+        <div v-if="backtestTrades.length" class="table-wrap bt-trades">
+          <table>
+            <thead>
+              <tr>
+                <th>标的</th>
+                <th>成交</th>
+                <th>信号</th>
+                <th>规则</th>
+                <th class="num">这笔</th>
+                <th class="num">RSI</th>
+                <th class="num">动量</th>
+                <th class="num">MA20</th>
+                <th class="num">距均线</th>
+                <th class="num">阿姆士</th>
+                <th class="num">涨 / 跌</th>
+                <th class="num">高于MA20</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(trade, index) in backtestTrades" :key="`${trade.symbol}-${trade.entry}-${index}`">
+                <td class="sym">{{ tickerOf(trade.symbol) }}</td>
+                <td>{{ dotDate(trade.entry) }}</td>
+                <td>{{ dotDate(trade.signal) }}</td>
+                <td>{{ trade.rule || '—' }}</td>
+                <td class="num" :class="pnlClass(trade.return_pct)">{{ signedPct(trade.return_pct) }}</td>
+                <td class="num">{{ plain(trade.rsi, 1) }}</td>
+                <td class="num" :class="pnlClass(trade.mom)">{{ plain(trade.mom, 2) }}</td>
+                <td class="num">{{ plain(trade.ma20, 2) }}</td>
+                <td class="num" :class="pnlClass(trade.vs_ma20)">{{ signedPct(trade.vs_ma20) }}</td>
+                <td class="num">{{ plain(trade.arms, 2) }}</td>
+                <td class="num">{{ trade.advancers == null ? '—' : `${trade.advancers} / ${trade.decliners}` }}</td>
+                <td class="num">{{ trade.above_ma20 == null ? '—' : `${Number(trade.above_ma20).toFixed(1)}%` }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p v-if="backtestTrades.length" class="section-sub">RSI、动量、MA20 和距均线取信号日收盘，也就是发出买单的那根日线。阿姆士、涨跌家数和高于 MA20 用那天已保存的全市场收盘，没有记录的留空。</p>
+
         <p class="disclaimer">策略根据当前账户与复盘数据制定。仓位数字对应本金与现有规则；执行前仍需核对实际可用资金与持仓。</p>
       </template>
     </a-spin>
@@ -649,9 +778,9 @@ onMounted(load)
 
 <style scoped>
 .strategy-page {
-  --page-border: #e7ebf2;
-  --page-ink: #243047;
-  --page-muted: #7b8598;
+  --page-border: var(--border);
+  --page-ink: var(--text);
+  --page-muted: var(--muted);
   --page-blue: #4b6de0;
   width: 100%;
   max-width: 1440px;
@@ -668,8 +797,8 @@ h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 27px; 
 .review-link { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: #2e7564; }
 .review-link span { transition: transform .15s ease; }
 .review-link:hover span { transform: translateX(2px); }
-.period-label { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: #667188; font-variant-numeric: tabular-nums; }
-.refresh-button { height: 36px; border-radius: 9px; border-color: #dce3f4; color: #4662bf; background: #f9faff; font-size: 12px; box-shadow: none; }
+.period-range { width: 240px; height: 36px; border-radius: 9px; border-color: #dce3f4; }
+.refresh-button { height: 36px; border-radius: 9px; border-color: #dce3f4; color: #4662bf; background: var(--chip); font-size: 12px; box-shadow: none; }
 .err { margin-bottom: 16px; }
 .loading-panel { min-height: 320px; padding: 28px; border: 1px solid var(--page-border); border-radius: 18px; }
 .strategy-hero { position: relative; display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(390px, .92fr); gap: 34px; align-items: center; overflow: hidden; padding: 34px; margin-bottom: 18px; border: 1px solid #dde9e5; border-radius: 20px; background: linear-gradient(122deg, #f4faf7 0%, #f8fbfe 50%, #eef3ff 100%); }
@@ -691,10 +820,10 @@ h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 27px; 
 .metric-icon.violet { color: #8a68c9; background: #f3effb; }
 .hero-metric > div { min-width: 0; }
 .hero-metric p { margin: 1px 0 7px; font-size: 10px; color: #7c8798; }
-.hero-metric strong { display: block; font-size: 21px; line-height: 1.22; letter-spacing: -.035em; font-variant-numeric: tabular-nums; color: #31445b; white-space: nowrap; }
+.hero-metric strong { display: block; font-size: 21px; line-height: 1.22; letter-spacing: -.035em; font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }
 .hero-metric strong small { font-size: 11px; font-weight: 500; letter-spacing: 0; color: #8490a2; }
 .hero-metric > div > span { display: block; margin-top: 6px; font-size: 9px; line-height: 1.5; color: #929baa; }
-.strategy-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 24px 0 4px; padding: 9px 12px; border: 1px solid #edf0f6; border-radius: 10px; background: #f8f9fc; font-size: 12px; }
+.strategy-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 24px 0 4px; padding: 9px 12px; border: 1px solid #edf0f6; border-radius: 10px; background: var(--chip); font-size: 12px; }
 .nav-label { margin: 0 12px 0 4px; color: #97a0b0; }
 .strategy-nav a { padding: 6px 10px; border-radius: 6px; color: #65728a; transition: background .15s, color .15s; }
 .strategy-nav a:hover { color: #2d7564; background: #eaf6f2; }
@@ -702,8 +831,14 @@ h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 27px; 
 .strategy-nav .nav-next span { margin-left: 4px; }
 .section-title { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 34px 0 8px; font-size: 19px; font-weight: 650; letter-spacing: -.025em; scroll-margin-top: 200px; }
 .section-number { padding: 5px 6px; border-radius: 5px; background: #eaf5f1; color: #3c8a77; font-size: 11px; font-weight: 600; letter-spacing: 0; font-variant-numeric: tabular-nums; }
-.section-badge { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 5px; background: #f3f5f9; color: #8992a4; font-size: 11px; font-weight: 400; letter-spacing: 0; }
-.section-sub { margin: 0 0 18px; font-size: 12px; line-height: 1.7; color: #7b8598; }
+.section-badge { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 5px; background: var(--chip); color: var(--muted); font-size: 11px; font-weight: 400; letter-spacing: 0; }
+.section-sub { margin: 0 0 18px; font-size: 12px; line-height: 1.7; color: var(--muted); }
+.backtest-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: -6px 0 16px; }
+.backtest-run { margin: 0; }
+.bt-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 8px; }
+.bt-trades { margin: 14px 0 8px; }
+.bt-trades table { min-width: 1080px; }
+.bt-trades th, .bt-trades td { padding: 10px 12px; }
 .alloc-card { padding: 24px; border: 1px solid #dfe8e4; border-radius: 16px; background: linear-gradient(180deg, #fbfdfc, #f7fafb); }
 .alloc-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .alloc-heading p { margin: 0 0 7px; font-size: 14px; font-weight: 650; color: #354c5e; }
@@ -715,7 +850,7 @@ h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 27px; 
 .alloc-names { display: grid; gap: 8px; margin-top: 16px; }
 .alloc-name { display: grid; grid-template-columns: 72px 42px 1fr 52px 1.2fr; gap: 8px; align-items: baseline; padding: 8px 2px; border-top: 1px solid #e7eeeb; font-size: 12px; color: #5c6b78; font-variant-numeric: tabular-nums; }
 .alloc-name b { color: #24384a; font-weight: 650; }
-.seg { display: flex; align-items: center; justify-content: center; min-width: 0; overflow: hidden; color: #fff; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.seg { display: flex; align-items: center; justify-content: center; min-width: 0; overflow: hidden; color: var(--panel); font-size: 11px; font-weight: 600; white-space: nowrap; }
 .seg.core { flex: 6; background: linear-gradient(90deg, #3d6b61, #4d7c70); }
 .seg.sat { flex: 3; background: linear-gradient(90deg, #6a9aaa, #86adba); }
 .seg.cash { flex: 1; background: #dfe9e7; color: #5d716f; }
@@ -724,21 +859,21 @@ h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 27px; 
 .alloc-index { display: grid; place-items: center; flex: 0 0 auto; width: 25px; height: 25px; border-radius: 7px; background: #edf3f1; color: #598074; font-size: 9px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .alloc-item p { margin: 0 0 6px; font-size: 12px; font-weight: 650; color: #425969; }
 .alloc-item p strong { color: #2f7565; font-weight: 700; }
-.alloc-item > div > span { display: block; font-size: 10px; line-height: 1.7; color: #8994a1; }
+.alloc-item > div > span { display: block; font-size: 10px; line-height: 1.7; color: var(--muted); }
 .strat-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
-.strat { position: relative; display: flex; flex-direction: column; gap: 14px; min-width: 0; padding: 22px; overflow: hidden; border: 1px solid var(--page-border); border-radius: 14px; background: #fff; box-shadow: 0 4px 16px rgba(38, 58, 95, .025); transition: transform .18s ease, box-shadow .18s ease; }
+.strat { position: relative; display: flex; flex-direction: column; gap: 14px; min-width: 0; padding: 22px; overflow: hidden; border: 1px solid var(--page-border); border-radius: 14px; background: var(--panel); box-shadow: 0 4px 16px rgba(38, 58, 95, .025); transition: transform .18s ease, box-shadow .18s ease; }
 .strat:hover { transform: translateY(-2px); box-shadow: 0 9px 24px rgba(38, 58, 95, .07); }
 .strat::before { content: ''; position: absolute; top: 0; left: 22px; width: 32px; height: 2px; border-radius: 0 0 4px 4px; background: #6b9e91; }
 .norm { align-self: flex-start; padding: 4px 8px; border-radius: 5px; background: #edf5f2; color: #4e8276; font-size: 10px; font-weight: 600; }
 .strat h3 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.02em; }
-.strat ul, .strat ol { margin: 0 0 4px; padding-left: 17px; font-size: 12px; line-height: 1.85; color: #748097; }
+.strat ul, .strat ol { margin: 0 0 4px; padding-left: 17px; font-size: 12px; line-height: 1.85; color: var(--muted); }
 .strat li { margin-bottom: 10px; padding-left: 2px; }
 .strat li:last-child { margin-bottom: 0; }
 .strat li::marker { color: #91aeaa; }
 .strat li b { color: #4a5a72; font-weight: 600; }
 .risk-guide { display: flex; flex-direction: column; gap: 10px; padding: 13px; border: 1px solid #dce9e4; border-radius: 10px; background: linear-gradient(145deg, #f3f9f6, #f9fbfe); }
 .risk-definition { display: flex; align-items: center; gap: 10px; }
-.risk-symbol { display: grid; place-items: center; flex: 0 0 auto; width: 32px; height: 32px; border-radius: 8px; background: #3f8b78; color: #fff; font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; box-shadow: 0 4px 10px rgba(63, 139, 120, .18); }
+.risk-symbol { display: grid; place-items: center; flex: 0 0 auto; width: 32px; height: 32px; border-radius: 8px; background: #3f8b78; color: var(--panel); font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; box-shadow: 0 4px 10px rgba(63, 139, 120, .18); }
 .risk-definition > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .risk-definition b { color: #3f5960; font-size: 11px; font-weight: 650; }
 .risk-definition span:last-child { color: #72858e; font-size: 10px; line-height: 1.55; }
@@ -780,11 +915,11 @@ h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 27px; 
 .payoff-equation i { padding-bottom: 1px; color: #a2abba; font-size: 10px; font-style: normal; }
 .payoff-equation > strong { color: #6b63a5; font-size: 18px; line-height: 1; font-variant-numeric: tabular-nums; }
 .payoff-guide p { margin: 0; color: #8893a5; font-size: 9px; line-height: 1.65; }
-.strat .foot { margin: auto 0 0; padding-top: 13px; border-top: 1px solid #edf0f5; font-size: 11px; line-height: 1.75; color: #8a94a6; }
+.strat .foot { margin: auto 0 0; padding-top: 13px; border-top: 1px solid #edf0f5; font-size: 11px; line-height: 1.75; color: var(--muted); }
 .strat .foot a { color: #4c75a0; font-weight: 600; }
-.table-wrap { overflow-x: auto; border: 1px solid var(--page-border); border-radius: 14px; background: #fff; }
-table { width: 100%; min-width: 650px; border-collapse: collapse; background: #fff; font-size: 12px; }
-th { padding: 14px 20px; border-bottom: 1px solid var(--page-border); background: #f8f9fc; color: #8792a7; font-size: 11px; font-weight: 500; text-align: left; white-space: nowrap; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--page-border); border-radius: 14px; background: var(--panel); }
+table { width: 100%; min-width: 650px; border-collapse: collapse; background: var(--panel); font-size: 12px; }
+th { padding: 14px 20px; border-bottom: 1px solid var(--page-border); background: var(--chip); color: #8792a7; font-size: 11px; font-weight: 500; text-align: left; white-space: nowrap; }
 td { padding: 16px 20px; border-bottom: 1px solid #edf0f5; color: #66758b; }
 tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: #fafcfb; }
@@ -797,11 +932,11 @@ tbody tr:hover { background: #fafcfb; }
 .pill.trim { background: #fcf5e8; color: #a77a30; }
 .pill.hold { background: #eaf6f2; color: #388a74; }
 .note { display: block; margin-top: 6px; color: #98a1b0; font-size: 10px; }
-.empty { padding: 32px; color: #8791a3; text-align: center; }
+.empty { padding: 32px; color: var(--muted); text-align: center; }
 .checklist { margin: 0; padding: 6px 24px; border: 1px solid #dfe8e4; border-radius: 14px; background: #f8fbfa; list-style: none; counter-reset: chk; }
-.checklist li { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: start; gap: 14px; padding: 16px 0; border-bottom: 1px solid #e7eeeb; color: #748097; font-size: 12px; line-height: 1.8; counter-increment: chk; }
+.checklist li { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: start; gap: 14px; padding: 16px 0; border-bottom: 1px solid #e7eeeb; color: var(--muted); font-size: 12px; line-height: 1.8; counter-increment: chk; }
 .checklist li:last-child { border-bottom: 0; }
-.checklist li::before { content: counter(chk, decimal-leading-zero); display: grid; place-items: center; width: 25px; height: 25px; border: 1px solid #d8e6e1; border-radius: 7px; background: #fff; color: #628d81; font-size: 10px; font-weight: 600; }
+.checklist li::before { content: counter(chk, decimal-leading-zero); display: grid; place-items: center; width: 25px; height: 25px; border: 1px solid #d8e6e1; border-radius: 7px; background: var(--panel); color: #628d81; font-size: 10px; font-weight: 600; }
 .checklist b { color: #4a5c7b; font-weight: 600; }
 .disclaimer { margin: 22px 0 0; padding: 0 2px; color: #96a0b2; font-size: 11px; line-height: 1.8; }
 
@@ -958,9 +1093,9 @@ tbody tr:hover { background: #fafcfb; }
   min-width: 0;
   overflow: hidden;
   padding: 19px;
-  border: 1px solid #e5eaf2;
+  border: 1px solid var(--border);
   border-radius: 16px;
-  background: #fff;
+  background: var(--panel);
   box-shadow: 0 8px 24px rgba(49, 67, 95, .045);
   transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
 }
@@ -1147,13 +1282,13 @@ tbody tr:hover { background: #fafcfb; }
   padding: 7px 11px;
   border-radius: 8px;
   background: #b85a56;
-  color: #fff;
+  color: var(--panel);
   font-size: 10px;
   font-weight: 650;
   box-shadow: 0 4px 10px rgba(184, 90, 86, .16);
   transition: background .15s ease, transform .15s ease;
 }
-.clear-action:hover { color: #fff; background: #a84d49; transform: translateX(1px); }
+.clear-action:hover { color: var(--panel); background: #a84d49; transform: translateX(1px); }
 .position-card.trim .clear-action { background: #a87d37; box-shadow: 0 4px 10px rgba(168, 125, 55, .14); }
 .position-card.trim .clear-action:hover { background: #986f2e; }
 .position-card.warning .clear-action { background: #c9942c; box-shadow: 0 4px 10px rgba(201, 148, 44, .2); }
@@ -1224,9 +1359,9 @@ tbody tr:hover { background: #fafcfb; }
   cursor: pointer;
   transition: background .15s ease, color .15s ease, box-shadow .15s ease;
 }
-.candidate-filter button:hover { color: #4c5f78; background: #fff; }
+.candidate-filter button:hover { color: #4c5f78; background: var(--panel); }
 .candidate-filter button.active {
-  background: #fff;
+  background: var(--panel);
   color: #415b80;
   font-weight: 650;
   box-shadow: 0 2px 7px rgba(54, 68, 91, .08);
@@ -1255,9 +1390,9 @@ tbody tr:hover { background: #fafcfb; }
   min-width: 0;
   overflow: hidden;
   padding: 17px;
-  border: 1px solid #e7ebf2;
+  border: 1px solid var(--border);
   border-radius: 15px;
-  background: #fff;
+  background: var(--panel);
   box-shadow: 0 7px 20px rgba(49, 67, 95, .04);
 }
 .candidate-card.ready { border-color: #d8e8e2; background: linear-gradient(160deg, #fcfffe, #fff); }
@@ -1307,7 +1442,7 @@ tbody tr:hover { background: #fafcfb; }
   gap: 7px;
   margin-top: 10px;
 }
-.candidate-metrics > div { min-width: 0; padding: 8px 9px; border-radius: 8px; background: #f8fafc; }
+.candidate-metrics > div { min-width: 0; padding: 8px 9px; border-radius: 8px; background: var(--chip); }
 .candidate-metrics span { display: block; margin-bottom: 2px; color: #9da6b5; font-size: 8px; }
 .candidate-metrics b {
   display: block;
@@ -1401,8 +1536,9 @@ tbody tr:hover { background: #fafcfb; }
   .strategy-page { padding-top: 2px; }
   .page-header { align-items: flex-start; }
   .header-actions { flex-direction: column; align-items: flex-end; gap: 10px; }
-  .period-label { font-size: 10px; }
+  .period-range { width: 100%; max-width: 240px; }
   .strategy-hero { padding: 24px; }
+  .bt-grid { grid-template-columns: 1fr; }
   .section-title { scroll-margin-top: 24px; }
   .alloc-list { grid-template-columns: 1fr; }
 }
@@ -1490,5 +1626,181 @@ tbody tr:hover { background: #fafcfb; }
   .candidate-metrics > div { padding: 7px 6px; }
   .candidate-metrics b { font-size: 9px; }
   .empty-panel { padding: 18px; }
+}
+
+:global(html[data-theme='dark'] .strategy-hero) {
+  background: #1a1e27;
+  border-color: var(--border);
+}
+:global(html[data-theme='dark'] .strategy-hero::after) { background: none; }
+:global(html[data-theme='dark'] .hero-meta span),
+:global(html[data-theme='dark'] .hero-metric),
+:global(html[data-theme='dark'] .alloc-item),
+:global(html[data-theme='dark'] .risk-level),
+:global(html[data-theme='dark'] .reentry-flow span),
+:global(html[data-theme='dark'] .workflow-step),
+:global(html[data-theme='dark'] .callout-rule),
+:global(html[data-theme='dark'] .candidate-signal),
+:global(html[data-theme='dark'] .position-numbers > div),
+:global(html[data-theme='dark'] .position-plan > div) {
+  background: #262b36;
+  border-color: var(--border);
+  box-shadow: none;
+}
+:global(html[data-theme='dark'] .alloc-card),
+:global(html[data-theme='dark'] .risk-guide),
+:global(html[data-theme='dark'] .reentry-guide),
+:global(html[data-theme='dark'] .payoff-guide),
+:global(html[data-theme='dark'] .checklist),
+:global(html[data-theme='dark'] .execution-stat),
+:global(html[data-theme='dark'] .exit-playbook),
+:global(html[data-theme='dark'] .reentry-callout),
+:global(html[data-theme='dark'] .candidate-filter),
+:global(html[data-theme='dark'] .empty-panel) {
+  background: #1e222d;
+  border-color: var(--border);
+}
+:global(html[data-theme='dark'] .metric-icon.blue),
+:global(html[data-theme='dark'] .metric-icon.teal),
+:global(html[data-theme='dark'] .metric-icon.amber),
+:global(html[data-theme='dark'] .metric-icon.violet),
+:global(html[data-theme='dark'] .section-number),
+:global(html[data-theme='dark'] .alloc-index),
+:global(html[data-theme='dark'] .norm),
+:global(html[data-theme='dark'] .ticker-avatar),
+:global(html[data-theme='dark'] .reentry-icon),
+:global(html[data-theme='dark'] .workflow-step > i),
+:global(html[data-theme='dark'] .callout-icon),
+:global(html[data-theme='dark'] .reentry-callout.positive .callout-icon),
+:global(html[data-theme='dark'] .candidate-avatar),
+:global(html[data-theme='dark'] .empty-mark),
+:global(html[data-theme='dark'] .candidate-filter button span),
+:global(html[data-theme='dark'] .candidate-filter button.active span) {
+  background: #2a2e39;
+  color: var(--muted);
+}
+:global(html[data-theme='dark'] .position-card.overdue),
+:global(html[data-theme='dark'] .position-card.trim),
+:global(html[data-theme='dark'] .position-card.warning),
+:global(html[data-theme='dark'] .candidate-card.ready),
+:global(html[data-theme='dark'] .candidate-card.cooling),
+:global(html[data-theme='dark'] .candidate-card.muted),
+:global(html[data-theme='dark'] .reentry-callout.positive) {
+  background: #1e222d;
+  border-color: var(--border);
+}
+:global(html[data-theme='dark'] .execution-stat.alert) {
+  background: rgba(242, 54, 69, 0.1);
+  border-color: rgba(242, 54, 69, 0.35);
+}
+:global(html[data-theme='dark'] .position-plan > div.suggestion-stop),
+:global(html[data-theme='dark'] .position-action-note.suggestion-exit-note),
+:global(html[data-theme='dark'] .trim .position-action-note) {
+  background: rgba(230, 167, 0, 0.12);
+  border-color: rgba(230, 167, 0, 0.35);
+}
+:global(html[data-theme='dark'] .position-plan > div.mandatory-stop),
+:global(html[data-theme='dark'] .overdue .position-action-note) {
+  background: rgba(242, 54, 69, 0.12);
+  border-color: rgba(242, 54, 69, 0.35);
+}
+:global(html[data-theme='dark'] .position-action-note),
+:global(html[data-theme='dark'] .reentry-cases .rise),
+:global(html[data-theme='dark'] .manual-check.ready) {
+  background: rgba(8, 153, 129, 0.12);
+  color: #8ecfb8;
+}
+:global(html[data-theme='dark'] .reentry-cases .fall) { background: rgba(242, 54, 69, 0.12); }
+:global(html[data-theme='dark'] .manual-check.cooling) { background: rgba(230, 167, 0, 0.12); color: #e2c48a; }
+:global(html[data-theme='dark'] .manual-check.muted),
+:global(html[data-theme='dark'] .risk-follow span) { background: #262b36; }
+:global(html[data-theme='dark'] .pill.cut),
+:global(html[data-theme='dark'] .execution-pill.cut) {
+  background: rgba(242, 54, 69, 0.16);
+  border-color: rgba(242, 54, 69, 0.35);
+  color: #ff8b95;
+}
+:global(html[data-theme='dark'] .pill.trim),
+:global(html[data-theme='dark'] .execution-pill.trim),
+:global(html[data-theme='dark'] .execution-pill.warning),
+:global(html[data-theme='dark'] .candidate-status.cooling) {
+  background: rgba(230, 167, 0, 0.16);
+  border-color: rgba(230, 167, 0, 0.35);
+  color: #f0c14d;
+}
+:global(html[data-theme='dark'] .pill.hold),
+:global(html[data-theme='dark'] .execution-pill.hold),
+:global(html[data-theme='dark'] .candidate-status.ready) {
+  background: rgba(8, 153, 129, 0.16);
+  border-color: rgba(8, 153, 129, 0.35);
+  color: #5dbea8;
+}
+:global(html[data-theme='dark'] .candidate-status.watching),
+:global(html[data-theme='dark'] .candidate-status.muted) {
+  background: #2a2e39;
+  color: var(--muted);
+}
+:global(html[data-theme='dark'] .seg.cash) { background: #363a45; color: var(--muted); }
+:global(html[data-theme='dark'] .position-numbers) { background: var(--border); border-color: var(--border); }
+:global(html[data-theme='dark'] .strategy-nav a:hover),
+:global(html[data-theme='dark'] .strategy-page tbody tr:hover),
+:global(html[data-theme='dark'] .candidate-filter button.active) {
+  background: #262b36;
+  color: var(--text);
+}
+:global(html[data-theme='dark'] .hero-copy h2),
+:global(html[data-theme='dark'] .alloc-heading p),
+:global(html[data-theme='dark'] .alloc-name b),
+:global(html[data-theme='dark'] .alloc-item p),
+:global(html[data-theme='dark'] .execution-stat > strong),
+:global(html[data-theme='dark'] .playbook-heading h3),
+:global(html[data-theme='dark'] .workflow-step b),
+:global(html[data-theme='dark'] .reentry-callout b),
+:global(html[data-theme='dark'] .candidate-signal b),
+:global(html[data-theme='dark'] .candidate-metrics b),
+:global(html[data-theme='dark'] .cycle-result > b),
+:global(html[data-theme='dark'] .sym),
+:global(html[data-theme='dark'] .checklist b),
+:global(html[data-theme='dark'] .strat li b),
+:global(html[data-theme='dark'] .payoff-equation b),
+:global(html[data-theme='dark'] .payoff-equation > strong),
+:global(html[data-theme='dark'] .reentry-head b),
+:global(html[data-theme='dark'] .risk-definition b),
+:global(html[data-theme='dark'] .position-numbers strong),
+:global(html[data-theme='dark'] .position-plan strong),
+:global(html[data-theme='dark'] .empty-panel b) {
+  color: var(--text);
+}
+:global(html[data-theme='dark'] .hero-copy h2 em),
+:global(html[data-theme='dark'] .review-link),
+:global(html[data-theme='dark'] .alloc-heading > strong),
+:global(html[data-theme='dark'] .alloc-item p strong),
+:global(html[data-theme='dark'] .section-number),
+:global(html[data-theme='dark'] .risk-level b),
+:global(html[data-theme='dark'] .strat .foot a),
+:global(html[data-theme='dark'] .manual-check.ready),
+:global(html[data-theme='dark'] .manual-check.ready b) {
+  color: #5dbea8;
+}
+:global(html[data-theme='dark'] .eyebrow),
+:global(html[data-theme='dark'] .hero-description),
+:global(html[data-theme='dark'] .hero-meta span),
+:global(html[data-theme='dark'] .nav-label),
+:global(html[data-theme='dark'] .strategy-nav a),
+:global(html[data-theme='dark'] .strategy-nav .nav-next),
+:global(html[data-theme='dark'] .strategy-page td),
+:global(html[data-theme='dark'] .strategy-page th),
+:global(html[data-theme='dark'] .disclaimer),
+:global(html[data-theme='dark'] .reentry-flow span),
+:global(html[data-theme='dark'] .callout-rule) {
+  color: var(--muted);
+}
+:global(html[data-theme='dark'] .alloc-name),
+:global(html[data-theme='dark'] .checklist li),
+:global(html[data-theme='dark'] .strat .foot),
+:global(html[data-theme='dark'] .strategy-page td),
+:global(html[data-theme='dark'] .position-card-foot),
+:global(html[data-theme='dark'] .cycle-result) {
+  border-color: var(--border);
 }
 </style>

@@ -349,6 +349,8 @@ class ReviewMeta(BaseModel):
     symbols: int = 0
     first_trade_at: datetime | None = None
     last_trade_at: datetime | None = None
+    start_date: date | None = None
+    end_date: date | None = None
 
 
 class ReviewCapital(BaseModel):
@@ -359,6 +361,8 @@ class ReviewCapital(BaseModel):
     commissions: Decimal = Decimal("0")
     realized: Decimal = Decimal("0")
     realized_pct: Decimal = Decimal("0")
+    closed_pnl: Decimal = Decimal("0")
+    holding_pnl: Decimal = Decimal("0")
 
 
 class ReviewBehavior(BaseModel):
@@ -390,6 +394,7 @@ class ReviewSymbolRow(BaseModel):
     trades: int = 0
     avg_holding_days: Decimal = Decimal("0")
     addon_below_avg: int = 0
+    status: str = ""
 
 
 class ReviewMonthRow(BaseModel):
@@ -571,6 +576,10 @@ class IndicatorPoint(BaseModel):
     vol_squeeze: bool = False
     rsi: float | None = None
     stop_candle: str | None = None
+    drawdown_pct: float | None = None
+    rebound_pct: float | None = None
+    swing_high_date: str | None = None
+    swing_low_date: str | None = None
     strategies: list[StrategySignal] = Field(default_factory=list)
 
 
@@ -594,6 +603,8 @@ class IndicatorHistory(BaseModel):
 
 
 class SentimentBreadth(BaseModel):
+    key: str = ""
+    pair: str = ""
     universe: str
     count: int = 0
     advancers: int = 0
@@ -605,6 +616,9 @@ class SentimentBreadth(BaseModel):
     strong_up: int | None = None
     strong_down: int | None = None
     above_ma20: float | None = None
+    ma_valid: int | None = None
+    ma_total: int | None = None
+    ma_pending: bool = False
 
 
 class SentimentSeriesPoint(BaseModel):
@@ -636,6 +650,7 @@ class MarketSentiment(BaseModel):
     tone: str = "info"
     note: str
     breadth: SentimentBreadth | None = None
+    books: list[SentimentBreadth] = Field(default_factory=list)
     vix: SentimentVix | None = None
     indexes: list[SentimentIndex] = Field(default_factory=list)
     arms_index: SentimentIndex | None = None
@@ -657,6 +672,72 @@ class BreadthHistory(BaseModel):
     basis: str
     note: str = ""
     points: list[BreadthHistoryPoint] = Field(default_factory=list)
+
+
+class CnActivityBucket(BaseModel):
+    label: str
+    count: int
+
+
+class CnActivity(BaseModel):
+    date: str | None = None
+    up: int | None = None
+    down: int | None = None
+    limit_up: int | None = None
+    limit_down: int | None = None
+    buckets: list[CnActivityBucket] = Field(default_factory=list)
+
+
+class CnSseDeal(BaseModel):
+    date: str | None = None
+    amount: float | None = None
+    volume: float | None = None
+    pe: float | None = None
+    turnover: float | None = None
+
+
+class CnFundFlow(BaseModel):
+    date: str | None = None
+    main: float | None = None
+    main_ratio: float | None = None
+    super_order: float | None = None
+    super_ratio: float | None = None
+    large: float | None = None
+    large_ratio: float | None = None
+    mid: float | None = None
+    mid_ratio: float | None = None
+    small: float | None = None
+    small_ratio: float | None = None
+
+
+class CnNorthbound(BaseModel):
+    board: str
+    net_buy: float | None = None
+    inflow: float | None = None
+    up: int | None = None
+    down: int | None = None
+    index_name: str | None = None
+    index_change: float | None = None
+
+
+class CnMarketDesk(BaseModel):
+    activity: CnActivity = Field(default_factory=CnActivity)
+    sse: CnSseDeal = Field(default_factory=CnSseDeal)
+    flow: CnFundFlow = Field(default_factory=CnFundFlow)
+    north: list[CnNorthbound] = Field(default_factory=list)
+
+
+class CnStockFlow(BaseModel):
+    symbol: str
+    main: float | None = None
+    main_ratio: float | None = None
+    buy_volume: float | None = None
+    sell_volume: float | None = None
+    neutral_volume: float | None = None
+
+
+class CnStockFlowBook(BaseModel):
+    items: list[CnStockFlow] = Field(default_factory=list)
 
 
 class AllocationSleeve(BaseModel):
@@ -695,3 +776,45 @@ class StrategyResponse(ReviewResponse):
     reentry_candidates: list[ReentryCandidate] = Field(default_factory=list)
     reentry_screened: int = 0
     allocation: StrategyAllocation | None = None
+
+
+class BacktestTrade(BaseModel):
+    symbol: str
+    entry: str
+    signal: str = ""
+    rule: str = ""
+    return_pct: float | None = None
+    held: int = 0
+    rsi: float | None = None
+    mom: float | None = None
+    ma20: float | None = None
+    vs_ma20: float | None = None
+    arms: float | None = None
+    above_ma20: float | None = None
+    advancers: int | None = None
+    decliners: int | None = None
+
+
+class BacktestSymbol(BaseModel):
+    symbol: str
+    name: str | None = None
+    bars: int = 0
+    return_pct: float | None = None
+    max_drawdown_pct: float | None = None
+    closed_trades: int = 0
+    win_rate: float | None = None
+    end_value: float | None = None
+    rule: str = ""
+    error: str = ""
+    trades: list[BacktestTrade] = Field(default_factory=list)
+
+
+class BacktestResponse(BaseModel):
+    engine: str = "AKQuant"
+    market: str
+    profile: str = ""
+    cash: float = 100000
+    start: date | None = None
+    end: date | None = None
+    note: str = ""
+    items: list[BacktestSymbol] = Field(default_factory=list)

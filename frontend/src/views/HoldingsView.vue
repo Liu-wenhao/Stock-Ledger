@@ -7,18 +7,72 @@ import { message, Modal } from 'ant-design-vue'
 import { DashboardOutlined, DownloadOutlined, FallOutlined, LineChartOutlined, QuestionCircleOutlined, RiseOutlined } from '@ant-design/icons-vue'
 import { fetchHoldings, fetchHoldingsAdvice, fetchIndicatorHistory, fetchBreadthHistory, fetchMarketSentiment, fetchTrades, updateHoldingLimit, updateHoldingStop } from '@/api/portfolio'
 import SymbolCell from '@/components/SymbolCell.vue'
+import CnMarketDesk from '@/components/CnMarketDesk.vue'
 import { formatMoney, formatPct, formatQty, pnlClass, tickerOf, toNumber } from '@/utils/format'
 import { isMarketOpen } from '@/utils/marketHours'
 import { usePortfolioStore } from '@/stores/portfolio'
 import { downloadTableImage } from '@/utils/tableImage'
 import { useTableScrollY } from '@/composables/useTableScroll'
+import { useTheme } from '@/composables/useTheme'
 
 const router = useRouter()
 const route = useRoute()
 const store = usePortfolioStore()
+const { isDark } = useTheme()
 
 const emit = defineEmits(['changed'])
 const isPricePage = computed(() => route.name === 'prices')
+const cnDeskSymbols = computed(() =>
+  (data.value?.items || [])
+    .map((item) => item.symbol)
+    .filter((symbol) => /^(SSE|SZSE|BSE):/.test(symbol || ''))
+    .slice(0, 12),
+)
+const cnDesk = ref(null)
+const cnFlowBySymbol = ref({})
+const upBuckets = computed(() =>
+  (cnDesk.value?.activity?.buckets || []).filter((bucket) => String(bucket.label).startsWith('上涨')),
+)
+const downBuckets = computed(() =>
+  (cnDesk.value?.activity?.buckets || []).filter((bucket) => String(bucket.label).startsWith('下跌')),
+)
+function onCnDesk(value) {
+  cnDesk.value = value
+}
+function onCnFlow(items) {
+  const next = {}
+  for (const item of items || []) next[item.symbol] = item
+  cnFlowBySymbol.value = next
+}
+function flowTone(label) {
+  return { 超大单: 'amber', 大单: 'blue', 中单: 'teal', 小单: 'violet' }[label] || 'amber'
+}
+function flowYi(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—'
+  const number = Number(value)
+  return `${number > 0 ? '+' : ''}${number.toFixed(2)}亿`
+}
+function flowLots(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—'
+  return Math.round(Number(value)).toLocaleString('en-US')
+}
+const flowTiers = computed(() => {
+  const flow = cnDesk.value?.flow
+  if (!flow) return []
+  const ratio = (value) => (value == null || Number.isNaN(Number(value)) ? '' : `${Number(value) > 0 ? '+' : ''}${Number(value).toFixed(2)}%`)
+  return [
+    ['主力', flow.main, flow.main_ratio],
+    ['超大单', flow.super_order, flow.super_ratio],
+    ['大单', flow.large, flow.large_ratio],
+    ['中单', flow.mid, flow.mid_ratio],
+    ['小单', flow.small, flow.small_ratio],
+  ].map(([label, amount, share]) => ({
+    label,
+    amount,
+    share,
+    text: `${label} ${flowYi(amount)}${ratio(share)}`,
+  }))
+})
 const subTab = ref('positions')
 const keyword = ref('')
 const loading = ref(false)
@@ -29,7 +83,9 @@ const tableScroll = computed(() => ({
   x:
     viewportWidth.value > 560
       ? subTab.value === 'price'
-        ? 1990
+        ? store.market === 'cn'
+          ? 2280
+          : 1990
         : 1720
       : subTab.value === 'cumulative'
         ? 603
@@ -764,7 +820,18 @@ const displayCycleColumns = computed(() => responsiveColumns(cycleColumns))
 const displayCumulativeCycleColumns = computed(() => responsiveColumns(cumulativeCycleColumns))
 
 const columns = computed(() => {
-  if (subTab.value === 'price') return responsiveColumns(priceColumns)
+  if (subTab.value === 'price') {
+    const list = store.market === 'cn'
+      ? [
+          ...priceColumns.slice(0, 4),
+          { title: '主力', key: 'main_flow', align: 'right', width: 96 },
+          { title: '买盘', key: 'buy_volume', align: 'right', width: 100 },
+          { title: '卖盘', key: 'sell_volume', align: 'right', width: 100 },
+          ...priceColumns.slice(4),
+        ]
+      : priceColumns
+    return responsiveColumns(list)
+  }
   if (subTab.value === 'cumulative') return displayCumulativeColumns.value
   return responsiveColumns(positionColumns)
 })
@@ -971,6 +1038,19 @@ let sentimentChart
 const trendOpen = ref(false)
 const trendLoading = ref(false)
 const trendSymbol = ref('')
+const trendSelectOptions = computed(() => {
+  const items = data.value?.items || []
+  const labelOf = (item) => item.name || tickerOf(item.symbol)
+  const held = items.filter((item) => !item.closed && toNumber(item.quantity) > 0)
+  const closed = items.filter((item) => item.closed)
+  const rest = items.filter((item) => !item.closed && !(toNumber(item.quantity) > 0))
+  const option = (item) => ({ value: item.symbol, label: labelOf(item) })
+  const groups = []
+  if (held.length) groups.push({ label: '持仓', options: held.map(option) })
+  if (closed.length) groups.push({ label: '清仓', options: closed.map(option) })
+  if (rest.length) groups.push({ label: '关注', options: rest.map((item) => option(item)) })
+  return groups
+})
 const trendBook = ref(null)
 const trendChartRef = ref(null)
 let trendChart
@@ -1162,6 +1242,25 @@ function disposeTrendChart() {
   trendChart = null
 }
 
+function bookName(book) {
+  return String(book?.universe || '').replace(/\s+\d+\s*家$/, '')
+}
+
+const INDEX_BOOK = {
+  '标普 500': 'nyse',
+  纳斯达克: 'nasdaq',
+  上证指数: 'sse',
+  深证成指: 'szse',
+}
+
+function indexCaption(name) {
+  return {
+    '标普 500': '对照纽交所宽度',
+    上证指数: '对照上证宽度',
+    深证成指: '对照深市宽度',
+  }[name] || ''
+}
+
 function breadthWidth(breadth) {
   if (!breadth?.count) return null
   return ((Number(breadth.advancers) - Number(breadth.decliners)) / Number(breadth.count)) * 100
@@ -1170,6 +1269,15 @@ function breadthWidth(breadth) {
 const armsOpen = ref(false)
 const armsLoading = ref(false)
 const armsHistory = ref(null)
+const armsFocusDate = ref(null)
+const breadthBook = ref('')
+const sentimentBooks = computed(() => sentiment.value?.books || [])
+const selectedBook = computed(
+  () => sentimentBooks.value.find((item) => item.key === breadthBook.value) || sentiment.value?.breadth || null,
+)
+watch(sentimentBooks, (books) => {
+  if (!books.some((item) => item.key === breadthBook.value)) breadthBook.value = books[0]?.key || ''
+})
 const armsChartRef = ref(null)
 let armsChart
 const ARMS_INDEX = { us: '纳斯达克 100', cn: '中证全指', hk: '恒生指数' }
@@ -1178,6 +1286,8 @@ const ARMS_DOWN = '#ef4444'
 
 function disposeArmsChart() {
   if (!armsChart) return
+  armsChart.off('updateAxisPointer')
+  armsChart.off('globalout')
   armsChart.dispose()
   armsChart = null
 }
@@ -1416,10 +1526,11 @@ function armsVerdict(input) {
   }
 }
 
-function buildArmsBoard(history, book, market) {
+function buildArmsBoard(history, book, market, focusDate = null) {
   const stored = history?.points || []
   const live = book?.breadth || null
   const index =
+    (live?.pair && (book?.indexes || []).find((item) => item.name === live.pair)) ||
     (book?.arms_index?.history?.length ? book.arms_index : null) ||
     (book?.indexes || []).find((item) => item.name === ARMS_INDEX[market]) ||
     book?.indexes?.[0] ||
@@ -1439,12 +1550,18 @@ function buildArmsBoard(history, book, market) {
     if (!path.length || path[path.length - 1].date < book.as_of) path.push(reading)
     else if (path[path.length - 1].date === book.as_of) Object.assign(path[path.length - 1], reading)
   }
-  const source =
+  const latest =
     [...path].reverse().find((point) => point.arms != null || point.above_ma20 != null) ||
     path[path.length - 1]
+  const focusKey = focusDate ? String(focusDate).slice(0, 10) : null
+  const focused = focusKey
+    ? path.find((point) => String(point.date).slice(0, 10) === focusKey)
+    : null
+  const source = focused || latest
+  const viewingPast = Boolean(focused && latest && String(focused.date).slice(0, 10) !== String(latest.date).slice(0, 10))
   let headlineArms = source?.arms ?? null
   let headlineMa20 = source?.above_ma20 ?? null
-  if (source) {
+  if (!viewingPast && source) {
     const earlier = [...path].reverse().find((point) => point.date < source.date)
     if (earlier) {
       if (headlineArms == null) headlineArms = earlier.arms
@@ -1465,15 +1582,23 @@ function buildArmsBoard(history, book, market) {
   const intensity = arms > 0 ? 1 / arms : null
   const closesByDate = new Map((index?.history || []).map((point) => [point.date, point.close]))
   const plotted = path.map((point) => ({ ...point, indexClose: closesByDate.get(point.date) ?? null }))
-  const indexUp = index?.day_change == null ? null : Number(index.day_change) > 0
+  const focusIndex = plotted.findIndex((point) => String(point.date).slice(0, 10) === String(source.date).slice(0, 10))
+  let indexUp = index?.day_change == null ? null : Number(index.day_change) > 0
+  if (viewingPast && focusIndex >= 0) {
+    const prev = focusIndex > 0 ? plotted[focusIndex - 1] : null
+    const close = plotted[focusIndex]?.indexClose
+    indexUp =
+      close != null && prev?.indexClose != null ? Number(close) > Number(prev.indexClose) : null
+  }
   const ma20 = headlineMa20 == null ? null : Number(headlineMa20)
   const position = armsPosition(ma20)
   const verdict = armsPanelVerdict(adRatio, arms, ma20)
   const net = advancers - decliners
+  const dayKey = String(source.date).slice(0, 10)
   return {
     ready: true,
     universe: live?.universe || history?.universe || '',
-    count: live?.count || total,
+    count: viewingPast ? total : live?.count || total,
     basis: history?.basis || (market === 'us' ? '成交量' : '成交额'),
     note: history?.note || '',
     indexName: index?.name || '',
@@ -1498,10 +1623,20 @@ function buildArmsBoard(history, book, market) {
     verdict,
     plotted,
     trinLeft: armsPointer(arms),
+    focusDate: viewingPast ? dayKey : null,
+    focusLabel: viewingPast ? dayKey.slice(5) : null,
+    focusIndex: viewingPast ? focusIndex : -1,
   }
 }
 
-const armsBoard = computed(() => buildArmsBoard(armsHistory.value, sentiment.value, store.market))
+const armsBoard = computed(() =>
+  buildArmsBoard(
+    armsHistory.value,
+    sentiment.value ? { ...sentiment.value, breadth: selectedBook.value } : null,
+    store.market,
+    armsFocusDate.value,
+  ),
+)
 
 function armsPointer(arms) {
   const clamped = Math.min(Math.max(arms ?? 1, 0.2), 3)
@@ -1542,6 +1677,7 @@ function renderArmsChart(retry = 0) {
   const narrow = viewportWidth.value <= 800
   const side = narrow ? 34 : 52
   const labelSize = narrow ? 10 : 11
+  const focusIndex = board.focusIndex >= 0 ? board.focusIndex : -1
   armsChart.setOption(
     {
       backgroundColor: 'transparent',
@@ -1653,6 +1789,9 @@ function renderArmsChart(retry = 0) {
             data: [
               { yAxis: 80, lineStyle: { color: '#f59e0b', type: 'dashed', width: 1 }, label: { formatter: '80% 超买区', color: '#f59e0b', fontSize: 10, position: 'insideEndTop' } },
               { yAxis: 20, lineStyle: { color: '#c084fc', type: 'dashed', width: 1 }, label: { formatter: '20% 冰点底', color: '#c084fc', fontSize: 10, position: 'insideEndBottom' } },
+              ...(focusIndex >= 0
+                ? [{ xAxis: labels[focusIndex], lineStyle: { color: '#64748b', type: 'dashed', width: 1.2 }, label: { show: false } }]
+                : []),
             ],
           },
         },
@@ -1689,6 +1828,9 @@ function renderArmsChart(retry = 0) {
             data: [
               { yAxis: 1, lineStyle: { color: '#94a3b8', width: 1 }, label: { formatter: '1.0 多空均衡', color: '#64748b', fontSize: 10, position: narrow ? 'insideStartTop' : 'insideEndTop' } },
               { yAxis: 2, lineStyle: { color: '#a855f7', type: 'dashed', width: 1 }, label: { formatter: '2.0 恐慌超卖线', color: '#7c3aed', fontSize: 10, position: narrow ? 'insideStartTop' : 'insideEndTop' } },
+              ...(focusIndex >= 0
+                ? [{ xAxis: labels[focusIndex], lineStyle: { color: '#64748b', type: 'dashed', width: 1.2 }, label: { show: false } }]
+                : []),
             ],
           },
         },
@@ -1707,15 +1849,48 @@ function renderArmsChart(retry = 0) {
     },
     true,
   )
+  armsChart.off('updateAxisPointer')
+  armsChart.off('globalout')
+  armsChart.on('updateAxisPointer', (event) => {
+    const fromSeries = event?.seriesDataIndices?.find((item) => item?.dataIndex != null)
+    let index = fromSeries?.dataIndex
+    if (index == null) {
+      const axis = (event?.axesInfo || []).find((item) => item?.value != null)
+      index = axis?.value
+      if (typeof index === 'string') index = labels.indexOf(index)
+    }
+    if (index == null || index < 0 || index >= points.length) return
+    const point = points[index]
+    if (!point?.date) return
+    const day = String(point.date).slice(0, 10)
+    const last = String(points[points.length - 1]?.date || '').slice(0, 10)
+    const next = day === last ? null : day
+    if (armsFocusDate.value === next) return
+    armsFocusDate.value = next
+  })
+  armsChart.on('globalout', () => {
+    if (armsFocusDate.value != null) armsFocusDate.value = null
+  })
   armsChart.resize()
+}
+
+async function selectBreadthBook(key) {
+  breadthBook.value = key
+  await openArmsHistory()
+}
+
+function openIndexBook(name) {
+  const key = INDEX_BOOK[name]
+  if (key) selectBreadthBook(key)
 }
 
 async function openArmsHistory() {
   armsOpen.value = true
+  armsFocusDate.value = null
   armsLoading.value = true
   armsHistory.value = null
   try {
-    armsHistory.value = await fetchBreadthHistory()
+    armsHistory.value = await fetchBreadthHistory(breadthBook.value)
   } catch {
     armsHistory.value = null
   } finally {
@@ -1726,21 +1901,32 @@ async function openArmsHistory() {
 }
 
 watch(armsOpen, (open) => {
-  if (!open) disposeArmsChart()
+  if (!open) {
+    armsFocusDate.value = null
+    disposeArmsChart()
+  }
 })
 
-watch(armsBoard, () => {
-  if (!armsOpen.value || armsLoading.value) return
-  nextTick(() => renderArmsChart())
-})
+watch(
+  () => [armsHistory.value, sentiment.value?.as_of, selectedBook.value?.arms, selectedBook.value?.key, armsOpen.value, armsLoading.value],
+  () => {
+    if (!armsOpen.value || armsLoading.value) return
+    nextTick(() => renderArmsChart())
+  },
+)
 
 let sentimentBusy = false
+let sentimentTries = 0
+let maTries = 0
 
 async function loadSentiment({ silent = false } = {}) {
   if (!isPricePage.value && subTab.value !== 'price') return
   if (sentimentBusy) return
   sentimentBusy = true
-  if (!silent) sentimentState.value = 'loading'
+  if (!silent) {
+    sentimentTries = 0
+    sentimentState.value = 'loading'
+  }
   try {
     sentiment.value = await fetchMarketSentiment()
     sentimentState.value = 'ready'
@@ -1754,30 +1940,56 @@ async function loadSentiment({ silent = false } = {}) {
   } finally {
     sentimentBusy = false
   }
+  const books = sentiment.value?.books || []
+  const waitingMa = books.some((book) => book.ma_pending && book.ma_total == null)
+  if (store.market !== 'hk' && !books.length && sentimentTries < 8) {
+    sentimentTries += 1
+    window.setTimeout(() => loadSentiment({ silent: true }), 15000)
+  } else if (waitingMa && maTries < 16) {
+    maTries += 1
+    window.setTimeout(() => loadSentiment({ silent: true }), 20000)
+  } else if (books.length) {
+    sentimentTries = 0
+    if (!waitingMa) maTries = 0
+  }
+}
+
+function trendPalette() {
+  const dark = document.documentElement.dataset.theme === 'dark'
+  return {
+    ink: dark ? '#d1d4dc' : '#243047',
+    axis: dark ? '#868b96' : '#8b95a8',
+    line: dark ? '#363a45' : '#e7ebf2',
+    split: dark ? '#2a2e39' : '#eef2f6',
+    slider: dark ? '#2a2e39' : '#f6f8fb',
+    handle: dark ? '#1e222d' : '#fff',
+    handleBorder: dark ? '#363a45' : '#d5deea',
+  }
 }
 
 function chartSlider(dates, extra = {}) {
+  const tone = trendPalette()
   return {
     type: 'slider',
     height: 18,
     bottom: 2,
-    backgroundColor: '#f6f8fb',
+    backgroundColor: tone.slider,
     borderColor: 'transparent',
     fillerColor: 'rgba(20, 151, 125, 0.14)',
     handleSize: 14,
-    handleStyle: { color: '#fff', borderColor: '#d5deea', borderWidth: 1 },
+    handleStyle: { color: tone.handle, borderColor: tone.handleBorder, borderWidth: 1 },
     moveHandleSize: 0,
     brushSelect: false,
     showDetail: false,
     dataBackground: {
-      lineStyle: { color: '#b7c6da', width: 1 },
+      lineStyle: { color: tone.axis, width: 1 },
       areaStyle: { color: 'rgba(20, 151, 125, 0.08)' },
     },
     selectedDataBackground: {
       lineStyle: { color: '#14977d', width: 1 },
       areaStyle: { color: 'rgba(20, 151, 125, 0.16)' },
     },
-    textStyle: { color: '#8b95a8', fontSize: 10 },
+    textStyle: { color: tone.axis, fontSize: 10 },
     labelFormatter: (value) => (typeof value === 'string' ? value.slice(5) : dates[value]?.slice(5) || ''),
     ...extra,
   }
@@ -2007,7 +2219,8 @@ const THS_LINE = {
 
 function trendStudyGraphics(point) {
   const macd = point?.macd
-  const macdColor = macd == null ? '#243047' : macd >= 0 ? '#089981' : '#f23645'
+  const ink = trendPalette().ink
+  const macdColor = macd == null ? ink : macd >= 0 ? '#089981' : '#f23645'
   const piece = (fill) => ({ fill, fontSize: 11 })
   return [
     {
@@ -2019,11 +2232,11 @@ function trendStudyGraphics(point) {
       style: {
         text: `{name|布林}  {up|上轨} {v|${adviceNum(point?.boll_upper)}}  {mid|中轨} {v|${adviceNum(point?.ma20)}}  {low|下轨} {v|${adviceNum(point?.boll_lower)}}`,
         rich: {
-          name: { ...piece('#243047'), fontWeight: 650 },
+          name: { ...piece(ink), fontWeight: 650 },
           up: piece(THS_LINE.bollUp),
           mid: piece(THS_LINE.bollMid),
           low: piece(THS_LINE.bollLow),
-          v: piece('#243047'),
+          v: piece(ink),
         },
       },
     },
@@ -2040,7 +2253,7 @@ function trendStudyGraphics(point) {
           dif: piece(THS_LINE.dif),
           dea: piece(THS_LINE.dea),
           bar: piece(macdColor),
-          v: piece('#243047'),
+          v: piece(ink),
           m: piece(macdColor),
         },
       },
@@ -2088,6 +2301,7 @@ function renderTrendChart({ keepRange = false } = {}) {
   })
   const mom = points[points.length - 1]?.mom
   const wash = mom > 0 ? 'rgba(8,153,129,0.08)' : mom < 0 ? 'rgba(230,167,0,0.10)' : 'transparent'
+  const tone = trendPalette()
   const zoomEnd = dates[dates.length - 1]
   const zoomStart = kept?.startValue && dates.includes(kept.startValue)
     ? kept.startValue
@@ -2101,14 +2315,14 @@ function renderTrendChart({ keepRange = false } = {}) {
       animationDuration: 280,
       axisPointer: {
         link: [{ xAxisIndex: [0, 1, 2, 3, 4] }],
-        lineStyle: { color: '#c5d0e0', type: 'dashed', width: 1 },
+        lineStyle: { color: tone.line, type: 'dashed', width: 1 },
       },
       legend: { show: false },
       tooltip: {
         show: true,
         showContent: false,
         trigger: 'axis',
-        axisPointer: { type: 'cross', lineStyle: { color: '#c5d0e0', type: 'dashed', width: 1 } },
+        axisPointer: { type: 'cross', lineStyle: { color: tone.line, type: 'dashed', width: 1 } },
       },
       dataZoom: [
         {
@@ -2142,13 +2356,13 @@ function renderTrendChart({ keepRange = false } = {}) {
         gridIndex,
         data: dates,
         boundaryGap: true,
-        axisLine: { lineStyle: { color: '#e7ebf2' } },
+        axisLine: { lineStyle: { color: tone.line } },
         axisPointer: {
           label: { show: false },
         },
         axisLabel: {
           show: gridIndex === 4,
-          color: '#8b95a8',
+          color: tone.axis,
           fontSize: 11,
           hideOverlap: true,
           formatter: (value) => String(value).slice(5),
@@ -2161,8 +2375,8 @@ function renderTrendChart({ keepRange = false } = {}) {
           scale: true,
           axisLine: { show: false },
           axisTick: { show: false },
-          splitLine: { lineStyle: { color: '#eef2f6' } },
-          axisLabel: { color: '#8b95a8', fontSize: 11, margin: 4, align: 'right' },
+          splitLine: { lineStyle: { color: tone.split } },
+          axisLabel: { color: tone.axis, fontSize: 11, margin: 4, align: 'right' },
         },
         { gridIndex: 1, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
         { gridIndex: 2, scale: true, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
@@ -2312,7 +2526,7 @@ function renderTrendChart({ keepRange = false } = {}) {
             silent: true,
             symbol: 'none',
             label: { show: false },
-            lineStyle: { color: '#e7ebf2', width: 1 },
+            lineStyle: { color: tone.line, width: 1 },
             data: [{ yAxis: 0 }],
           },
         },
@@ -3056,6 +3270,9 @@ watch(trendOpen, (open) => {
     disposeTrendChart()
   }
 })
+watch(isDark, () => {
+  if (trendOpen.value && trendChart) renderTrendChart({ keepRange: true })
+})
 watch(trendSymbol, () => {
   if (trendOpen.value) loadTrend()
 })
@@ -3382,22 +3599,112 @@ onUnmounted(() => {
             <span v-if="sentiment.breadth?.strong_down != null">跌超 2% {{ sentiment.breadth.strong_down }}</span>
           </div>
         </div>
-        <div v-if="sentiment?.breadth || (sentiment && store.market !== 'hk')" class="price-metrics">
-          <template v-if="sentiment.breadth">
+        <div class="price-hero-side">
+        <div v-if="sentimentBooks.length" class="breadth-books">
+          <button
+            v-for="book in sentimentBooks"
+            :key="book.key"
+            type="button"
+            class="breadth-book"
+            :class="{ 'is-on': book.key === breadthBook }"
+            @click="selectBreadthBook(book.key)"
+          >
+            <span class="breadth-book-head">
+              <span class="breadth-book-name">{{ bookName(book) }}</span>
+              <span v-if="book.pair" class="breadth-book-pair">对照 {{ book.pair }}</span>
+            </span>
+            <span class="breadth-book-count">{{ book.count }} 家</span>
+            <span v-if="book.ma_total != null" class="breadth-book-sample" :title="book.above_ma20 == null ? '拿到前 19 日收盘价的只数未满当场成交的九成，高于 MA20 的比例先不写' : '拿到前 19 日收盘价的只数 / 当场有成交的只数'">
+              日线 {{ book.ma_valid || 0 }}/{{ book.ma_total }} · {{ Math.round((book.ma_valid || 0) / book.ma_total * 100) }}%
+              <template v-if="book.above_ma20 != null"> · 高于MA20 {{ Number(book.above_ma20).toFixed(1) }}%</template>
+            </span>
+            <span class="breadth-book-stats">
+              <span>
+                <span class="breadth-book-label">
+                  <span class="price-metric-icon teal"><RiseOutlined /></span>
+                  <em>上涨</em>
+                </span>
+                <strong class="pnl-up">{{ book.advancers }}</strong>
+              </span>
+              <span>
+                <span class="breadth-book-label">
+                  <span class="price-metric-icon amber"><FallOutlined /></span>
+                  <em>下跌</em>
+                </span>
+                <strong class="pnl-down">{{ book.decliners }}</strong>
+              </span>
+              <span>
+                <span class="breadth-book-label">
+                  <span class="price-metric-icon blue"><LineChartOutlined /></span>
+                  <em>宽度</em>
+                </span>
+                <strong :class="pnlClass(breadthWidth(book))">
+                  {{ breadthWidth(book) == null ? '—' : `${breadthWidth(book) > 0 ? '+' : ''}${breadthWidth(book).toFixed(1)}%` }}
+                </strong>
+              </span>
+              <span>
+                <span class="breadth-book-label">
+                  <span class="price-metric-icon violet"><DashboardOutlined /></span>
+                  <em>阿姆士</em>
+                </span>
+                <strong :class="book.arms == null ? '' : book.arms < 1 ? 'pnl-up' : book.arms > 1 ? 'pnl-down' : ''">
+                  {{ book.arms == null ? '—' : book.arms.toFixed(2) }}
+                </strong>
+              </span>
+            </span>
+          </button>
+        </div>
+        <div
+          v-if="(!sentimentBooks.length && (sentiment?.breadth || (sentiment && store.market !== 'hk'))) || (store.market === 'cn' && cnDesk?.flow)"
+          class="price-metrics"
+        >
+          <template v-if="sentiment.breadth && !sentimentBooks.length">
           <article>
-            <span class="price-metric-icon teal"><RiseOutlined /></span>
-            <div>
-              <p>上涨</p>
-              <strong class="pnl-up">{{ sentiment.breadth.advancers }}</strong>
-              <span>当前行情里的上涨家数</span>
+            <a-tooltip v-if="store.market === 'cn' && upBuckets.length" placement="bottomLeft">
+              <template #title>
+                <div v-for="bucket in upBuckets" :key="bucket.label">{{ bucket.label }} {{ bucket.count }}</div>
+              </template>
+              <div class="metric-hit">
+                <span class="price-metric-icon teal"><RiseOutlined /></span>
+                <div>
+                  <p>上涨</p>
+                  <strong class="pnl-up">{{ sentiment.breadth.advancers }}</strong>
+                  <span>涨停 {{ cnDesk?.activity?.limit_up ?? '—' }}</span>
+                </div>
+              </div>
+            </a-tooltip>
+            <div v-else class="metric-hit">
+              <span class="price-metric-icon teal"><RiseOutlined /></span>
+              <div>
+                <p>上涨</p>
+                <strong class="pnl-up">{{ sentiment.breadth.advancers }}</strong>
+                <span v-if="store.market === 'cn'">涨停 {{ cnDesk?.activity?.limit_up ?? '—' }}</span>
+                <span v-else>当前行情里的上涨家数</span>
+              </div>
             </div>
           </article>
           <article>
-            <span class="price-metric-icon amber"><FallOutlined /></span>
-            <div>
-              <p>下跌</p>
-              <strong class="pnl-down">{{ sentiment.breadth.decliners }}</strong>
-              <span>当前行情里的下跌家数</span>
+            <a-tooltip v-if="store.market === 'cn' && downBuckets.length" placement="bottomLeft">
+              <template #title>
+                <div v-for="bucket in downBuckets" :key="bucket.label">{{ bucket.label }} {{ bucket.count }}</div>
+              </template>
+              <div class="metric-hit">
+                <span class="price-metric-icon amber"><FallOutlined /></span>
+                <div>
+                  <p>下跌</p>
+                  <strong class="pnl-down">{{ sentiment.breadth.decliners }}</strong>
+                  <span>跌停 {{ cnDesk?.activity?.limit_down ?? '—' }}</span>
+                </div>
+              </div>
+            </a-tooltip>
+            <div v-else class="metric-hit">
+              <span class="price-metric-icon amber"><FallOutlined /></span>
+              <div>
+                <p>下跌</p>
+                <strong class="pnl-down">{{ sentiment.breadth.decliners }}</strong>
+                <span v-if="store.market === 'cn'">跌停 {{ cnDesk?.activity?.limit_down ?? '—' }}</span>
+                <span v-else>当前行情里的下跌家数</span>
+              </div>
             </div>
           </article>
           <article>
@@ -3430,7 +3737,7 @@ onUnmounted(() => {
           </article>
           </template>
           <article
-            v-if="store.market !== 'hk'"
+            v-if="store.market !== 'hk' && !sentimentBooks.length"
             class="is-arms"
             title="查看宽广度和阿姆士"
             @click="openArmsHistory"
@@ -3447,11 +3754,42 @@ onUnmounted(() => {
               >
                 {{ sentiment.breadth.arms.toFixed(2) }}
               </strong>
-              <span v-if="sentiment.breadth?.arms == null">收盘后才有当天的数，点开可看以前的</span>
+              <span v-if="sentiment.breadth?.arms == null">正在读取全市场，点开可看以前的</span>
               <span v-else>{{ store.market === 'us' ? '小于 1 表示上涨股票的成交量更大' : '小于 1 表示上涨股票的成交额更大' }}</span>
             </div>
           </article>
+          <article v-if="store.market === 'cn' && cnDesk?.flow" class="is-main-flow">
+            <a-tooltip placement="bottomLeft">
+              <template #title>
+                <div v-for="row in flowTiers" :key="row.label">{{ row.text }}</div>
+              </template>
+              <div class="metric-hit">
+                <div>
+                  <p>大盘主力</p>
+                  <strong :class="pnlClass(cnDesk.flow.main)">{{ flowYi(cnDesk.flow.main) }}</strong>
+                  <span>占成交 {{ cnDesk.flow.main_ratio == null ? '—' : `${cnDesk.flow.main_ratio > 0 ? '+' : ''}${Number(cnDesk.flow.main_ratio).toFixed(2)}%` }}</span>
+                </div>
+              </div>
+            </a-tooltip>
+            <div class="main-flow-tiers">
+              <span v-for="row in flowTiers.slice(1)" :key="row.label">
+                <span class="breadth-book-label">
+                  <span class="price-metric-icon" :class="flowTone(row.label)"><LineChartOutlined /></span>
+                  <em>{{ row.label }}</em>
+                </span>
+                <strong :class="pnlClass(row.amount)">{{ flowYi(row.amount) }}</strong>
+              </span>
+            </div>
+          </article>
         </div>
+        </div>
+        <CnMarketDesk
+          v-if="store.market === 'cn'"
+          class="price-hero-desk"
+          :symbols="cnDeskSymbols"
+          @ready="onCnDesk"
+          @flow="onCnFlow"
+        />
       </section>
       <section v-if="isPricePage && sentiment && (sentiment.vix || sentiment.indexes?.length)" class="price-tape">
         <div class="price-tape-row">
@@ -3464,8 +3802,16 @@ onUnmounted(() => {
               </span>
             </strong>
           </article>
-          <article v-for="item in sentiment.indexes" :key="item.name">
-            <p>{{ item.name }}</p>
+          <article
+            v-for="item in sentiment.indexes"
+            :key="item.name"
+            :class="{ 'is-linked': INDEX_BOOK[item.name] }"
+            @click="openIndexBook(item.name)"
+          >
+            <p>
+              {{ item.name }}
+              <small v-if="indexCaption(item.name)">{{ indexCaption(item.name) }}</small>
+            </p>
             <strong>
               {{ item.last == null ? '—' : item.last.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}
               <span :class="pnlClass(item.day_change)">
@@ -3550,6 +3896,11 @@ onUnmounted(() => {
             />
             <SymbolCell v-else :symbol="record.symbol" :name="record.name" :logo-url="record.logo_url" />
           </template>
+          <template v-else-if="column.key === 'main_flow'">
+            <span :class="pnlClass(cnFlowBySymbol[record.symbol]?.main)">{{ flowYi(cnFlowBySymbol[record.symbol]?.main) }}</span>
+          </template>
+          <template v-else-if="column.key === 'buy_volume'">{{ flowLots(cnFlowBySymbol[record.symbol]?.buy_volume) }}</template>
+          <template v-else-if="column.key === 'sell_volume'">{{ flowLots(cnFlowBySymbol[record.symbol]?.sell_volume) }}</template>
           <template v-else-if="priceMetricKeys.includes(column.key)">
             <span :class="priceMetricTone(record, column.key)">{{ priceMetricText(record, column.key) }}</span>
           </template>
@@ -3702,11 +4053,14 @@ onUnmounted(() => {
       :footer="null"
     >
       <template #title>
-        <span class="arms-modal-title">市场宽广度与阿姆士指数</span>
+        <span class="arms-modal-title">{{ selectedBook?.universe || '市场宽广度' }} · 阿姆士</span>
       </template>
       <div v-if="armsLoading" class="arms-empty">正在读取最近 22 个交易日</div>
       <div v-else-if="!armsBoard.ready" class="arms-empty">这段行情还没有汇总出来</div>
       <div v-else class="arms-board">
+        <div v-if="armsBoard.focusLabel" class="arms-focus-bar">
+          <span>正在查看 {{ armsBoard.focusLabel }} 的宽广度和阿姆士</span>
+        </div>
         <section class="arms-cards">
           <article>
             <div class="arms-card-head">
@@ -3716,7 +4070,10 @@ onUnmounted(() => {
             </div>
             <div class="arms-card-main">
               <div>
-                <p>高于 MA20 成分股占比 (% Above MA20)</p>
+                <p>
+                  高于 MA20 成分股占比 (% Above MA20)
+                  <template v-if="armsBoard.focusLabel"> · {{ armsBoard.focusLabel }}</template>
+                </p>
                 <div class="arms-figure">
                   <strong>{{ armsBoard.ma20 == null ? '—' : `${armsBoard.ma20.toFixed(1)}%` }}</strong>
                   <span :class="armsBoard.net > 0 ? 'is-up' : armsBoard.net < 0 ? 'is-down' : ''">
@@ -3748,7 +4105,9 @@ onUnmounted(() => {
             </div>
             <div class="arms-card-main">
               <div>
-                <p>实时 TRIN = (A / D) ÷ (AV / DV)</p>
+                <p>
+                  {{ armsBoard.focusLabel ? `${armsBoard.focusLabel} TRIN` : '实时 TRIN' }} = (A / D) ÷ (AV / DV)
+                </p>
                 <div class="arms-figure">
                   <strong>{{ armsBoard.arms == null ? '—' : armsBoard.arms.toFixed(2) }}</strong>
                   <span v-if="armsBoard.adRatio != null && armsBoard.volRatio != null">
@@ -3799,7 +4158,7 @@ onUnmounted(() => {
           <div class="arms-chart-head">
             <div>
               <h3>历史 20 日时序背离与共振分析（主图：{{ armsBoard.indexName || '大盘指数' }} vs % Above MA20 | 副图：TRIN 柱状图与 5 日均线）</h3>
-              <p>紫色柱代表 TRIN ≥ 2.0 的恐慌宣泄极值。</p>
+              <p>紫色柱代表 TRIN ≥ 2.0 的恐慌宣泄极值。鼠标移到某一天，上方读数和结论会跟着变。</p>
             </div>
             <div class="arms-legend">
               <span><i class="is-index"></i>{{ armsBoard.indexName || '大盘指数' }}</span>
@@ -3863,7 +4222,7 @@ onUnmounted(() => {
           v-model:value="trendSymbol"
           show-search
           option-filter-prop="label"
-          :options="data.items.map((item) => ({ value: item.symbol, label: item.name || tickerOf(item.symbol) }))"
+          :options="trendSelectOptions"
         />
       </div>
       <div v-if="trendLatest" class="trend-marks">
@@ -3932,6 +4291,9 @@ onUnmounted(() => {
         <span><em>RSI</em><b>{{ adviceNum(trendCursor.rsi, 1) }}</b></span>
         <span><em>止损K线</em><b>{{ trendCursor.stop_candle || '—' }}</b></span>
       </div>
+      <p v-if="trendCursor?.drawdown_pct != null && trendCursor?.rebound_pct != null" class="trend-swing">
+        近 22 日从 {{ trendCursor.swing_high_date }} 高点回撤 {{ Number(trendCursor.drawdown_pct).toFixed(1) }}%，从 {{ trendCursor.swing_low_date }} 低点反弹 {{ Number(trendCursor.rebound_pct).toFixed(1) }}%
+      </p>
       <div v-if="trendReadyStrategies.length" class="trend-strategies">
         <article
           v-for="item in trendReadyStrategies"
@@ -4331,7 +4693,7 @@ onUnmounted(() => {
 
 .trade-steps :deep(.ant-steps-item-description) {
   font-size: 12px;
-  color: #787b86;
+  color: var(--muted);
   padding-bottom: 12px;
 }
 
@@ -4354,12 +4716,12 @@ onUnmounted(() => {
 
 .holdings-summary-row :deep(td) {
   font-weight: 600;
-  background: #f7f8fa !important;
+  background: var(--chip) !important;
 }
 
 .cycle-inner-table {
   margin: 0;
-  background: #fafbfc;
+  background: var(--chip);
 }
 
 .cycle-inner-table :deep(.ant-table) {
@@ -4367,7 +4729,7 @@ onUnmounted(() => {
 }
 
 .cycle-inner-table :deep(.ant-table-thead > tr > th) {
-  background: #f0f3f6;
+  background: var(--chip);
   font-size: 12px;
 }
 
@@ -4394,7 +4756,7 @@ onUnmounted(() => {
   font-size: 12px;
   line-height: 20px;
   border-radius: 6px;
-  background: #f0f3fa;
+  background: var(--chip);
 }
 
 .holding-action-link:hover {
@@ -4480,7 +4842,7 @@ onUnmounted(() => {
 }
 
 .holding-limit-line {
-  color: #787b86;
+  color: var(--muted);
 }
 
 .positions-table :deep(.symbol-meta .name),
@@ -4494,7 +4856,7 @@ onUnmounted(() => {
 .cumulative-table :deep(.ant-table-cell-fix-right),
 .closed-table :deep(.ant-table-cell-fix-left),
 .holdings-table :deep(.ant-table-cell-fix-left) {
-  background: #fff;
+  background: var(--panel);
 }
 
 .positions-table :deep(.ant-table-cell-fix-right-first),
@@ -4540,12 +4902,12 @@ onUnmounted(() => {
 .calculator-overview span,
 .calculator-result span,
 .calculator-field > span {
-  color: #787b86;
+  color: var(--muted);
   font-size: 12px;
 }
 
 .calculator-overview strong {
-  color: #131722;
+  color: var(--text);
   font-size: 15px;
   font-variant-numeric: tabular-nums;
 }
@@ -4613,20 +4975,20 @@ onUnmounted(() => {
 .calculator-result {
   min-width: 0;
   padding: 12px;
-  border: 1px solid #e5e8ee;
+  border: 1px solid var(--border);
   border-radius: 9px;
-  background: #fff;
+  background: var(--panel);
 }
 
 .calculator-result strong {
-  color: #131722;
+  color: var(--text);
   font-size: 16px;
   font-variant-numeric: tabular-nums;
 }
 
 .calculator-note {
   margin: 0;
-  color: #787b86;
+  color: var(--muted);
   font-size: 12px;
   line-height: 1.6;
 }
@@ -4825,7 +5187,7 @@ onUnmounted(() => {
   max-width: 1440px;
   margin: 0 auto;
   padding: 8px 0 32px;
-  color: #243047;
+  color: var(--text);
 }
 
 .price-header {
@@ -4841,7 +5203,7 @@ onUnmounted(() => {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.06em;
-  color: #7b8598;
+  color: var(--muted);
 }
 
 .price-title {
@@ -4866,7 +5228,7 @@ onUnmounted(() => {
   margin: 8px 0 0;
   font-size: 13px;
   line-height: 1.6;
-  color: #7b8598;
+  color: var(--muted);
 }
 
 .price-header-actions {
@@ -4881,7 +5243,7 @@ onUnmounted(() => {
   border-radius: 9px;
   border-color: #dce3f4;
   color: #4662bf;
-  background: #f9faff;
+  background: var(--chip);
   font-size: 12px;
   box-shadow: none;
 }
@@ -4889,7 +5251,7 @@ onUnmounted(() => {
 .price-hero {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1.08fr) minmax(390px, 0.92fr);
+  grid-template-columns: minmax(180px, 1fr) minmax(0, 62%);
   gap: 34px;
   align-items: center;
   overflow: hidden;
@@ -4913,7 +5275,9 @@ onUnmounted(() => {
 }
 
 .price-hero-copy,
-.price-metrics {
+.price-hero-side,
+.price-metrics,
+.price-hero-desk {
   position: relative;
   z-index: 1;
 }
@@ -4969,10 +5333,142 @@ onUnmounted(() => {
   color: #687b89;
 }
 
+.price-hero-side {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.breadth-books {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.breadth-book {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 14px 14px 12px;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.84);
+  border: 1px solid rgba(219, 227, 239, 0.95);
+  border-radius: 14px;
+  box-shadow: 0 5px 18px rgba(46, 70, 105, 0.035);
+  cursor: pointer;
+}
+.breadth-book:hover {
+  border-color: #c9d7ee;
+}
+.breadth-book:focus-visible {
+  outline: 2px solid #21836f;
+  outline-offset: 2px;
+}
+.breadth-book.is-on {
+  border-color: #21836f;
+  background: var(--panel);
+  box-shadow: 0 8px 20px rgba(33, 131, 111, 0.08);
+}
+.breadth-book-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.breadth-book-name {
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+.breadth-book-pair {
+  flex: none;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgba(33, 131, 111, 0.1);
+  color: #1b6b5b;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+.breadth-book-count {
+  margin-top: -4px;
+  color: #5d6f80;
+  font-size: 11px;
+}
+.breadth-book-sample {
+  color: #7b8794;
+  font-size: 10px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+.breadth-book-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+  margin-top: 2px;
+}
+.breadth-book-stats > span {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+}
+.breadth-book-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.breadth-book-stats .price-metric-icon {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  font-size: 11px;
+}
+.breadth-book-stats em {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 500;
+  color: #5d6f80;
+}
+.breadth-book-stats strong {
+  display: block;
+  font-size: 16px;
+  font-weight: 680;
+  line-height: 1.2;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.breadth-book-stats strong.pnl-up {
+  color: #089981;
+}
+.breadth-book-stats strong.pnl-down {
+  color: #f23645;
+}
+.main-flow-tiers {
+  display: none;
+}
+.price-tape article p small {
+  display: block;
+  margin-top: 2px;
+  color: #5d6f80;
+  font-size: 11px;
+  font-weight: 400;
+}
 .price-metrics {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
+}
+
+.price-hero:has(.price-hero-desk) {
+  align-items: start;
 }
 
 .price-metrics article {
@@ -4996,8 +5492,19 @@ onUnmounted(() => {
   border-color: #c9d7ee;
 }
 
+.metric-hit {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+}
+
+.price-metrics article:has(.metric-hit) {
+  display: block;
+}
+
 .arms-modal-title {
-  color: #131722;
+  color: var(--text);
   font-weight: 700;
 }
 
@@ -5005,13 +5512,25 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  color: #1e293b;
+  color: var(--text);
+}
+
+.arms-focus-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #dbe4f0;
+  border-radius: 10px;
+  background: var(--chip);
+  color: #475569;
+  font-size: 12px;
 }
 
 .arms-kicker,
 .arms-note {
   margin: 0;
-  color: #64748b;
+  color: var(--muted);
   font-size: 12px;
   line-height: 1.6;
 }
@@ -5027,9 +5546,9 @@ onUnmounted(() => {
 .arms-views article,
 .arms-chart-card,
 .arms-synergy {
-  border: 1px solid #e6ebf2;
+  border: 1px solid var(--border);
   border-radius: 12px;
-  background: #fff;
+  background: var(--panel);
 }
 
 .arms-cards article,
@@ -5051,13 +5570,13 @@ onUnmounted(() => {
 }
 
 .arms-card-head h3 small {
-  color: #64748b;
+  color: var(--muted);
   font-size: 12px;
   font-weight: 500;
 }
 
 .arms-tag {
-  color: #64748b;
+  color: var(--muted);
   font-family: ui-monospace, Consolas, monospace;
   font-size: 11px;
 }
@@ -5086,7 +5605,7 @@ onUnmounted(() => {
 .arms-views h3,
 .arms-synergy h3 {
   margin: 0;
-  color: #131722;
+  color: var(--text);
   font-size: 14px;
   font-weight: 650;
 }
@@ -5099,7 +5618,7 @@ onUnmounted(() => {
 .arms-chart-head p,
 .arms-gauge-scale,
 .arms-legend {
-  color: #64748b;
+  color: var(--muted);
   font-size: 12px;
 }
 
@@ -5117,13 +5636,13 @@ onUnmounted(() => {
 .arms-card-head em.is-down { color: #f87171; background: rgba(239, 68, 68, 0.12); border-color: rgba(239, 68, 68, 0.4); }
 .arms-card-head em.is-hot { color: #fbbf24; background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.4); }
 .arms-card-head em.is-ice { color: #c084fc; background: rgba(168, 85, 247, 0.16); border-color: rgba(168, 85, 247, 0.45); }
-.arms-card-head em.is-flat { color: #475569; background: #f1f5f9; border-color: #e2e8f0; }
+.arms-card-head em.is-flat { color: #475569; background: var(--chip); border-color: #e2e8f0; }
 
 .arms-synergy.is-up { background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.4); }
 .arms-synergy.is-down { background: rgba(239, 68, 68, 0.08); border-color: rgba(239, 68, 68, 0.4); }
 .arms-synergy.is-hot { background: rgba(245, 158, 11, 0.08); border-color: rgba(245, 158, 11, 0.4); }
 .arms-synergy.is-ice { background: rgba(168, 85, 247, 0.1); border-color: rgba(168, 85, 247, 0.45); }
-.arms-synergy.is-flat { background: #f8fafc; border-color: #e2e8f0; }
+.arms-synergy.is-flat { background: var(--chip); border-color: #e2e8f0; }
 .arms-synergy p strong {
   margin-left: 6px;
   font-size: 14px;
@@ -5133,7 +5652,7 @@ onUnmounted(() => {
 .arms-synergy.is-down p strong { color: #f87171; }
 .arms-synergy.is-hot p strong { color: #fbbf24; }
 .arms-synergy.is-ice p strong { color: #c084fc; }
-.arms-synergy.is-flat p strong { color: #131722; }
+.arms-synergy.is-flat p strong { color: var(--text); }
 
 .arms-gauge-scale {
   font-size: 11px;
@@ -5157,7 +5676,7 @@ onUnmounted(() => {
 
 .arms-card-main strong {
   display: block;
-  color: #131722;
+  color: var(--text);
   font-size: 36px;
   line-height: 1.1;
 }
@@ -5177,7 +5696,7 @@ onUnmounted(() => {
 
 .arms-card-main span,
 .arms-split span {
-  color: #334155;
+  color: var(--text);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
@@ -5187,7 +5706,7 @@ onUnmounted(() => {
   margin-top: 6px;
   padding: 2px 8px;
   border-radius: 6px;
-  background: #f1f5f9;
+  background: var(--chip);
 }
 
 .arms-split {
@@ -5249,7 +5768,7 @@ onUnmounted(() => {
   margin-top: -4px;
   border: 2px solid #020617;
   border-radius: 4px;
-  background: #fff;
+  background: var(--panel);
   transform: translateX(-50%);
 }
 
@@ -5267,7 +5786,7 @@ onUnmounted(() => {
   width: 36px;
   height: 36px;
   border-radius: 8px;
-  background: #f1f5f9;
+  background: var(--chip);
   font-size: 18px;
 }
 
@@ -5329,7 +5848,7 @@ onUnmounted(() => {
 .arms-empty {
   padding: 48px 0;
   text-align: center;
-  color: #64748b;
+  color: var(--muted);
 }
 
 .arms-chart {
@@ -5363,7 +5882,7 @@ onUnmounted(() => {
   line-height: 1.22;
   letter-spacing: -0.035em;
   font-variant-numeric: tabular-nums;
-  color: #31445b;
+  color: var(--text);
 }
 
 .price-metrics strong.pnl-up,
@@ -5378,7 +5897,8 @@ onUnmounted(() => {
   color: #f23645;
 }
 
-.price-metrics article > div > span {
+.price-metrics article > div > span:not(.price-metric-icon),
+.price-metrics .metric-hit > div > span {
   display: block;
   margin-top: 6px;
   font-size: 11px;
@@ -5412,6 +5932,14 @@ onUnmounted(() => {
   background: rgba(255, 255, 255, 0.72);
 }
 
+.price-tape article.is-linked {
+  cursor: pointer;
+}
+
+.price-tape article.is-linked:hover {
+  border-color: #c9d7ee;
+}
+
 .price-tape p {
   margin: 0 0 6px;
   font-size: 12px;
@@ -5439,7 +5967,7 @@ onUnmounted(() => {
   display: block;
   margin-top: 4px;
   font-size: 12px;
-  color: #8994a1;
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
 
@@ -5480,8 +6008,8 @@ onUnmounted(() => {
 .price-section-badge {
   padding: 3px 8px;
   border-radius: 5px;
-  background: #f3f5f9;
-  color: #8992a4;
+  background: var(--chip);
+  color: var(--muted);
   font-size: 11px;
   font-weight: 400;
 }
@@ -5490,7 +6018,7 @@ onUnmounted(() => {
   margin: 0 0 14px;
   font-size: 12px;
   line-height: 1.7;
-  color: #7b8598;
+  color: var(--muted);
 }
 
 .price-toolbar {
@@ -5498,15 +6026,15 @@ onUnmounted(() => {
 }
 
 .price-page .price-table :deep(.ant-table) {
-  border: 1px solid #e7ebf2;
+  border: 1px solid var(--border);
   border-radius: 16px;
-  background: #fff;
+  background: var(--panel);
   box-shadow: 0 4px 16px rgba(38, 58, 95, 0.025);
 }
 
 .price-page .price-table :deep(.ant-table-thead > tr > th) {
-  background: #f8f9fc;
-  color: #7b8598;
+  background: var(--chip);
+  color: var(--muted);
   font-size: 12px;
   font-weight: 600;
 }
@@ -5532,6 +6060,110 @@ onUnmounted(() => {
     grid-template-columns: 1fr;
     gap: 26px;
     padding: 28px;
+  }
+
+  .price-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .breadth-books {
+    grid-template-columns: 1fr;
+  }
+
+  .breadth-book-stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px 6px;
+  }
+
+  .breadth-book-stats strong {
+    font-size: 14px;
+  }
+
+  .price-metrics .is-main-flow {
+    grid-column: 1 / -1;
+  }
+
+  .is-main-flow .metric-hit {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "icon title amount"
+      "icon ratio amount";
+    align-items: center;
+    column-gap: 0px;
+    row-gap: 2px;
+  }
+
+  .is-main-flow .metric-hit > div {
+    display: contents;
+  }
+
+  .is-main-flow .metric-hit .price-metric-icon {
+    grid-area: icon;
+    align-self: start;
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    font-size: 11px;
+  }
+
+  .is-main-flow .metric-hit p {
+    grid-area: title;
+    margin: 0;
+    font-size: 13px;
+    font-weight: 650;
+    color: var(--text);
+  }
+
+  .is-main-flow .metric-hit strong {
+    grid-area: amount;
+    justify-self: end;
+    align-self: start;
+    font-size: 18px;
+  }
+
+  .is-main-flow .metric-hit > div > span {
+    grid-area: ratio;
+    margin-top: 0;
+  }
+
+  .main-flow-tiers {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px 6px;
+    margin-top: 12px;
+  }
+
+  .main-flow-tiers > span {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .main-flow-tiers .price-metric-icon {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    font-size: 10px;
+  }
+
+  .main-flow-tiers em {
+    font-style: normal;
+    font-size: 11px;
+    font-weight: 500;
+    color: #5d6f80;
+  }
+
+  .price-metrics .main-flow-tiers strong {
+    display: block;
+    font-size: 13px;
+    font-weight: 680;
+    letter-spacing: -0.03em;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.2;
   }
 }
 
@@ -5700,9 +6332,9 @@ onUnmounted(() => {
   gap: 8px;
   margin: 0 0 6px;
   padding: 10px 12px 8px;
-  border: 1px solid #e7ebf2;
+  border: 1px solid var(--border);
   border-radius: 12px;
-  background: #fff;
+  background: var(--panel);
   font-variant-numeric: tabular-nums;
 }
 
@@ -5714,7 +6346,7 @@ onUnmounted(() => {
 }
 
 .trend-quote-date {
-  color: #7b8598;
+  color: var(--muted);
   font-size: 12px;
   font-weight: 650;
 }
@@ -5752,11 +6384,11 @@ onUnmounted(() => {
   min-width: 0;
   padding: 6px 8px;
   border-radius: 8px;
-  background: #f8f9fc;
+  background: var(--chip);
 }
 
 .trend-quote-grid em {
-  color: #7b8598;
+  color: var(--muted);
   font-size: 11px;
   font-style: normal;
   font-weight: 600;
@@ -5764,7 +6396,7 @@ onUnmounted(() => {
 }
 
 .trend-quote-grid b {
-  color: #243047;
+  color: var(--text);
   font-size: 13px;
   line-height: 1.2;
   white-space: nowrap;
@@ -5801,7 +6433,7 @@ onUnmounted(() => {
 
 .trend-topline em {
   margin-right: 4px;
-  color: #7b8598;
+  color: var(--muted);
   font-style: normal;
   font-weight: 650;
 }
@@ -5817,10 +6449,17 @@ onUnmounted(() => {
   margin: 0 10px 6px;
 }
 
+.trend-swing {
+  margin: 0 0 10px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .trend-strategy {
   padding: 6px 8px;
   border-radius: 8px;
-  background: #f3f5f8;
+  background: var(--chip);
   color: #667085;
   font-size: 12px;
 }
@@ -5839,7 +6478,7 @@ onUnmounted(() => {
 
 .trend-strategy p {
   margin: 4px 0 0;
-  color: #243047;
+  color: var(--text);
   line-height: 1.4;
 }
 
@@ -5862,14 +6501,14 @@ onUnmounted(() => {
 }
 
 .trend-table :deep(.ant-table) {
-  border: 1px solid #e7ebf2;
+  border: 1px solid var(--border);
   border-radius: 14px;
   overflow: hidden;
 }
 
 .trend-table :deep(.ant-table-thead > tr > th) {
-  background: #f8f9fc;
-  color: #7b8598;
+  background: var(--chip);
+  color: var(--muted);
   font-size: 12px;
   font-weight: 600;
 }
@@ -5887,7 +6526,7 @@ onUnmounted(() => {
   font-weight: 650;
   line-height: 1.55;
   letter-spacing: -0.02em;
-  color: #243047;
+  color: var(--text);
 }
 
 .trend-levels {
@@ -6063,7 +6702,7 @@ onUnmounted(() => {
   line-height: 20px;
   padding: 3px 8px;
   border-radius: 6px;
-  background: #f4f6fa;
+  background: var(--chip);
   color: #5c6b82;
 }
 
@@ -6169,6 +6808,100 @@ onUnmounted(() => {
     height: 320px;
   }
 }
+
+:global(html[data-theme='dark'] .price-hero) {
+  background: #1a1e27;
+  border-color: var(--border);
+}
+
+:global(html[data-theme='dark'] .breadth-book),
+:global(html[data-theme='dark'] .breadth-book.is-on),
+:global(html[data-theme='dark'] .price-metrics article) {
+  background: #262b36;
+  border-color: #363a45;
+  color: var(--text);
+}
+
+:global(html[data-theme='dark'] .breadth-book-count),
+:global(html[data-theme='dark'] .breadth-book-sample),
+:global(html[data-theme='dark'] .breadth-book-stats em),
+:global(html[data-theme='dark'] .price-kicker),
+:global(html[data-theme='dark'] .price-hero-note),
+:global(html[data-theme='dark'] .price-hero-meta span) {
+  color: var(--muted);
+}
+
+:global(html[data-theme='dark'] .price-hero-meta span) {
+  background: #262b36;
+  border-color: var(--border);
+}
+
+:global(html[data-theme='dark'] .trend-strategy) {
+  color: var(--muted);
+}
+
+:global(html[data-theme='dark'] .trend-brief-grid article) {
+  background: #262b36;
+  border-color: var(--border);
+}
+
+:global(html[data-theme='dark'] .trend-brief-grid h3) {
+  color: #5dbea8;
+}
+
+:global(html[data-theme='dark'] .trend-levels .is-stop) {
+  background: rgba(242, 54, 69, 0.12);
+  border-color: rgba(242, 54, 69, 0.35);
+}
+
+:global(html[data-theme='dark'] .trend-levels .is-target) {
+  background: rgba(8, 153, 129, 0.12);
+  border-color: rgba(8, 153, 129, 0.35);
+}
+
+:global(html[data-theme='dark'] .trend-mark.is-up) {
+  background: rgba(8, 153, 129, 0.16);
+  color: #5dbea8;
+}
+
+:global(html[data-theme='dark'] .trend-mark.is-down) {
+  background: rgba(242, 54, 69, 0.16);
+  color: #ff8b95;
+}
+
+:global(html[data-theme='dark'] .trend-mark.is-warn) {
+  background: rgba(230, 167, 0, 0.16);
+  color: #f0c14d;
+}
+
+:global(html[data-theme='dark'] .trend-mark.is-info) {
+  background: rgba(59, 111, 216, 0.16);
+  color: #8eb4ff;
+}
+
+:global(html[data-theme='dark'] .advice-stage) {
+  color: var(--muted);
+}
+
+:global(html[data-theme='dark'] .advice-stage.is-success) {
+  background: rgba(8, 153, 129, 0.16);
+  color: #5dbea8;
+}
+
+:global(html[data-theme='dark'] .advice-stage.is-danger),
+:global(html[data-theme='dark'] .advice-stage.is-warning) {
+  background: rgba(242, 54, 69, 0.16);
+  color: #ff8b95;
+}
+
+:global(html[data-theme='dark'] .advice-stage.is-info) {
+  background: rgba(59, 111, 216, 0.16);
+  color: #8eb4ff;
+}
+
+:global(html[data-theme='dark'] .trend-chart) {
+  background: var(--panel);
+}
 </style>
 
 <style>
@@ -6177,9 +6910,9 @@ onUnmounted(() => {
 }
 
 .arms-modal .ant-modal-content {
-  background: #fff;
-  color: #1e293b;
-  border: 1px solid #e6ebf2;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
 }
 
 .arms-modal .ant-modal-header {
@@ -6187,7 +6920,7 @@ onUnmounted(() => {
 }
 
 .arms-modal .ant-modal-close {
-  color: #64748b;
+  color: var(--muted);
 }
 
 .arms-modal .ant-modal-body {

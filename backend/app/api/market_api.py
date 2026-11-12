@@ -4,7 +4,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.models.entities import SymbolMeta, Trade
-from app.schemas.portfolio import BreadthHistory, MarketSentiment, QuoteOut, SymbolSearchItem
+from app.schemas.portfolio import BreadthHistory, CnMarketDesk, CnStockFlowBook, MarketSentiment, QuoteOut, SymbolSearchItem
+from app.services.cn_desk import cn_market_desk, cn_stock_flow
 from app.services.market import get_quotes, refresh_quotes_sync
 from app.services.market_scope import current_market, in_market
 from app.services.sentiment import breadth_history_payload, build_market_sentiment
@@ -20,9 +21,21 @@ def market_sentiment(db: Session = Depends(get_db)):
 
 
 @router.get("/market/breadth-history", response_model=BreadthHistory)
-def market_breadth_history(db: Session = Depends(get_db)):
-    """Recent advance/decline and Arms readings for the selected market."""
-    return breadth_history_payload(db, current_market())
+def market_breadth_history(book: str = Query(""), db: Session = Depends(get_db)):
+    """Recent advance/decline and Arms readings for one book."""
+    return breadth_history_payload(db, current_market(), book)
+
+
+@router.get("/market/cn-desk", response_model=CnMarketDesk)
+def market_cn_desk():
+    """A-share breadth, turnover, fund flow, and northbound summary."""
+    return cn_market_desk()
+
+
+@router.get("/market/cn-stock-flow", response_model=CnStockFlowBook)
+def market_cn_stock_flow(symbols: str = Query("")):
+    """Latest main-force flow and inner/outer volume for the given A-share symbols."""
+    return cn_stock_flow([part.strip() for part in symbols.split(",") if part.strip()])
 
 
 @router.get("/market/quote", response_model=list[QuoteOut])

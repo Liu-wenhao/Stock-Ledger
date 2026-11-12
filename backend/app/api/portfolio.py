@@ -31,8 +31,11 @@ from app.schemas.portfolio import (
     ProfitSeriesResponse,
     ReviewResponse,
     StrategyResponse,
+    BacktestResponse,
 )
 from app.services import ledger, review
+from app.services.ak_backtest import run_book_backtest
+from app.services.market_scope import current_market
 from app.services.signals import build_holdings_advice, build_indicator_history
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
@@ -54,6 +57,43 @@ def _filter_rows(items: list[dict], q: str | None) -> list[dict]:
 
 def _sum(items: list[dict], key: str) -> Decimal:
     return sum((i[key] for i in items), ZERO)
+
+
+def _dec_value(value) -> Decimal:
+    if value is None or value == "":
+        return ZERO
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return ZERO
+
+
+def _order_price_board(items: list[dict]) -> list[dict]:
+    """Open names by position size, then flat names by realized loss."""
+    held = []
+    closed = []
+    rest = []
+    for item in items:
+        if item.get("closed"):
+            last = item.get("last_price")
+            prev = item.get("prev_close")
+            if last is not None and prev is not None:
+                last_d = _dec_value(last)
+                prev_d = _dec_value(prev)
+                if prev_d != 0 and last_d > 0:
+                    change = last_d - prev_d
+                    item["day_change"] = change
+                    item["day_change_percent"] = (change / prev_d * Decimal("100")).quantize(Decimal("0.01"))
+            closed.append(item)
+        elif _dec_value(item.get("quantity")) > 0:
+            held.append(item)
+        else:
+            rest.append(item)
+    held.sort(key=lambda item: str(item.get("symbol") or ""))
+    held.sort(key=lambda item: _dec_value(item.get("market_value")), reverse=True)
+    closed.sort(key=lambda item: str(item.get("symbol") or ""))
+    closed.sort(key=lambda item: _dec_value(item.get("realized_pnl")))
+    return [*held, *closed, *rest]
 
 
 def _attach_position_stops(db: Session, items: list[dict], portfolio_id: int) -> list[dict]:
@@ -263,9 +303,10 @@ def holdings(
             cash=data["cash"],
         )
 
-    data = ledger.compute_holdings(db, include_closed=include_closed)
+    data = ledger.compute_holdings(db, include_closed=include_closed or watch)
     items = _merge_watch_rows(db, data["items"]) if watch else data["items"]
-    items = _sort_holding_rows(_filter_rows(items, q), sort_by, sort_order)
+    items = _filter_rows(items, q)
+    items = _order_price_board(items) if watch and not sort_by else _sort_holding_rows(items, sort_by, sort_order)
     items = review.enrich_holding_stop_levels(items)
     items = _attach_position_stops(db, items, settings.default_portfolio_id)
     return HoldingsResponse(
@@ -408,12 +449,32 @@ def profit_series(range: str = Query("3M"), db: Session = Depends(get_db)):
 
 
 @router.get("/analysis/review", response_model=ReviewResponse)
-def trading_review(db: Session = Depends(get_db)):
-    """Trading-behaviour review: win rate, payoff, chases, hold times."""
-    return review.build_review(db)
+def trading_review(
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Trading-behaviour review for a date range. Defaults to the last month."""
+    return review.build_review(db, start=start, end=end)
 
 
 @router.get("/analysis/strategy", response_model=StrategyResponse)
-def trading_strategy(db: Session = Depends(get_db)):
+def trading_strategy(
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+    db: Session = Depends(get_db),
+):
     """Position actions and post-exit re-entry candidates for the strategy page."""
-    return review.build_strategy(db)
+    return review.build_strategy(db, start=start, end=end)
+
+
+@router.get("/analysis/backtest", response_model=BacktestResponse)
+def analysis_backtest(
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """AKQuant replay of the price-page rules. Separate from ledger P&L."""
+    if start and end and start > end:
+        raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+    return run_book_backtest(db, current_market(), start, end)

@@ -11,3 +11,4 @@ __pycache__/
 .cursor/
 frontend/dist/
 backend/.venv/
+backend/data/

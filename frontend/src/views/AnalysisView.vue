@@ -276,7 +276,7 @@ onUnmounted(() => {
   margin: 0 0 8px;
   font-size: 18px;
   font-weight: 700;
-  color: #131722;
+  color: var(--text);
   line-height: 1.3;
 }
 
@@ -314,16 +314,16 @@ onUnmounted(() => {
 }
 
 .profit-chip:hover {
-  background: #f7f8fa;
+  background: var(--chip);
 }
 
 .profit-chip.active {
-  background: #f0f3fa;
+  background: var(--chip);
 }
 
 .chip-label {
   font-size: 12px;
-  color: #787b86;
+  color: var(--muted);
   line-height: 1.35;
 }
 
@@ -345,7 +345,7 @@ onUnmounted(() => {
 }
 
 .muted {
-  color: #787b86;
+  color: var(--muted);
 }
 
 @media (max-width: 800px) {
@@ -382,7 +382,7 @@ onUnmounted(() => {
 
   .profit-chip {
     padding: 9px 6px;
-    border: 1px solid #e0e3eb;
+    border: 1px solid var(--border);
   }
 
   .profit-chip.active {

@@ -7,6 +7,7 @@ import locale from 'ant-design-vue/es/calendar/locale/zh_CN'
 import { fetchDailyHoldings, fetchDailyPnl, fetchPeriodHoldings } from '@/api/portfolio'
 import SymbolCell from '@/components/SymbolCell.vue'
 import { formatMoney, formatPct, pnlClass, toNumber } from '@/utils/format'
+import { useTheme } from '@/composables/useTheme'
 
 dayjs.extend(updateLocale)
 dayjs.updateLocale('zh-cn', { weekStart: 0 })
@@ -37,6 +38,7 @@ const PERIOD_NET = {
 }
 
 const loading = ref(false)
+const { isDark } = useTheme()
 const granularity = ref('day')
 const year = ref(new Date().getFullYear())
 const month = ref(new Date().getMonth() + 1)
@@ -115,9 +117,11 @@ const summaryCards = computed(() => {
 function cellBackground(pnl) {
   if (pnl == null || pnl === '') return {}
   const n = toNumber(pnl)
-  if (n === 0) return { background: '#f5f6fa' }
+  if (n === 0) return { background: isDark.value ? '#2a2e39' : '#f5f6fa' }
   return {
-    background: n > 0 ? 'rgba(38, 166, 154, 0.35)' : 'rgba(239, 83, 80, 0.35)',
+    background: n > 0
+      ? isDark.value ? 'rgba(8, 153, 129, 0.32)' : 'rgba(38, 166, 154, 0.35)'
+      : isDark.value ? 'rgba(242, 54, 69, 0.32)' : 'rgba(239, 83, 80, 0.35)',
   }
 }
 
@@ -728,21 +732,21 @@ load()
   margin: 0;
   font-size: 16px;
   font-weight: 700;
-  color: #131722;
+  color: var(--text);
 }
 
 .granularity-toggle {
   display: inline-flex;
   gap: 4px;
   padding: 4px;
-  background: #f0f3fa;
+  background: var(--chip);
   border-radius: 8px;
 }
 
 .mode-btn {
   border: none;
   background: transparent;
-  color: #787b86;
+  color: var(--muted);
   font-size: 13px;
   font-weight: 600;
   padding: 4px 12px;
@@ -751,8 +755,8 @@ load()
 }
 
 .mode-btn.active {
-  background: #131722;
-  color: #fff;
+  background: var(--text);
+  color: var(--panel);
 }
 
 .summary-grid {
@@ -763,27 +767,27 @@ load()
 }
 
 .summary-card {
-  background: #fff;
-  border: 1px solid #e0e3eb;
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px 14px;
 }
 
 .summary-label {
   font-size: 12px;
-  color: #787b86;
+  color: var(--muted);
   margin-bottom: 6px;
 }
 
 .summary-value {
   font-size: 18px;
   font-weight: 700;
-  color: #131722;
+  color: var(--text);
 }
 
 .pnl-calendar {
-  background: #fff;
-  border: 1px solid #e0e3eb;
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 12px 12px;
 }
@@ -806,7 +810,7 @@ load()
   text-align: center;
   font-size: 15px;
   font-weight: 700;
-  color: #131722;
+  color: var(--text);
 }
 
 .pnl-calendar :deep(.ant-picker-calendar-date) {
@@ -907,7 +911,7 @@ load()
   background:
     radial-gradient(circle at 100% 0, rgba(41, 98, 255, 0.035), transparent 28%),
     #fff;
-  border: 1px solid #e0e3eb;
+  border: 1px solid var(--border);
   border-radius: 12px;
   box-shadow: 0 10px 28px rgba(19, 23, 34, 0.055);
 }
@@ -928,7 +932,7 @@ load()
 
 .daily-holdings-title {
   margin: 0;
-  color: #131722;
+  color: var(--text);
   font-size: 17px;
   font-weight: 750;
   letter-spacing: -0.01em;
@@ -967,14 +971,14 @@ load()
 }
 
 .daily-total-main strong {
-  color: #131722;
+  color: var(--text);
   font-size: 20px;
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
 }
 
 .daily-total span {
-  color: #787b86;
+  color: var(--muted);
   font-size: 11px;
 }
 
@@ -1024,7 +1028,7 @@ load()
 
 .daily-mover-panel-header h4 {
   margin: 0;
-  color: #272b35;
+  color: var(--text);
   font-size: 13px;
   font-weight: 750;
 }
@@ -1153,7 +1157,7 @@ load()
 
 .daily-mover-value strong {
   overflow: hidden;
-  color: #131722;
+  color: var(--text);
   font-size: 13px;
   font-weight: 750;
   text-overflow: ellipsis;
@@ -1202,7 +1206,7 @@ load()
 .day-cell .cell-date {
   font-size: 14px;
   font-weight: 600;
-  color: #131722;
+  color: var(--text);
   line-height: 1.2;
 }
 
@@ -1215,14 +1219,14 @@ load()
 .month-cell .cell-month {
   font-size: 14px;
   font-weight: 700;
-  color: #131722;
+  color: var(--text);
   line-height: 1.2;
 }
 
 .cell-year {
   font-size: 14px;
   font-weight: 700;
-  color: #131722;
+  color: var(--text);
   line-height: 1.2;
 }
 
@@ -1253,8 +1257,8 @@ load()
 }
 
 .quarter-panel {
-  background: #fff;
-  border: 1px solid #e0e3eb;
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 12px 12px;
 }
@@ -1275,7 +1279,7 @@ load()
 
 .year-cell .cell-body {
   min-height: 96px;
-  border: 1px solid #e0e3eb;
+  border: 1px solid var(--border);
 }
 
 .calendar-empty {
@@ -1285,7 +1289,7 @@ load()
 .hint {
   margin: 12px 0 0;
   font-size: 12px;
-  color: #787b86;
+  color: var(--muted);
 }
 
 @media (max-width: 960px) {
@@ -1445,5 +1449,61 @@ load()
     border-left: none;
     border-top: none;
   }
+}
+
+:global(html[data-theme='dark'] .cell-body--empty),
+:global(html[data-theme='dark'] .cell-body.other-month) {
+  background: #2a2e39;
+}
+
+:global(html[data-theme='dark'] .daily-holdings-card) {
+  background: var(--panel);
+  border-color: var(--border);
+  box-shadow: none;
+}
+
+:global(html[data-theme='dark'] .daily-count-tag),
+:global(html[data-theme='dark'] .daily-total),
+:global(html[data-theme='dark'] .daily-status--holding),
+:global(html[data-theme='dark'] .daily-status--intraday),
+:global(html[data-theme='dark'] .daily-status--closed) {
+  background: #262b36;
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+:global(html[data-theme='dark'] .daily-status--holding) {
+  color: #8eb4ff;
+}
+
+:global(html[data-theme='dark'] .daily-status--intraday) {
+  color: #d7a4ea;
+}
+
+:global(html[data-theme='dark'] .daily-total-breakdown) {
+  border-left-color: var(--border);
+}
+
+:global(html[data-theme='dark'] .daily-total-breakdown b),
+:global(html[data-theme='dark'] .daily-holdings-subtitle),
+:global(html[data-theme='dark'] .daily-mover-panel-header p),
+:global(html[data-theme='dark'] .daily-mover-meta),
+:global(html[data-theme='dark'] .daily-panel-empty),
+:global(html[data-theme='dark'] .cell-empty),
+:global(html[data-theme='dark'] .muted-value) {
+  color: var(--muted);
+}
+
+:global(html[data-theme='dark'] .daily-mover-panel-header),
+:global(html[data-theme='dark'] .daily-mover-row) {
+  border-bottom-color: var(--border);
+}
+
+:global(html[data-theme='dark'] .daily-mover-row:hover) {
+  background: #262b36;
+}
+
+:global(html[data-theme='dark'] .daily-mover-track) {
+  background: #2a2e39;
 }
 </style>

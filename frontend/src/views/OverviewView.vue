@@ -511,7 +511,7 @@ onUnmounted(() => {
   margin: 0 0 12px;
   font-size: 18px;
   font-weight: 700;
-  color: #131722;
+  color: var(--text);
 }
 
 .mode-toggle {
@@ -525,9 +525,9 @@ onUnmounted(() => {
   height: 28px;
   padding: 0 14px;
   border-radius: 14px;
-  border: 1px solid #d1d4dc;
-  background: #fff;
-  color: #131722;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -535,9 +535,9 @@ onUnmounted(() => {
 }
 
 .mode-btn.active {
-  background: #131722;
-  border-color: #131722;
-  color: #fff;
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--panel);
 }
 
 .nav-chart {
@@ -563,16 +563,16 @@ onUnmounted(() => {
 }
 
 .range-chip:hover {
-  background: #f7f8fa;
+  background: var(--chip);
 }
 
 .range-chip.active {
-  background: #f0f3fa;
+  background: var(--chip);
 }
 
 .r-label {
   font-size: 12px;
-  color: #787b86;
+  color: var(--muted);
   line-height: 1.3;
 }
 
@@ -622,7 +622,7 @@ onUnmounted(() => {
 .mover-bar {
   height: 10px;
   border-radius: 5px;
-  background: #eef1f6;
+  background: var(--chip);
   overflow: hidden;
 }
 
@@ -704,7 +704,7 @@ onUnmounted(() => {
 
   .range-chip {
     min-height: 58px;
-    border: 1px solid #e0e3eb;
+    border: 1px solid var(--border);
   }
 
   .range-chip.active {

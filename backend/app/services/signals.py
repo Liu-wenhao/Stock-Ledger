@@ -171,6 +171,7 @@ def _alpha_strategies(bars: list[dict], rsi: float | None, stop_candle: str | No
             "id": strategy_id,
             "name": name,
             "ready": not missed,
+            "missed": len(missed),
             "detail": "条件都满足" if not missed else "、".join(missed),
             "exit": exit_rule,
             "exit_now": exit_now,
@@ -187,7 +188,7 @@ def _alpha_strategies(bars: list[dict], rsi: float | None, stop_candle: str | No
                 ("RSI 低于 70", rsi is not None and rsi < 70),
                 ("没有止损K线", stop_candle is None),
             ],
-            "买入价下跌 4% 止损，盈利达到 3 倍风险止盈，持有满 15 天卖出",
+            "买入价下跌 4% 止损，盈利达到 3 倍风险止盈。持有满 2 日后收盘跌破 20 日线也卖，持有满 15 天卖出",
         ),
         pack(
             "rsi_reversion_v1",
@@ -336,6 +337,7 @@ def _measure(bars: list[dict], live: float | None) -> dict | None:
         else None
     )
     price = live if live and live > 0 else closes[-1]
+    swing_range = _range_move(bars, price)
     mom = mom20
     day = rets[-1] if rets else None
     avg_dollar = mean(amounts[-20:]) if len(amounts) >= 20 else None
@@ -384,6 +386,10 @@ def _measure(bars: list[dict], live: float | None) -> dict | None:
         "anchor_vwap": anchor,
         "vs_anchor": (price / anchor - 1) if anchor else None,
         "price": price,
+        "drawdown_pct": None if swing_range is None else swing_range["drawdown_pct"],
+        "rebound_pct": None if swing_range is None else swing_range["rebound_pct"],
+        "swing_high_date": None if swing_range is None else swing_range["high_date"],
+        "swing_low_date": None if swing_range is None else swing_range["low_date"],
     }
 
 
@@ -884,7 +890,7 @@ def _metrics(stats: dict | None, row: dict, pe: float | None, us10y: float | Non
 
 
 def build_holdings_advice(db: Session, portfolio_id: int = 1) -> dict:
-    book = compute_holdings(db, portfolio_id)
+    book = compute_holdings(db, portfolio_id, include_closed=True)
     stops = {
         row.symbol: row
         for row in db.query(PositionStop)
@@ -899,13 +905,16 @@ def build_holdings_advice(db: Session, portfolio_id: int = 1) -> dict:
         for item in book.get("items", [])
         if (_f(item.get("quantity")) or 0) > 0 and (_f(item.get("market_value")) or 0) > 0
     ]
+    closed_rows = [item for item in book.get("items", []) if item.get("closed")]
     from app.models.entities import SymbolMeta
     from app.services.market import get_quotes
     from app.services.market_scope import current_market, market_of
     from app.services.symbols import quote_code
     from app.services.watchlist import watch_symbols
 
-    pending = [symbol for symbol in watch_symbols(current_market()) if symbol.upper() not in {item["symbol"].upper() for item in open_rows}]
+    known = {item["symbol"].upper() for item in open_rows}
+    known.update(item["symbol"].upper() for item in closed_rows)
+    pending = [symbol for symbol in watch_symbols(current_market()) if symbol.upper() not in known]
     quotes = get_quotes(db, pending, background_refresh=False)
     names = {
         row.symbol: row.name
@@ -919,6 +928,16 @@ def build_holdings_advice(db: Session, portfolio_id: int = 1) -> dict:
                 "symbol": symbol,
                 "name": quote.get("name") or names.get(symbol),
                 "last_price": quote.get("price"),
+                "market_value": 0,
+                "quantity": 0,
+            }
+        )
+    for item in closed_rows:
+        open_rows.append(
+            {
+                "symbol": item["symbol"],
+                "name": item.get("name"),
+                "last_price": item.get("last_price"),
                 "market_value": 0,
                 "quantity": 0,
             }
@@ -1141,6 +1160,10 @@ def _history_point(stats: dict) -> dict:
         "rsi": rounded("rsi", 1),
         "stop_candle": stats.get("stop_candle"),
         "strategies": stats.get("strategies") or [],
+        "drawdown_pct": stats.get("drawdown_pct"),
+        "rebound_pct": stats.get("rebound_pct"),
+        "swing_high_date": stats.get("swing_high_date"),
+        "swing_low_date": stats.get("swing_low_date"),
     }
 
 
@@ -1327,6 +1350,24 @@ def _close_swing(bars: list[dict], back: int = 5, step: float = 0.01) -> str:
     return "flat"
 
 
+def _range_move(bars: list[dict], price: float | None) -> dict | None:
+    """Drawdown from the 22-session high and rebound from the 22-session low."""
+    if not price or price <= 0 or len(bars) < 22:
+        return None
+    window = bars[-22:]
+    high_bar = _extreme_bar(window, "h")
+    low_bar = _extreme_bar(window, "l")
+    high, low = high_bar["h"], low_bar["l"]
+    if not high or not low or high <= 0 or low <= 0:
+        return None
+    return {
+        "high_date": str(high_bar["d"])[:10],
+        "low_date": str(low_bar["d"])[:10],
+        "drawdown_pct": round((high - price) / high * 100, 1),
+        "rebound_pct": round((price - low) / low * 100, 1),
+    }
+
+
 def _extreme_bar(window: list[dict], key: str) -> dict:
     level = max(bar[key] for bar in window) if key == "h" else min(bar[key] for bar in window)
     return [bar for bar in window if bar[key] == level][-1]
@@ -1503,6 +1544,11 @@ def _trend_brief(bars: list[dict], points: list[dict], ticker: str, pe: float | 
         ma20=measured.get("ma20"),
         pe=pe,
     )
+    if measured.get("drawdown_pct") is not None and measured.get("rebound_pct") is not None:
+        headline += (
+            f"近 22 个交易日从 {measured.get('swing_high_date')} 高点回撤 {measured['drawdown_pct']:.1f}%，"
+            f"从 {measured.get('swing_low_date')} 低点反弹 {measured['rebound_pct']:.1f}%。"
+        )
 
     ma_trend = (
         f"MA5 {_px(measured.get('ma5'))}，MA10 {_px(measured.get('ma10'))}，MA20 {_px(ma20)}。"
@@ -1558,19 +1604,19 @@ def build_indicator_history(symbol: str, before: str | None = None, limit: int =
 
     The window starts on 1 April of the current year. Callers walk backward
     with `before` (exclusive) so a long history is not built in one response.
-    Today's open bar is attached only on the newest page and is not stored.
+    Today's session bar is attached on the newest page when stored bars stop
+    before that session, and that print is not written.
     """
-    from app.services.bars import append_open_bar, bar_key, chart_since, open_session_bars
+    from app.services.bars import append_open_bar, chart_session_bar, chart_since
 
     limit = max(20, min(int(limit or 40), 80))
     since = chart_since().isoformat()
     cutoff = str(before)[:10] if before else ""
     newest = not cutoff
-    from app.services.market_scope import market_of
 
     bars = _load_bars(symbol)
-    if newest and market_of(symbol) not in {"cn", "hk"}:
-        bars = append_open_bar(bars, open_session_bars([symbol]).get(bar_key(symbol)))
+    if newest:
+        bars = append_open_bar(bars, chart_session_bar(symbol, bars))
     eligible = [
         index
         for index, bar in enumerate(bars)

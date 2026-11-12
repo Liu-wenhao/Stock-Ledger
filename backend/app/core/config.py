@@ -18,7 +18,6 @@ class Settings(BaseSettings):
     default_portfolio_name: str = "我的投资组合"
     base_currency: str = "USD"
     # AkShare is the default A-share/HK source. US history and live quotes use YFinance.
-    tushare_token: str = ""
     enable_eastmoney_patch: bool = False
     max_workers: int = 4
     longbridge_oauth_client_id: str = ""

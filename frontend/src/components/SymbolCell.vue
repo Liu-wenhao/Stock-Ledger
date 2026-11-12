@@ -12,6 +12,19 @@ const props = defineProps({
 defineEmits(['pick'])
 
 const ticker = computed(() => tickerOf(props.symbol))
+const listed = computed(() => /^(SSE|SZSE|BSE|HKEX):/.test(String(props.symbol || '').toUpperCase()))
+const chineseName = computed(() => {
+  const name = String(props.name || '').trim()
+  if (!listed.value || !name || name === ticker.value || name === props.symbol) return ''
+  return name
+})
+const primary = computed(() => chineseName.value || ticker.value)
+const secondary = computed(() => {
+  if (chineseName.value) return ticker.value
+  const name = String(props.name || '').trim()
+  if (!name || name === ticker.value || name === props.symbol) return ''
+  return name
+})
 
 // TradingView's primary listing exchange can differ from the exchange
 // prefix used by the ledger/quote provider (especially NYSE Arca ETFs).
@@ -56,11 +69,11 @@ const href = computed(() => {
   >
     <div class="symbol-logo">
       <img v-if="logoUrl" :src="logoUrl" :alt="symbol" />
-      <span v-else>{{ ticker.slice(0, 2) }}</span>
+      <span v-else>{{ primary.slice(0, 2) }}</span>
     </div>
     <div class="symbol-meta">
-      <div class="code">{{ ticker }}</div>
-      <div class="name">{{ name || symbol }}</div>
+      <div class="code">{{ primary }}</div>
+      <div v-if="secondary" class="name">{{ secondary }}</div>
     </div>
   </button>
   <a
@@ -73,21 +86,21 @@ const href = computed(() => {
   >
     <div class="symbol-logo">
       <img v-if="logoUrl" :src="logoUrl" :alt="symbol" />
-      <span v-else>{{ ticker.slice(0, 2) }}</span>
+      <span v-else>{{ primary.slice(0, 2) }}</span>
     </div>
     <div class="symbol-meta">
-      <div class="code">{{ ticker }}</div>
-      <div class="name">{{ name || symbol }}</div>
+      <div class="code">{{ primary }}</div>
+      <div v-if="secondary" class="name">{{ secondary }}</div>
     </div>
   </a>
   <div v-else class="symbol-cell">
     <div class="symbol-logo">
       <img v-if="logoUrl" :src="logoUrl" :alt="symbol" />
-      <span v-else>{{ ticker.slice(0, 2) }}</span>
+      <span v-else>{{ primary.slice(0, 2) }}</span>
     </div>
     <div class="symbol-meta">
-      <div class="code">{{ ticker }}</div>
-      <div class="name">{{ name || symbol }}</div>
+      <div class="code">{{ primary }}</div>
+      <div v-if="secondary" class="name">{{ secondary }}</div>
     </div>
   </div>
 </template>

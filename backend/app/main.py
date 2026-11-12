@@ -27,6 +27,13 @@ def _ensure_schema() -> None:
         "ALTER TABLE position_stop ADD COLUMN max_buy_amount DECIMAL(18, 6) NULL",
         "ALTER TABLE position_stop ADD COLUMN take_profit_price DECIMAL(18, 6) NULL",
         "ALTER TABLE arms_reading ADD COLUMN above_ma20 DECIMAL(8, 2) NULL",
+        "ALTER TABLE arms_reading ADD COLUMN ma_valid INT NULL",
+        "ALTER TABLE arms_reading ADD COLUMN ma_total INT NULL",
+        "ALTER TABLE ma_anchor MODIFY COLUMN symbol VARCHAR(32) NOT NULL",
+        "ALTER TABLE arms_reading ADD COLUMN book VARCHAR(16) NOT NULL DEFAULT 'legacy'",
+        "ALTER TABLE breadth_day ADD COLUMN book VARCHAR(16) NOT NULL DEFAULT 'legacy'",
+        "ALTER TABLE arms_reading DROP PRIMARY KEY, ADD PRIMARY KEY (market, bar_date, phase, book)",
+        "ALTER TABLE breadth_day DROP PRIMARY KEY, ADD PRIMARY KEY (market, bar_date, book)",
         (
             "UPDATE price_cache SET price_as_of = fetched_at "
             "WHERE price_as_of IS NOT NULL "
@@ -68,7 +75,13 @@ def init_db() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    yield
+    from app.services.sentiment import start_close_capture, stop_close_capture
+
+    start_close_capture()
+    try:
+        yield
+    finally:
+        stop_close_capture()
 
 
 class MarketScopeMiddleware:
