@@ -27,10 +27,6 @@ _LIVE_BREADTH_SECONDS = 180
 _lock = threading.Lock()
 _caches: dict[str, dict] = {}
 
-_BREADTH_URL = (
-    "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var/"
-    "US_CategoryService.getList"
-)
 _VIX_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
 _INDEXES = (("标普 500", ".inx"), ("道琼斯", ".dji"), ("纳斯达克", ".ixic"))
 _ARMS_INDEX = {
@@ -179,78 +175,6 @@ def _breadth_payload(
         payload["strong_up"] = sum(1 for value in changes if value >= 2)
         payload["strong_down"] = sum(1 for value in changes if value <= -2)
     return payload
-
-
-def _breadth_page(page: int) -> list[dict]:
-    # The list ignores `num` and returns 20 names per page, ordered by market cap.
-    try:
-        text = _request_text(
-            _BREADTH_URL,
-            params={"page": page, "num": 20, "sort": "", "asc": 0, "market": "", "id": ""},
-            referer="https://finance.sina.com.cn/",
-            timeout=8,
-        )
-    except Exception:
-        return []
-    match = re.search(r"\((\{.*\})\)", text, flags=re.DOTALL)
-    if not match:
-        return []
-    try:
-        payload = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return []
-    rows = []
-    for row in payload.get("data") or []:
-        symbol = str(row.get("symbol") or "")
-        if not symbol:
-            continue
-        try:
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "price": float(row.get("price")),
-                    "preclose": float(row.get("preclose")),
-                    "chg": float(row.get("chg")),
-                    "volume": float(row.get("volume") or 0),
-                }
-            )
-        except (TypeError, ValueError):
-            continue
-    return rows
-
-
-def _breadth() -> dict | None:
-    """Largest 500 US names. Issue counts and TRIN share that list; TRIN uses share volume."""
-    seen: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for rows in pool.map(_breadth_page, range(1, 26)):
-            for row in rows:
-                seen.setdefault(row["symbol"], row)
-    up = down = flat = 0
-    up_volume = down_volume = 0.0
-    changes: list[float] = []
-    for row in seen.values():
-        price, preclose, volume = row["price"], row["preclose"], row["volume"]
-        if preclose <= 0 or price <= 0 or volume <= 0:
-            continue
-        changes.append(row["chg"])
-        if price > preclose:
-            up += 1
-            up_volume += volume
-        elif price < preclose:
-            down += 1
-            down_volume += volume
-        else:
-            flat += 1
-    return _breadth_payload(
-        "市值前 500 只美股",
-        up,
-        down,
-        flat,
-        _arms_value(up, down, up_volume, down_volume),
-        changes=changes,
-        minimum=50,
-    )
 
 
 def _fetch_vix_bars() -> list[dict]:
@@ -852,6 +776,32 @@ def _live_prices(market: str) -> list[dict]:
         prices.append({"symbol": symbol, "code": code, "venue": venue, "price": price})
     if market == "cn" and len(prices) < 1000:
         return _cn_sina_prices()
+    if market == "us" and len(prices) < 8000:
+        logger.warning("US Eastmoney live list is short (%s names); using Sina", len(prices))
+        return _us_sina_prices()
+    return prices
+
+
+def _us_sina_prices() -> list[dict]:
+    """US prints when the Eastmoney list is empty or short. Same shape as `_live_prices`."""
+    prices: list[dict] = []
+    for item in _sina_us_listings():
+        row = item["row"]
+        try:
+            price = float(row.get("price"))
+            volume = float(row.get("volume") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or volume <= 0:
+            continue
+        prices.append(
+            {
+                "symbol": item["code"],
+                "code": item["code"],
+                "venue": item["venue"],
+                "price": price,
+            }
+        )
     return prices
 
 
@@ -943,7 +893,7 @@ def _fill_above_ma20(market: str, day: date, phase: str) -> None:
         return
     through = _previous_weekday(day)
     prices = _live_prices(market)
-    minimum = 1000 if market == "cn" else 800
+    minimum = 1000 if market == "cn" else 8000
     if len(prices) < minimum:
         return
     db = SessionLocal()
@@ -1018,11 +968,11 @@ def _fill_above_ma20(market: str, day: date, phase: str) -> None:
             if row is None:
                 continue
             covered = slot["total"] > 0 and slot["valid"] >= 50 and slot["valid"] >= slot["total"] * _MA_COVERAGE
-            if not covered and slot["valid"] < slot["total"] * 0.5:
+            if not covered:
                 continue
             row.ma_valid = slot["valid"]
             row.ma_total = slot["total"]
-            if row.above_ma20 is None and covered:
+            if row.above_ma20 is None:
                 row.above_ma20 = Decimal(str(round(slot["above"] / slot["valid"] * 100, 1)))
             chart = (
                 db.query(BreadthDay)
@@ -1105,16 +1055,24 @@ def _clist_page(fs: str, fields: str, page: int) -> dict | None:
 
 
 def _clist_rows(fs: str, fields: str) -> list[dict]:
-    """One page at a time. A failed page is retried once, then the scan stops."""
+    """One page at a time. A failed page is skipped after three tries so a short prefix is not stored as the whole list."""
     rows: list[dict] = []
     total = None
-    for page in range(1, 121):
-        data = _clist_page(fs, fields, page)
-        if data is None:
-            time.sleep(2)
+    misses = 0
+    page = 1
+    while page <= 160:
+        data = None
+        for _attempt in range(3):
             data = _clist_page(fs, fields, page)
+            if data:
+                break
+            time.sleep(1.5)
         if not data:
-            break
+            misses += 1
+            if total is None or misses >= 3:
+                break
+            page += 1
+            continue
         if total is None:
             try:
                 total = int(data.get("total") or 0)
@@ -1124,13 +1082,21 @@ def _clist_rows(fs: str, fields: str) -> list[dict]:
         if isinstance(batch, dict):
             batch = list(batch.values())
         if not batch:
+            if total and len(rows) < total:
+                misses += 1
+                if misses >= 3:
+                    break
+                page += 1
+                continue
             break
+        misses = 0
         rows.extend(batch)
         if total and len(rows) >= total:
             break
-        if len(batch) < 100:
+        if len(batch) < 100 and (not total or len(rows) >= total):
             break
-        time.sleep(0.5)
+        page += 1
+        time.sleep(0.35)
     return rows
 
 
@@ -1234,16 +1200,83 @@ def _sina_pages(fetch, page_size: int, limit: int) -> list[dict]:
     return rows
 
 
+def _eastmoney_us_venue(market: str) -> int:
+    """Sina's exchange name to the Eastmoney market id used by the saved books.
+
+    105 is Nasdaq and 106 is NYSE. The stored book keys follow those ids.
+    """
+    text = market.upper()
+    if "NASDAQ" in text:
+        return 105
+    if "NYSE" in text:
+        return 106
+    if "AMEX" in text or "ARCA" in text:
+        return 107
+    return 0
+
+
+def _sina_us_listings() -> list[dict]:
+    """Every Sina US name, with the Eastmoney venue id. Empty when the list is short."""
+    try:
+        text = _request_text(
+            _SINA_US_LIST,
+            params={"page": "1", "num": "20", "sort": "", "asc": "0", "market": "", "id": ""},
+            referer="https://finance.sina.com.cn/",
+            encoding="utf-8",
+            timeout=12,
+        )
+        match = re.search(r"\((\{.*\})\)", text, flags=re.DOTALL)
+        payload = json.loads(match.group(1)) if match else {}
+    except Exception:
+        return []
+    try:
+        count = int(payload.get("count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    pages = max(1, (count + 19) // 20) if count else 1
+    rows = [row for row in payload.get("data") or [] if isinstance(row, dict)]
+
+    def load(page: int) -> list[dict]:
+        try:
+            return _sina_us_page(page)
+        except Exception:
+            time.sleep(0.8)
+            try:
+                return _sina_us_page(page)
+            except Exception:
+                return []
+
+    if pages > 1:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for batch in pool.map(load, range(2, min(pages, 1200) + 1)):
+                rows.extend(batch)
+    listings = []
+    seen: set[str] = set()
+    for item in rows:
+        code = str(item.get("symbol") or "").strip().upper()
+        if not code or code in seen:
+            continue
+        venue = _eastmoney_us_venue(str(item.get("market") or ""))
+        if venue not in {105, 106, 107}:
+            continue
+        seen.add(code)
+        listings.append({"code": code, "venue": venue, "row": item})
+    if len(listings) < 8000:
+        logger.warning("Sina US list is short (%s names)", len(listings))
+        return []
+    return listings
+
+
 def _scan_us_sina() -> dict[str, list]:
     groups = {"us_all": [], "nyse": [], "nasdaq": []}
-    for item in _sina_pages(_sina_us_page, 20, 80):
-        groups["us_all"].append(item)
-        venue = str(item.get("market") or item.get("exchange") or "").upper()
-        if "NASDAQ" in venue:
-            groups["nasdaq"].append(item)
-        elif "NYSE" in venue:
-            groups["nyse"].append(item)
-    if not groups["nyse"] or not groups["nasdaq"]:
+    for item in _sina_us_listings():
+        row = item["row"]
+        groups["us_all"].append(row)
+        if item["venue"] == 105:
+            groups["nyse"].append(row)
+        elif item["venue"] == 106:
+            groups["nasdaq"].append(row)
+    if len(groups["us_all"]) < 8000 or not groups["nyse"] or not groups["nasdaq"]:
         return {"us_all": [], "nyse": [], "nasdaq": []}
     return groups
 
@@ -1261,7 +1294,8 @@ def _scan_us_groups() -> dict[str, list]:
             groups["nyse"].append(row)
         elif venue == 106:
             groups["nasdaq"].append(row)
-    if len(groups["us_all"]) < 800 or not groups["nyse"] or not groups["nasdaq"]:
+    if len(groups["us_all"]) < 8000 or not groups["nyse"] or not groups["nasdaq"]:
+        logger.warning("US Eastmoney list is short (%s names); using Sina", len(groups["us_all"]))
         return _scan_us_sina()
     return groups
 
@@ -1434,8 +1468,10 @@ def ensure_arms_reading(market: str, now: datetime | None = None):
         primary = next((row for row in rows if row.book == _default_book(market)), None)
         if primary is None:
             return None, "", []
+        # Retry while the percentage is still blank. An earlier partial write of
+        # ma_total used to stop the retry even though above_ma20 was never set.
         pending = bool(due) and any(
-            row.ma_total is None and row.bar_date == due[0] and row.phase == due[1]
+            row.above_ma20 is None and row.bar_date == due[0] and row.phase == due[1]
             for row in rows
         )
         if pending:
@@ -1443,7 +1479,7 @@ def ensure_arms_reading(market: str, now: datetime | None = None):
         books = [_public_reading(row) for row in rows]
         if pending:
             for item in books:
-                if item.get("ma_total") is None:
+                if item.get("above_ma20") is None:
                     item["ma_pending"] = True
         books.sort(key=lambda item: _book_order(market, item.get("key")))
         return _public_reading(primary), _arms_caption(primary.phase), books
@@ -1477,7 +1513,7 @@ def _checkpoint_gaps(market: str, day: date, phase: str) -> tuple[bool, bool]:
     finally:
         db.close()
     found = {row.book for row in rows}
-    return bool(wanted - found), any(row.ma_total is None for row in rows)
+    return bool(wanted - found), any(row.above_ma20 is None for row in rows)
 
 
 def capture_due_close(market: str) -> None:
@@ -1545,23 +1581,6 @@ def _book_order(market: str, key: str | None) -> int:
 
 
 _open_counts_cache: dict[str, tuple[float, dict | None]] = {}
-
-
-def _cn_board_counts() -> dict | None:
-    """Advance/decline from the CSI All Share quote. One request, no Arms."""
-    try:
-        text = _request_text(
-            "https://push2.eastmoney.com/api/qt/stock/get",
-            params={"secid": "1.000985", "fltt": "2", "fields": "f113,f114,f115"},
-            referer="https://quote.eastmoney.com/",
-            encoding="utf-8",
-            timeout=8,
-        )
-        data = json.loads(text).get("data") or {}
-        up, down, flat = int(data["f113"]), int(data["f114"]), int(data["f115"])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-    return _breadth_payload("中证全指", up, down, flat, None)
 
 
 def _stored_session_counts(market: str) -> dict | None:
@@ -1671,212 +1690,7 @@ def _read_ratio(breadth: dict | None, name: str) -> tuple[str, str, str]:
     return "中性", "info", f"{universe}涨跌接近对半，没有单边。"
 
 
-def _breadth_a_shares_eastmoney() -> dict | None:
-    """All Shanghai and Shenzhen A-shares. TRIN uses turnover, not share volume."""
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    fs = _CN_LIST
-    page_size = 100
-
-    def page(pn: int) -> dict:
-        try:
-            text = _request_text(
-                url,
-                params={
-                    "pn": str(pn),
-                    "pz": str(page_size),
-                    "po": "1",
-                    "np": "1",
-                    "fltt": "2",
-                    "invt": "2",
-                    "fid": "f12",
-                    "fs": fs,
-                    "fields": "f3,f5,f6",
-                },
-                encoding="utf-8",
-                timeout=8,
-            )
-            return json.loads(text).get("data") or {}
-        except Exception:
-            return {}
-
-    first = page(1)
-    rows = list(first.get("diff") or [])
-    try:
-        total = int(first.get("total") or 0)
-    except (TypeError, ValueError):
-        return None
-    pages = max(1, (total + page_size - 1) // page_size)
-    if pages > 1:
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for batch in pool.map(page, range(2, pages + 1)):
-                rows.extend(batch.get("diff") or [])
-    if total < 1000 or len(rows) < total * 0.9:
-        return None
-    up = down = flat = 0
-    up_amount = down_amount = 0.0
-    for row in rows:
-        try:
-            change = float(row.get("f3"))
-            volume = float(row.get("f5") or 0)
-            amount = float(row.get("f6") or 0)
-        except (TypeError, ValueError):
-            continue
-        if volume <= 0:
-            continue
-        if change > 0:
-            up += 1
-            up_amount += amount
-        elif change < 0:
-            down += 1
-            down_amount += amount
-        else:
-            flat += 1
-    return _breadth_payload("沪深A股", up, down, flat, _arms_value(up, down, up_amount, down_amount))
-
-
-def _sina_a_page(page: int) -> list[dict]:
-    try:
-        text = _request_text(
-            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
-            params={"page": page, "num": 100, "sort": "symbol", "asc": 1, "node": "hs_a", "symbol": ""},
-            referer="https://finance.sina.com.cn/",
-            encoding="utf-8",
-            timeout=12,
-        )
-        payload = json.loads(text)
-    except Exception:
-        return []
-    return payload if isinstance(payload, list) else []
-
-
-def _breadth_a_shares_sina() -> dict | None:
-    """Same Shanghai and Shenzhen pool when the Eastmoney list is unavailable."""
-    rows: list[dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for batch in pool.map(_sina_a_page, range(1, 61)):
-            rows.extend(batch)
-    shsz = [row for row in rows if str(row.get("symbol") or "").startswith(("sh", "sz"))]
-    if len(shsz) < 2000:
-        return None
-    up = down = flat = 0
-    up_amount = down_amount = 0.0
-    for row in shsz:
-        try:
-            price = float(row.get("trade") or 0)
-            preclose = float(row.get("settlement") or 0)
-            volume = float(row.get("volume") or 0)
-            amount = float(row.get("amount") or 0)
-        except (TypeError, ValueError):
-            continue
-        if price <= 0 or preclose <= 0 or volume <= 0:
-            continue
-        if price > preclose:
-            up += 1
-            up_amount += amount
-        elif price < preclose:
-            down += 1
-            down_amount += amount
-        else:
-            flat += 1
-    return _breadth_payload("沪深A股", up, down, flat, _arms_value(up, down, up_amount, down_amount))
-
-
-def _breadth_a_shares() -> dict | None:
-    listed = _breadth_a_shares_eastmoney()
-    return listed if listed is not None else _breadth_a_shares_sina()
-
-
-def _hk_page(page: int) -> list[dict]:
-    try:
-        text = _request_text(
-            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHKStockData",
-            params={"page": page, "num": 60, "sort": "symbol", "asc": 1, "node": "qbgg_hk"},
-            referer="https://finance.sina.com.cn/",
-            encoding="utf-8",
-            timeout=12,
-        )
-        payload = json.loads(text)
-    except Exception:
-        return []
-    return payload if isinstance(payload, list) else []
-
-
-def _breadth_hk() -> dict | None:
-    """Hong Kong names on the Sina full list. TRIN uses turnover, not share volume."""
-    rows: list[dict] = []
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        for batch in pool.map(_hk_page, range(1, 48)):
-            rows.extend(batch)
-    if len(rows) < 1500:
-        return None
-    up = down = flat = 0
-    up_amount = down_amount = 0.0
-    for row in rows:
-        try:
-            price = float(row.get("lasttrade") or 0)
-            preclose = float(row.get("prevclose") or 0)
-            volume = float(row.get("volume") or 0)
-            amount = float(row.get("amount") or 0)
-        except (TypeError, ValueError):
-            continue
-        if price <= 0 or preclose <= 0 or volume <= 0:
-            continue
-        if price > preclose:
-            up += 1
-            up_amount += amount
-        elif price < preclose:
-            down += 1
-            down_amount += amount
-        else:
-            flat += 1
-    return _breadth_payload("港股", up, down, flat, _arms_value(up, down, up_amount, down_amount))
-
-
 _HISTORY_DAYS = 45
-
-
-def _history_codes(market: str) -> tuple[list[str], bool, float]:
-    """Tencent kline codes, whether Arms uses turnover, and the share multiplier."""
-    if market == "cn":
-        rows: list[dict] = []
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for batch in pool.map(_sina_a_page, range(1, 61)):
-                rows.extend(batch)
-        codes = []
-        seen = set()
-        for row in rows:
-            symbol = str(row.get("symbol") or "")
-            if symbol.startswith(("sh", "sz")) and symbol not in seen:
-                seen.add(symbol)
-                codes.append(symbol)
-        return codes, True, 1.0
-    if market == "hk":
-        rows = []
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            for batch in pool.map(_hk_page, range(1, 48)):
-                rows.extend(batch)
-        codes = []
-        seen = set()
-        for row in rows:
-            symbol = str(row.get("symbol") or "").zfill(5)
-            code = f"hk{symbol}"
-            if symbol.isdigit() and code not in seen:
-                seen.add(code)
-                codes.append(code)
-        return codes, True, 1.0
-    rows = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for batch in pool.map(_breadth_page, range(1, 26)):
-            rows.extend(batch)
-    codes = []
-    seen = set()
-    for row in rows:
-        symbol = str(row.get("symbol") or "")
-        code = f"us{symbol}"
-        if symbol and code not in seen:
-            seen.add(code)
-            codes.append(code)
-    return codes, False, 1.0
 
 
 def _sina_closes(code: str) -> list[tuple[str, float, float]]:
@@ -1901,195 +1715,6 @@ def _sina_closes(code: str) -> list[tuple[str, float, float]]:
             continue
     bars.sort()
     return bars
-
-
-def _tencent_closes(code: str) -> list[tuple[str, float, float]]:
-    try:
-        text = _request_text(
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
-            params={"param": f"{code},day,,,48,qfq"},
-            encoding="utf-8",
-            timeout=8,
-        )
-        payload = json.loads(text)
-    except Exception:
-        return []
-    node = (payload.get("data") or {}).get(code) or {}
-    raw = node.get("qfqday") or node.get("day") or []
-    bars: list[tuple[str, float, float]] = []
-    for row in raw:
-        if not isinstance(row, list) or len(row) < 6:
-            continue
-        try:
-            bars.append((str(row[0]), float(row[2]), float(row[5])))
-        except (TypeError, ValueError):
-            continue
-    bars.sort()
-    return bars[-48:]
-
-
-def _points_from_series(series: list[list[tuple[str, float, float]]], amount: bool, share_lot: float, minimum: int) -> list[dict]:
-    if len(series) < minimum:
-        return []
-    buckets: dict[str, list[float]] = {}
-    above_ma20: dict[str, list[int]] = {}
-    for bars in series:
-        window: list[float] = []
-        window_sum = 0.0
-        for index, (day, close, volume) in enumerate(bars):
-            window.append(close)
-            window_sum += close
-            if len(window) > 20:
-                window_sum -= window.pop(0)
-            if index == 0:
-                continue
-            prev = bars[index - 1][1]
-            if volume <= 0 or close <= 0 or prev <= 0:
-                continue
-            size = volume * share_lot * close if amount else volume
-            slot = buckets.setdefault(day, [0, 0, 0, 0.0, 0.0])
-            if close > prev:
-                slot[0] += 1
-                slot[3] += size
-            elif close < prev:
-                slot[1] += 1
-                slot[4] += size
-            else:
-                slot[2] += 1
-            if len(window) < 20 or any(price <= 0 for price in window):
-                continue
-            counted = above_ma20.setdefault(day, [0, 0])
-            counted[1] += 1
-            if close > window_sum / 20:
-                counted[0] += 1
-    points = []
-    for day in sorted(buckets)[-_HISTORY_DAYS:]:
-        up, down, flat, up_size, down_size = buckets[day]
-        up, down, flat = int(up), int(down), int(flat)
-        count = up + down + flat
-        above, valid = above_ma20.get(day, [0, 0])
-        points.append(
-            {
-                "date": day,
-                "advancers": up,
-                "decliners": down,
-                "unchanged": flat,
-                "up_ratio": round(up / count * 100, 1) if count else None,
-                "breadth": round((up - down) / count * 100, 1) if count else None,
-                "arms": _arms_value(up, down, up_size, down_size),
-                "above_ma20": round(above / valid * 100, 1) if valid >= 50 else None,
-            }
-        )
-    return points
-
-
-def _yahoo_series(codes: list[str]) -> list[list[tuple[str, float, float]]]:
-    import yfinance as yf
-
-    tickers = [code[2:] for code in codes if code.startswith("us") and len(code) > 2]
-    if not tickers:
-        return []
-    frame = yf.download(
-        tickers,
-        period="3mo",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
-        group_by="ticker",
-    )
-    series: list[list[tuple[str, float, float]]] = []
-    single = len(tickers) == 1
-    for ticker in tickers:
-        try:
-            block = frame if single else frame[ticker]
-            closes = block["Close"].dropna()
-            volumes = block["Volume"].reindex(closes.index)
-        except (KeyError, TypeError, AttributeError):
-            continue
-        bars: list[tuple[str, float, float]] = []
-        for day, price in closes.items():
-            volume = volumes.get(day)
-            try:
-                price = float(price)
-                volume = float(volume)
-            except (TypeError, ValueError):
-                continue
-            bars.append((str(day)[:10], price, volume))
-        bars.sort()
-        if len(bars) >= 2:
-            series.append(bars[-48:])
-    return series
-
-
-def _aggregate_arms_history(codes: list[str], amount: bool, share_lot: float) -> list[dict]:
-    series: list[list[tuple[str, float, float]]] = []
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        for bars in pool.map(_sina_closes if codes and codes[0].startswith(("sh", "sz")) else _tencent_closes, codes):
-            if len(bars) >= 2:
-                series.append(bars)
-    return _points_from_series(series, amount, share_lot, max(50, int(len(codes) * 0.6)))
-
-
-def fill_above_ma20(db, market: str) -> int:
-    """Write MA20 breadth onto days that still lack it. Do not rewrite Arms or existing MA20."""
-    from decimal import Decimal
-
-    from app.models.entities import ArmsReading, BreadthDay
-
-    fresh = build_arms_history(market)
-    book = _default_book(market)
-    rows = {
-        row.bar_date.isoformat(): row
-        for row in db.query(BreadthDay).filter(BreadthDay.market == market, BreadthDay.book == book).all()
-    }
-    readings = (
-        db.query(ArmsReading)
-        .filter(ArmsReading.market == market, ArmsReading.book == book, ArmsReading.above_ma20.is_(None))
-        .all()
-    )
-    by_day: dict[str, list] = {}
-    for row in readings:
-        by_day.setdefault(row.bar_date.isoformat(), []).append(row)
-    changed = 0
-    for point in fresh:
-        value = point.get("above_ma20")
-        if value is None:
-            continue
-        number = Decimal(str(value))
-        row = rows.get(point["date"])
-        if row is not None and row.above_ma20 is None:
-            row.above_ma20 = number
-            changed += 1
-        for reading in by_day.get(point["date"], []):
-            reading.above_ma20 = number
-            changed += 1
-    if changed:
-        db.commit()
-    return changed
-
-
-def _session_closed(market: str) -> bool:
-    from app.services.bars import cash_session_closed, cn_session_closed, hk_session_closed
-
-    if market == "cn":
-        return cn_session_closed()
-    if market == "hk":
-        return hk_session_closed()
-    return cash_session_closed()
-
-
-def build_arms_history(market: str) -> list[dict]:
-    if market == "hk":
-        return []
-    codes, amount, share_lot = _history_codes(market)
-    if market == "us":
-        series = _yahoo_series(codes)
-        points = _points_from_series(series, False, 1.0, max(50, int(len(codes) * 0.6)))
-    else:
-        points = _aggregate_arms_history(codes, amount, share_lot)
-    if points and not _session_closed(market):
-        points = points[:-1]
-    return points
 
 
 def breadth_history_payload(db, market: str, book: str = "") -> dict:

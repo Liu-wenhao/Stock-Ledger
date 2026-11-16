@@ -17,14 +17,13 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from app.models.entities import Trade
+from app.models.entities import PositionStop, Trade
 from app.services import market
 from app.services.ledger import load_trades, period_holdings, trade_us_session_date, us_equity_session_date
+from app.services.signals import _alpha_strategies, _rsi, _stop_candle, is_etf, rule_catalog, wilder_atr
 
 ZERO = Decimal("0")
 _EPS = Decimal("0.0000001")
-HARD_STOP_PCT = Decimal("0.12")
-TRAILING_STOP_PCT = Decimal("0.08")
 REENTRY_COOLDOWN_SESSIONS = 5
 REENTRY_LOOKBACK_DAYS = 180
 REENTRY_MAX_SYMBOLS = 20
@@ -494,7 +493,7 @@ def _sessions_since_exit(
 
 
 def _technical_snapshot(
-    closes: dict[str, Decimal], current: Decimal | None
+    symbol: str, closes: dict[str, Decimal], current: Decimal | None
 ) -> dict:
     ordered_days = sorted(closes)
     values = [closes[d] for d in ordered_days if closes[d] > ZERO]
@@ -506,30 +505,35 @@ def _technical_snapshot(
 
     latest = values[-1] if values else current
     ma10 = sum(values[-10:], ZERO) / Decimal(len(values[-10:])) if len(values) >= 10 else None
-    ma10_previous = (
-        sum(values[-15:-5], ZERO) / Decimal(10) if len(values) >= 15 else None
-    )
     previous_20_high = max(values[-21:-1]) if len(values) >= 21 else None
-    stabilized = bool(
-        latest is not None
-        and ma10 is not None
-        and latest >= ma10
-        and (ma10_previous is None or ma10 >= ma10_previous)
-    )
-    breakout = bool(
-        latest is not None
-        and previous_20_high is not None
-        and latest > previous_20_high
-    )
-    signal = "突破" if breakout else ("企稳" if stabilized else "")
+
+    # 优先使用日线 K 线跑完整的 4 条 ATR 策略判定
+    hit_rules: list[str] = []
+    try:
+        from app.services.signals import _load_bars
+        bars = _load_bars(symbol)
+        if len(bars) >= 25:
+            f_closes = [float(b["c"]) for b in bars]
+            packs = _alpha_strategies(bars, _rsi(f_closes), _stop_candle(bars), is_etf(symbol))
+            hit_rules = [p["name"] for p in packs if p.get("ready")]
+    except Exception:
+        hit_rules = []
+
+    stabilized = bool(latest is not None and ma10 is not None and latest >= ma10)
+    breakout = bool(latest is not None and previous_20_high is not None and latest > previous_20_high)
+    if hit_rules:
+        signal = " / ".join(hit_rules)
+    else:
+        signal = "突破" if breakout else ("企稳" if stabilized else "")
+
     return {
         "latest_price": latest,
         "ma10": _q(ma10) if ma10 is not None else None,
         "previous_20_high": _q(previous_20_high) if previous_20_high is not None else None,
         "stabilized": stabilized,
-        "breakout": breakout,
+        "breakout": breakout or bool(hit_rules),
         "technical_signal": signal,
-        "technical_ready": bool(signal),
+        "technical_ready": bool(hit_rules) or bool(signal),
         "sample_size": len(values),
     }
 
@@ -554,25 +558,68 @@ def _position_plan(
     current_price: Decimal | None,
     closes: list[Decimal],
     holding_days: int = 0,
+    symbol: str | None = None,
+    entry_day: date | None = None,
 ) -> dict:
-    hard_stop = avg_price * (Decimal("1") - HARD_STOP_PCT)
+    # 1. 加载 K 线：atr_dec 是最新的 Wilder ATR(14)，atr0 是建仓那天的 ATR（初始止损尺度）
+    atr_dec: Decimal | None = None
+    atr0: Decimal | None = None
+    ma20_dec: Decimal | None = None
+    if symbol:
+        try:
+            from app.services.signals import _load_bars
+            bars = _load_bars(symbol)
+            if len(bars) >= 14:
+                atrs = wilder_atr(bars, 14)
+                if atrs:
+                    atr_dec = Decimal(str(round(atrs[-1], 4)))
+                    if entry_day is not None:
+                        cutoff = entry_day.isoformat()
+                        upto = sum(1 for b in bars if str(b.get("d") or "")[:10] <= cutoff)
+                        if upto >= 14:
+                            atr0 = Decimal(str(round(atrs[upto - 1], 4)))
+            if len(bars) >= 20:
+                ma20_val = sum(float(b["c"]) for b in bars[-20:]) / 20.0
+                ma20_dec = Decimal(str(round(ma20_val, 4)))
+        except Exception:
+            pass
+    if atr0 is None or atr0 <= ZERO:
+        # 建仓日的 K 线不够时，退回最新 ATR。
+        atr0 = atr_dec
+
     highest_close = max(closes) if closes else None
-    if current_price is not None and (
-        highest_close is None or current_price > highest_close
-    ):
+    if current_price is not None and (highest_close is None or current_price > highest_close):
         highest_close = current_price
-    trailing_stop = (
-        highest_close * (Decimal("1") - TRAILING_STOP_PCT)
-        if highest_close is not None else None
-    )
-    # The trailing stop may tighten the exit, but it never falls below the -12% cost floor.
-    stop_price = max(
-        hard_stop,
-        trailing_stop if trailing_stop is not None else hard_stop,
-    )
-    stop_source = (
-        "建议止损" if trailing_stop is not None and trailing_stop > hard_stop else "必须止损"
-    )
+
+    if atr0 is None or atr0 <= ZERO or atr_dec is None or atr_dec <= ZERO:
+        # 没有 ATR 就没有止损价，不再退回固定百分比。
+        return {
+            "hard_stop_price": None,
+            "trailing_stop_price": None,
+            "high_water_price": _q(highest_close) if highest_close is not None else None,
+            "stop_price": None,
+            "stop_source": "ATR 不足",
+            "action": "hold",
+            "action_tone": "hold",
+            "action_label": "日线不足 · 算不出 ATR 止损",
+            "action_note": "这只的日线不够 14 根，算不出 ATR 止损价；补齐日线前请手动设止损。",
+        }
+
+    # 2. 必须止损 (1R)：成本 − 2 倍建仓日 ATR
+    risk_1r = Decimal("2.0") * atr0
+    hard_stop = avg_price - risk_1r
+
+    # 3. 建议止损：浮盈到过 2.5 倍建仓日 ATR 后，最高收盘 − 2.2 倍当日 ATR（ATR 吊灯）
+    trailing_stop: Decimal | None = None
+    if highest_close is not None and (highest_close - avg_price) >= Decimal("2.5") * atr0:
+        trailing_stop = highest_close - Decimal("2.2") * atr_dec
+
+    if trailing_stop is not None and trailing_stop > hard_stop:
+        stop_price = trailing_stop
+        stop_source = "建议止损(ATR吊灯)"
+    else:
+        stop_price = hard_stop
+        stop_source = "必须止损(初始1R)"
 
     if current_price is None:
         return {
@@ -587,10 +634,15 @@ def _position_plan(
             "action_note": f"行情未更新；跌到 {stop_source}价即全部卖出。",
         }
 
-    if current_price <= stop_price:
-        # Mandatory stop has visual and execution priority when both levels are breached.
+    # 4. 破位止损判定（硬止损或已激活的吊灯止盈，或持满3日跌破 MA20 - 0.3*ATR）
+    ma20_broken = (
+        holding_days >= 3
+        and ma20_dec is not None
+        and current_price < (ma20_dec - Decimal("0.3") * atr_dec)
+    )
+    if current_price <= stop_price or ma20_broken:
         mandatory_exit = current_price <= hard_stop
-        exit_source = "必须止损" if mandatory_exit else "建议止损"
+        exit_source = "必须止损" if mandatory_exit else ("MA20缓冲带破位" if ma20_broken else "ATR吊灯止盈")
         return {
             "hard_stop_price": _q(hard_stop),
             "trailing_stop_price": _q(trailing_stop) if trailing_stop is not None else None,
@@ -599,8 +651,49 @@ def _position_plan(
             "stop_source": exit_source,
             "action": "exit",
             "action_tone": "cut" if mandatory_exit else "warning",
-            "action_label": "必须止损 · 待清仓" if mandatory_exit else "建议止损 · 待清仓",
-            "action_note": f"现价已跌破{exit_source}价，卖出全部剩余仓位；清仓后记录卖出，并冷却 5 个交易日。",
+            "action_label": "必须止损 · 待清仓" if mandatory_exit else f"{exit_source} · 待离场",
+            "action_note": f"现价已触发{exit_source}（{_q(stop_price)}），按纪律卖出并强制冷却 5 个交易日。",
+        }
+
+    # 5. +1.5R 与 +2.5R 分批止盈提示
+    gain = current_price - avg_price
+    if risk_1r > ZERO and gain >= Decimal("2.5") * risk_1r:
+        return {
+            "hard_stop_price": _q(hard_stop),
+            "trailing_stop_price": _q(trailing_stop) if trailing_stop is not None else None,
+            "high_water_price": _q(highest_close) if highest_close is not None else None,
+            "stop_price": _q(stop_price),
+            "stop_source": stop_source,
+            "action": "trim",
+            "action_tone": "trim",
+            "action_label": "已达 +2.5R · 减仓 1/3",
+            "action_note": f"浮盈已超 2.5R！按纪律兑现第二个 1/3 仓位，尾仓以 {_q(stop_price)} 为吊灯止盈线让利润奔跑。",
+        }
+    if risk_1r > ZERO and gain >= Decimal("1.5") * risk_1r:
+        return {
+            "hard_stop_price": _q(hard_stop),
+            "trailing_stop_price": _q(trailing_stop) if trailing_stop is not None else None,
+            "high_water_price": _q(highest_close) if highest_close is not None else None,
+            "stop_price": _q(stop_price),
+            "stop_source": stop_source,
+            "action": "trim",
+            "action_tone": "hold",
+            "action_label": "已达 +1.5R · 减仓 1/3",
+            "action_note": f"浮盈已达 1.5R（+{_q(gain)}），可兑现首个 1/3 仓位锁定胜局，并将底仓止损上移至成本价 {_q(avg_price)}。",
+        }
+
+    # 6. 时间证伪止损（15天未达 1.5*ATR 或 40天全局复核）
+    if holding_days >= 15 and gain < Decimal("1.5") * atr0:
+        return {
+            "hard_stop_price": _q(hard_stop),
+            "trailing_stop_price": _q(trailing_stop) if trailing_stop is not None else None,
+            "high_water_price": _q(highest_close) if highest_close is not None else None,
+            "stop_price": _q(stop_price),
+            "stop_source": stop_source,
+            "action": "trim",
+            "action_tone": "trim",
+            "action_label": f"持满 {holding_days} 天 · 动能不足",
+            "action_note": f"已持有 {holding_days} 天但浮盈仍未达 1.5 倍 ATR（僵尸仓），建议时间止损换仓。",
         }
 
     if holding_days >= 40:
@@ -612,8 +705,8 @@ def _position_plan(
             "stop_source": stop_source,
             "action": "trim",
             "action_tone": "trim",
-            "action_label": "到时间止损 · 复核逻辑",
-            "action_note": "已持有 40 天以上；没有新增基本面或趋势理由就清仓，有明确理由才保留且不加仓。",
+            "action_label": "满 40 天 · 复核四条规则",
+            "action_note": "已持有 40 天以上；若四条买入规则均不成立则清仓。",
         }
 
     if current_price < avg_price:
@@ -625,8 +718,8 @@ def _position_plan(
             "stop_source": stop_source,
             "action": "hold",
             "action_tone": "trim",
-            "action_label": "持有，守止损",
-            "action_note": "当前低于持仓成本，不加仓；跌到止损价全部卖出。",
+            "action_label": "水下持有 · 严禁补仓",
+            "action_note": f"当前低于持仓成本 {_q(avg_price)}，严禁水下摊平！跌破 {_q(stop_price)} 无条件止损。",
         }
 
     return {
@@ -637,10 +730,9 @@ def _position_plan(
         "stop_source": stop_source,
         "action": "hold",
         "action_tone": "hold",
-        "action_label": "持有，抬高止损",
-        "action_note": f"只在盈利时分批加仓；{stop_source}价随新高上移。",
+        "action_label": "盈利持有 · 可分批加仓",
+        "action_note": f"现价高于成本，收盘比上一批买价再高 0.25 倍 ATR 可加下一批（不超过单只上限）；防守线 {_q(stop_price)}。",
     }
-
 
 def _enrich_open_positions(
     positions: list[dict],
@@ -684,7 +776,7 @@ def _enrich_open_positions(
             if total_pnl is not None and pnl_base > ZERO else None
         )
         holding_days = max((today - cycle_day).days, 0) if cycle_day else 0
-        plan = _position_plan(avg_price, current, relevant, holding_days)
+        plan = _position_plan(avg_price, current, relevant, holding_days, symbol=symbol, entry_day=cycle_day)
         enriched.append(
             {
                 **row,
@@ -753,7 +845,7 @@ def enrich_holding_stop_levels(items: list[dict]) -> list[dict]:
             row["suggested_stop_price"] = None
             row["mandatory_stop_price"] = None
             continue
-        plan = _position_plan(avg_price, current, relevant)
+        plan = _position_plan(avg_price, current, relevant, symbol=symbol, entry_day=cycle_day)
         row["suggested_stop_price"] = plan["trailing_stop_price"]
         row["mandatory_stop_price"] = plan["hard_stop_price"]
     return items
@@ -806,7 +898,7 @@ def _build_reentry_candidates(
         change_since_exit_pct = None
         if current is not None and exit_price is not None and exit_price > ZERO:
             change_since_exit_pct = _q((current - exit_price) / exit_price * Decimal("100"))
-        technical = _technical_snapshot(closes, current)
+        technical = _technical_snapshot(symbol, closes, current)
 
         if not cooldown_met:
             status = "cooling"
@@ -866,35 +958,58 @@ _CORE_TICKERS = {
     "159915", "159949", "588000", "588080",
     "2800", "3033", "3067",
 }
-_SLEEVE_TARGET = (("core", "核心仓", 60), ("satellite", "卫星仓", 30), ("cash", "现金", 10))
+# Core and satellite numbers are ceilings; the cash number is a floor.
+_SLEEVE_TARGET = (("core", "核心仓", 50), ("satellite", "卫星仓", 30), ("cash", "现金", 20))
+# Each sleeve's ceiling is split evenly across the names actually in it.
+SLEEVE_PCT = {"core": 50, "satellite": 30}
+SLEEVE_MAX_NAMES = {"core": 3, "satellite": 5}
+SLEEVE_LABEL = {"core": "核心", "satellite": "卫星"}
 
 
-def _allocation_sleeve(symbol: str) -> str:
+def sleeve_choices(db: Session, portfolio_id: int = 1) -> dict[str, str]:
+    """Sleeves the user picked by hand, keyed by symbol."""
+    rows = (
+        db.query(PositionStop.symbol, PositionStop.sleeve)
+        .filter(PositionStop.portfolio_id == portfolio_id, PositionStop.sleeve.isnot(None))
+        .all()
+    )
+    return {str(symbol).upper(): sleeve for symbol, sleeve in rows if sleeve in SLEEVE_PCT}
+
+
+def sleeve_of(symbol: str, chosen: dict[str, str] | None = None) -> str:
+    picked = (chosen or {}).get((symbol or "").upper())
+    if picked:
+        return picked
     ticker = (symbol or "").split(":")[-1].upper()
     return "core" if ticker in _CORE_TICKERS else "satellite"
 
 
-def _build_allocation(positions: list[dict], cash: Decimal) -> dict:
+def _build_allocation(positions: list[dict], cash: Decimal, chosen: dict[str, str] | None = None) -> dict:
     cash_value = cash if cash > ZERO else ZERO
     buckets = {"core": ZERO, "satellite": ZERO}
+    counts = {"core": 0, "satellite": 0}
     names = []
     for row in positions:
         value = Decimal(row.get("market_value") or 0)
         if value <= ZERO:
             continue
-        sleeve = _allocation_sleeve(row["symbol"])
+        sleeve = sleeve_of(row["symbol"], chosen)
         buckets[sleeve] += value
+        counts[sleeve] += 1
         names.append(
             {
                 "symbol": row["symbol"],
                 "ticker": (row["symbol"] or "").split(":")[-1],
-                "sleeve": "核心" if sleeve == "core" else "卫星",
+                "sleeve": SLEEVE_LABEL[sleeve],
+                "sleeve_key": sleeve,
                 "market_value": value,
             }
         )
     holdings_value = buckets["core"] + buckets["satellite"]
     equity = holdings_value + cash_value
-    single_cap = equity * Decimal("0.08")
+    # 单只上限 = 该类型的总额 ÷ 该类型现在的只数。还没有持仓时按 1 只算。
+    single_cap = equity * Decimal(SLEEVE_PCT["satellite"]) / Decimal("100") / Decimal(max(counts["satellite"], 1))
+    core_single_cap = equity * Decimal(SLEEVE_PCT["core"]) / Decimal("100") / Decimal(max(counts["core"], 1))
     current = {
         "core": buckets["core"],
         "satellite": buckets["satellite"],
@@ -912,18 +1027,20 @@ def _build_allocation(positions: list[dict], cash: Decimal) -> dict:
                 "target_amount": _q(target_amount),
                 "current_pct": float(_q(amount / equity * Decimal("100"), "0.1")) if equity > ZERO else 0,
                 "current_amount": _q(amount),
-                "gap": _q(target_amount - amount),
+                # 核心、卫星：离上限还有多少（负数是超了）。现金：比下限多多少（负数是不够）。
+                "gap": _q(amount - target_amount) if key == "cash" else _q(target_amount - amount),
             }
         )
     priced = []
     for row in names:
         weight = row["market_value"] / equity * Decimal("100") if equity > ZERO else ZERO
+        cap = core_single_cap if row["sleeve"] == "核心" else single_cap
         priced.append(
             {
                 **row,
                 "market_value": _q(row["market_value"]),
                 "weight": float(_q(weight, "0.1")),
-                "room": _q(single_cap - row["market_value"]),
+                "room": _q(cap - row["market_value"]),
             }
         )
     priced.sort(key=lambda row: row["market_value"], reverse=True)
@@ -938,17 +1055,27 @@ def _build_allocation(positions: list[dict], cash: Decimal) -> dict:
             f"金额按持仓市值加现金计算。"
             f"核心仓现在 {core_pct:.0f}%，卫星仓 {satellite_pct:.0f}%，现金 {cash_pct:.0f}%。"
         )
+        note += f"核心 {counts['core']} 只，卫星 {counts['satellite']} 只，各自平分该类型的总额。"
         if over:
-            note += f"{'、'.join(over)} 超过单只 8% 上限。"
-        elif core_pct == 0 and satellite_pct > 0:
-            note += "宽基指数才计入核心仓，现在的持仓都在卫星仓。"
+            note += f"{'、'.join(over)} 超过单只上限。"
+        crowded = [
+            f"{SLEEVE_LABEL[key]}有 {counts[key]} 只，超过 {SLEEVE_MAX_NAMES[key]} 只"
+            for key in ("core", "satellite")
+            if counts[key] > SLEEVE_MAX_NAMES[key]
+        ]
+        if crowded:
+            note += "；".join(crowded) + "。"
     return {
+        "core_count": counts["core"],
+        "satellite_count": counts["satellite"],
+        "core_max": SLEEVE_MAX_NAMES["core"],
+        "satellite_max": SLEEVE_MAX_NAMES["satellite"],
         "equity": _q(equity),
         "cash": _q(cash_value),
         "holdings_value": _q(holdings_value),
         "single_cap": _q(single_cap),
+        "core_single_cap": _q(core_single_cap),
         "tranche": _q(single_cap / Decimal("3")),
-        "loss_cap": _q(single_cap / Decimal("3") * Decimal("0.12")),
         "sleeves": sleeves,
         "names": priced,
         "note": note,
@@ -1009,5 +1136,6 @@ def build_strategy(
         "open_positions": enriched,
         "reentry_candidates": candidates,
         "reentry_screened": len(candidates),
-        "allocation": _build_allocation(enriched, cash),
+        "allocation": _build_allocation(enriched, cash, sleeve_choices(db, portfolio_id)),
+        "rules": rule_catalog(),
     }

@@ -26,15 +26,19 @@ from app.schemas.portfolio import (
     PositionLimitUpdate,
     HoldingsAdvice,
     IndicatorHistory,
+    PositionSleeveOut,
+    PositionSleeveUpdate,
     PositionStopOut,
     PositionStopUpdate,
     ProfitSeriesResponse,
     ReviewResponse,
+    StrategyEngineResponse,
     StrategyResponse,
+    BacktestCandlesResponse,
     BacktestResponse,
 )
 from app.services import ledger, review
-from app.services.ak_backtest import run_book_backtest
+from app.services.ak_backtest import backtest_candles, engine_source, run_book_backtest
 from app.services.market_scope import current_market
 from app.services.signals import build_holdings_advice, build_indicator_history
 
@@ -347,7 +351,34 @@ def _position_stop_empty(row: PositionStop) -> bool:
         and row.take_profit_price is None
         and row.target_qty is None
         and row.max_buy_amount is None
+        and row.sleeve is None
     )
+
+
+@router.put("/holdings/sleeve", response_model=PositionSleeveOut)
+def update_holding_sleeve(payload: PositionSleeveUpdate, db: Session = Depends(get_db)):
+    """Mark a held name as core or satellite. Core holds at most 3 names, satellite at most 5."""
+    symbol = (payload.symbol or "").strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="缺少商品代码")
+    chosen = review.sleeve_choices(db, settings.default_portfolio_id)
+    held = {str(item["symbol"]).upper() for item in ledger.compute_holdings(db)["items"]}
+    others = sum(
+        1 for name in held if name != symbol and review.sleeve_of(name, chosen) == payload.sleeve
+    )
+    limit = review.SLEEVE_MAX_NAMES[payload.sleeve]
+    if others >= limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{review.SLEEVE_LABEL[payload.sleeve]}最多 {limit} 只，先把其中一只改成另一类",
+        )
+    row = _position_stop_row(db, symbol)
+    if row is None:
+        row = PositionStop(portfolio_id=settings.default_portfolio_id, symbol=symbol)
+        db.add(row)
+    row.sleeve = payload.sleeve
+    db.commit()
+    return PositionSleeveOut(symbol=symbol, sleeve=payload.sleeve)
 
 
 @router.put("/holdings/stop", response_model=PositionStopOut)
@@ -468,6 +499,12 @@ def trading_strategy(
     return review.build_strategy(db, start=start, end=end)
 
 
+@router.get("/analysis/strategy/engine", response_model=StrategyEngineResponse)
+def trading_strategy_engine():
+    """Core engine source for the strategy page's copy action. Read straight from the modules."""
+    return {"engine_code": engine_source()}
+
+
 @router.get("/analysis/backtest", response_model=BacktestResponse)
 def analysis_backtest(
     start: date | None = Query(None),
@@ -478,3 +515,19 @@ def analysis_backtest(
     if start and end and start > end:
         raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
     return run_book_backtest(db, current_market(), start, end)
+
+
+@router.get("/analysis/backtest/candles", response_model=BacktestCandlesResponse)
+def analysis_backtest_candles(
+    symbol: str = Query(..., min_length=1),
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Daily bars around one backtest cycle for the B/S candlestick chart."""
+    if start and end and start > end:
+        raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+    try:
+        return backtest_candles(db, symbol, start, end)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="日线没有取到") from exc

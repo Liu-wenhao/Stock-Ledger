@@ -86,6 +86,8 @@ class PositionStop(Base):
     # Planned size: share count and/or max cash still allowed in this name.
     target_qty: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
     max_buy_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    # "core" or "satellite". Null means the default for the ticker.
+    sleeve: Mapped[str | None] = mapped_column(String(16), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )

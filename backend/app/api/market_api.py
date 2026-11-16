@@ -3,9 +3,10 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.database import get_db
-from app.models.entities import SymbolMeta, Trade
-from app.schemas.portfolio import BreadthHistory, CnMarketDesk, CnStockFlowBook, MarketSentiment, QuoteOut, SymbolSearchItem
+from app.models.entities import SymbolMeta
+from app.schemas.portfolio import BreadthHistory, CnFlowSnapshot, CnMarketDesk, CnStockFlowBook, MarketSentiment, QuoteOut, SymbolSearchItem
 from app.services.cn_desk import cn_market_desk, cn_stock_flow
+from app.services.cn_flow import cn_flow_snapshot
 from app.services.market import get_quotes, refresh_quotes_sync
 from app.services.market_scope import current_market, in_market
 from app.services.sentiment import breadth_history_payload, build_market_sentiment
@@ -24,6 +25,12 @@ def market_sentiment(db: Session = Depends(get_db)):
 def market_breadth_history(book: str = Query(""), db: Session = Depends(get_db)):
     """Recent advance/decline and Arms readings for one book."""
     return breadth_history_payload(db, current_market(), book)
+
+
+@router.get("/market/cn-flow", response_model=CnFlowSnapshot)
+def market_cn_flow():
+    """Latest A-share margin balance and broad-ETF share changes. Not a forecast."""
+    return cn_flow_snapshot()
 
 
 @router.get("/market/cn-desk", response_model=CnMarketDesk)

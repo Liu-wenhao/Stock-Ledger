@@ -26,6 +26,7 @@ def _ensure_schema() -> None:
         "ALTER TABLE position_stop ADD COLUMN target_qty DECIMAL(18, 6) NULL",
         "ALTER TABLE position_stop ADD COLUMN max_buy_amount DECIMAL(18, 6) NULL",
         "ALTER TABLE position_stop ADD COLUMN take_profit_price DECIMAL(18, 6) NULL",
+        "ALTER TABLE position_stop ADD COLUMN sleeve VARCHAR(16) NULL",
         "ALTER TABLE arms_reading ADD COLUMN above_ma20 DECIMAL(8, 2) NULL",
         "ALTER TABLE arms_reading ADD COLUMN ma_valid INT NULL",
         "ALTER TABLE arms_reading ADD COLUMN ma_total INT NULL",

@@ -5,7 +5,7 @@ import * as echarts from 'echarts'
 import dayjs from 'dayjs'
 import { message, Modal } from 'ant-design-vue'
 import { DashboardOutlined, DownloadOutlined, FallOutlined, LineChartOutlined, QuestionCircleOutlined, RiseOutlined } from '@ant-design/icons-vue'
-import { fetchHoldings, fetchHoldingsAdvice, fetchIndicatorHistory, fetchBreadthHistory, fetchMarketSentiment, fetchTrades, updateHoldingLimit, updateHoldingStop } from '@/api/portfolio'
+import { fetchHoldings, fetchHoldingsAdvice, fetchIndicatorHistory, fetchBreadthHistory, fetchCnFlow, fetchMarketSentiment, fetchTrades, updateHoldingLimit, updateHoldingStop } from '@/api/portfolio'
 import SymbolCell from '@/components/SymbolCell.vue'
 import CnMarketDesk from '@/components/CnMarketDesk.vue'
 import { formatMoney, formatPct, formatQty, pnlClass, tickerOf, toNumber } from '@/utils/format'
@@ -29,6 +29,7 @@ const cnDeskSymbols = computed(() =>
     .slice(0, 12),
 )
 const cnDesk = ref(null)
+const cnFlow = ref(null)
 const cnFlowBySymbol = ref({})
 const upBuckets = computed(() =>
   (cnDesk.value?.activity?.buckets || []).filter((bucket) => String(bucket.label).startsWith('上涨')),
@@ -36,6 +37,18 @@ const upBuckets = computed(() =>
 const downBuckets = computed(() =>
   (cnDesk.value?.activity?.buckets || []).filter((bucket) => String(bucket.label).startsWith('下跌')),
 )
+async function loadCnFlow() {
+  if (!isPricePage.value || store.market !== 'cn') {
+    cnFlow.value = null
+    return
+  }
+  try {
+    cnFlow.value = await fetchCnFlow()
+  } catch {
+    cnFlow.value = null
+  }
+}
+
 function onCnDesk(value) {
   cnDesk.value = value
 }
@@ -109,6 +122,7 @@ const sortState = reactive({ field: null, order: null })
 const tradeModalOpen = ref(false)
 const tradeModalLoading = ref(false)
 const tradeModalSymbol = ref('')
+const tradeModalPrice = ref(null)
 const symbolTrades = ref([])
 /** trade id -> true when this sell closed a cycle */
 const clearTradeIds = ref(new Set())
@@ -187,6 +201,8 @@ async function load({ silent = false } = {}) {
     if (!silent && (isPricePage.value || subTab.value === 'price')) {
       loadIndicators()
       loadSentiment()
+    } else if (!silent && subTab.value === 'positions') {
+      loadIndicators()
     }
   } finally {
     if (!silent) loading.value = false
@@ -207,6 +223,7 @@ function tradeInCycle(t, startMs, endMs) {
 
 async function openTradeHistory(record, cycle = null) {
   tradeModalSymbol.value = record.symbol
+  tradeModalPrice.value = record.last_price
   tradeModalOpen.value = true
   tradeModalLoading.value = true
   symbolTrades.value = []
@@ -271,7 +288,12 @@ async function openTradeHistory(record, cycle = null) {
 }
 
 function tradeStepTitle(t) {
-  const base = `${SIDE_LABELS[t.side] || t.side}  ${formatMoney(t.fill_price, 'USD', 4).replace(/ [A-Z]{3}$/, '')} × ${formatQty(t.qty)}`
+  const vs = tradeVsNow(t)
+  const ratio =
+    vs == null
+      ? ''
+      : ` <span style="color:var(--text)!important">(</span><span class="${pnlClass(vs)}">${formatPct(vs * 100)}</span><span style="color:var(--text)!important">)</span>`
+  const base = `${SIDE_LABELS[t.side] || t.side}  ${formatMoney(t.fill_price, 'USD', 4).replace(/ [A-Z]{3}$/, '')} × ${formatQty(t.qty)}${ratio}`
   if (clearTradeIds.value.has(t.id)) return `${base}  · 清仓`
   return base
 }
@@ -280,6 +302,16 @@ function goEditTrade(t) {
   if (!t?.id) return
   tradeModalOpen.value = false
   router.push({ name: 'trades', query: { editId: String(t.id) } })
+}
+
+function tradeVsNow(t) {
+  // Buy is ahead when the latest price is above the fill. Sell is ahead when the fill is above the latest price.
+  const now = toNumber(tradeModalPrice.value)
+  const fill = toNumber(t.fill_price)
+  if (!(now > 0) || !(fill > 0)) return null
+  if (t.side === 'Buy') return (now - fill) / fill
+  if (t.side === 'Sell') return (fill - now) / fill
+  return null
 }
 
 function tradeStepDesc(t) {
@@ -607,6 +639,7 @@ function renderPriceChart() {
 
 const positionColumns = [
   { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 126, minWidth: 126, fixed: 'left' },
+  { title: '信号', key: 'signals', width: 132 },
   { title: '交易笔数', key: 'trade_count', dataIndex: 'trade_count', width: 100, align: 'right' },
   { title: '分配 %', dataIndex: 'allocation', key: 'allocation', align: 'right' },
   { title: '数量', dataIndex: 'quantity', key: 'quantity', align: 'right' },
@@ -651,6 +684,7 @@ const positionColumns = [
 
 const priceColumns = [
   { title: '商品代码', key: 'symbol', dataIndex: 'symbol', width: 120, fixed: 'left' },
+  { title: '信号', key: 'signals', width: 132 },
   { title: '价格', dataIndex: 'last_price', key: 'last_price', align: 'right', width: 88 },
   { title: '日涨跌', dataIndex: 'day_change', key: 'day_change', align: 'right', width: 96 },
   { title: '日涨跌 %', dataIndex: 'day_change_percent', key: 'day_change_percent', align: 'right', width: 84 },
@@ -772,6 +806,7 @@ const cumulativeCycleColumns = [
 
 const compactColumnWidths = {
   symbol: 56,
+  signals: 96,
   cycle_index: 54,
   status: 62,
   started_at: 132,
@@ -967,15 +1002,19 @@ function adviceSignedPct(value) {
   return `${n > 0 ? '+' : ''}${n.toFixed(1)}%`
 }
 
-async function loadIndicators() {
-  if (!isPricePage.value && subTab.value !== 'price') return
-  adviceLoading.value = true
+const INDICATOR_POLL_MS = 60_000
+let lastIndicatorPoll = 0
+
+async function loadIndicators({ silent = false } = {}) {
+  // Signals are needed on the holdings tab as well as the price tab.
+  if (!isPricePage.value && !['price', 'positions'].includes(subTab.value)) return
+  if (!silent) adviceLoading.value = true
   try {
     indicatorBook.value = await fetchHoldingsAdvice()
   } catch {
-    indicatorBook.value = null
+    if (!silent) indicatorBook.value = null
   } finally {
-    adviceLoading.value = false
+    if (!silent) adviceLoading.value = false
   }
 }
 
@@ -1017,6 +1056,26 @@ function priceMetricTone(record, key) {
   if (key === 'ma_order') return metrics[key] === '多头' ? 'pnl-up' : metrics[key] === '空头' ? 'pnl-down' : ''
   if (key === 'vs_anchor' || key === 'erp' || key === 'mom') return pnlClass(metrics[key])
   return ''
+}
+
+function signalListOf(record) {
+  const metrics = metricsOf(record.symbol)
+  if (!metrics) return null
+  return metrics.signals || []
+}
+
+function signalTitle(record) {
+  const list = signalListOf(record) || []
+  return list
+    .map((item) => `${item.name}：${item.detail || '条件都满足'}${item.exit_now ? ` · ${item.exit_now}` : ''}`)
+    .join('\n')
+}
+
+function imageSignals(record) {
+  const list = signalListOf(record)
+  if (!list) return '—'
+  if (!list.length) return { text: '未触发', tone: '' }
+  return { text: list.map((item) => item.name).join('、'), tone: 'pnl-up' }
 }
 
 function openStockAdvice(record) {
@@ -1087,9 +1146,6 @@ const trendLatest = computed(() => {
   const points = trendBook.value?.points || []
   return points.length ? points[points.length - 1] : null
 })
-const trendReadyStrategies = computed(() =>
-  (trendCursor.value?.strategies || []).filter((item) => item.ready),
-)
 const indicatorHints = {
   volume: {
     text: '已收盘交易日的成交股数。',
@@ -1964,6 +2020,7 @@ function trendPalette() {
     slider: dark ? '#2a2e39' : '#f6f8fb',
     handle: dark ? '#1e222d' : '#fff',
     handleBorder: dark ? '#363a45' : '#d5deea',
+    paper: dark ? '#1e222d' : '#fff',
   }
 }
 
@@ -2164,6 +2221,10 @@ async function loadTrend() {
   trendPaging = false
   trendLoading.value = true
   trendCursor.value = null
+  // Drop the previous symbol's book and canvas up front: keeping them would show the
+  // old stock's chart under the new name while loading, and on failure forever.
+  trendBook.value = null
+  if (trendChart) trendChart.clear()
   try {
     const page = await fetchIndicatorHistory(symbol, { limit: TREND_PAGE })
     if (token !== trendLoadToken || trendSymbol.value !== symbol || !trendOpen.value) return
@@ -2172,7 +2233,8 @@ async function loadTrend() {
     await nextTick()
     renderTrendChart()
   } catch {
-    if (token === trendLoadToken) trendBook.value = null
+    // A chart error must not throw away rows that already arrived.
+    if (token === trendLoadToken && trendBook.value?.symbol !== symbol) trendBook.value = null
   } finally {
     if (token === trendLoadToken) trendLoading.value = false
   }
@@ -2261,9 +2323,179 @@ function trendStudyGraphics(point) {
   ]
 }
 
+const TREND_RULE_ORDER = [
+  'volatility_compression_breakout_v1',
+  'ma_crossover_v1',
+  'rsi_reversion_v1',
+  'mean_reversion_oversold_v1',
+]
+const TREND_BUY = '#2962ff'
+const TREND_SELL = '#f23645'
+
+function trendAdviceMarks(points) {
+  // The server walks one position per symbol from a fixed first day with the backtest
+  // engine's entry and exit checks, so the marks do not move when older bars load.
+  const marks = []
+  points.forEach((point, index) => {
+    for (const item of point.advice || []) {
+      const byRule = item.kind === 'rule'
+      marks.push({
+        index,
+        side: item.side,
+        title: item.side === 'B' ? 'B 建议买入' : byRule ? 'S 卖出规则' : 'S 持仓离场',
+        reason: byRule ? item.rule : item.side === 'S' && item.rule ? `${item.rule}：${item.reason}` : item.reason,
+      })
+    }
+  })
+  return marks
+}
+
+function trendTooltip(point, prevClose, dayMarks) {
+  if (!point) return ''
+  const tone = trendPalette()
+  const close = Number(point.close)
+  const prev = Number(prevClose)
+  const change = prev > 0 ? ((close - prev) / prev) * 100 : null
+  const changeColor = change == null ? tone.ink : change >= 0 ? '#089981' : '#f23645'
+  const ma = (label, value, color) =>
+    value == null
+      ? ''
+      : `<span style="margin-right:10px"><i style="display:inline-block;width:8px;height:2px;background:${color};margin-right:4px;vertical-align:middle"></i>${label} ${adviceNum(value)}</span>`
+  const row = (label, ok) =>
+    `<div style="font-size:11px;line-height:1.6"><span style="color:${ok ? '#089981' : '#f23645'};font-weight:700">${ok ? '✓' : '✗'}</span> ${label}</div>`
+  const heading = (text) =>
+    `<div style="margin-top:2px;font-size:10px;font-weight:700;color:${tone.axis}">${text}</div>`
+  let html = `<div style="font-size:12px;line-height:1.75;max-width:100%;overflow-wrap:anywhere;color:${tone.ink}">`
+  html += `<div style="font-weight:650;margin-bottom:2px">${point.date}</div>`
+  html += `<div>开 ${adviceNum(point.open)} · 高 ${adviceNum(point.high)} · 低 ${adviceNum(point.low)}</div>`
+  html += `<div>收 <b style="color:${changeColor}">${adviceNum(point.close)}</b>`
+  html += change == null ? '' : ` <span style="color:${changeColor}">${formatPct(change)}</span>`
+  html += ` · 量 ${formatCount(point.volume)}</div>`
+  html += `<div style="margin-top:2px">${ma('MA5', point.ma5, THS_LINE.ma5)}${ma('MA10', point.ma10, THS_LINE.ma10)}${ma('MA20', point.ma20, THS_LINE.ma20)}</div>`
+  for (const mark of dayMarks) {
+    const buy = mark.side === 'B'
+    const color = buy ? TREND_BUY : TREND_SELL
+    html += `<div style="margin-top:5px;padding-top:5px;border-top:1px dashed ${tone.line}"><b style="color:${color}">${mark.title}</b> ${adviceNum(point.close)}`
+    html += `<div style="color:${tone.axis};font-size:11px">${mark.reason}</div></div>`
+  }
+  const buys = [...(point.strategies || [])].sort(
+    (a, b) => TREND_RULE_ORDER.indexOf(a.id) - TREND_RULE_ORDER.indexOf(b.id),
+  )
+  for (const [title, list] of [
+    ['买入规则条件', buys],
+    ['卖出规则条件', point.sells || []],
+  ]) {
+    const rules = list.filter((rule) => (rule.core || []).some((item) => item.ok))
+    if (!rules.length) continue
+    html += `<div style="margin-top:6px;padding-top:6px;border-top:1px dashed ${tone.line}">`
+    html += `<div style="font-weight:650">${title}</div>`
+    for (const rule of rules) {
+      const core = rule.core || []
+      const optional = rule.optional || []
+      const coreHit = core.filter((item) => item.ok).length
+      html += `<div style="margin-top:5px;font-weight:650">${rule.name} <span style="color:${tone.axis};font-weight:400;font-size:10px">${rule.ready ? '全部满足' : `必填 ${coreHit}/${core.length} · 辅助 ${rule.opt_hits}/${rule.need}`}</span></div>`
+      if (core.length) {
+        html += heading('必填：')
+        html += core.map((item) => row(item.label, item.ok)).join('')
+        html += heading(`辅助：至少 ${rule.need} 项`)
+        html += optional.map((item) => row(item.label, item.ok)).join('')
+      } else if (rule.detail) {
+        html += `<div style="font-size:11px">${rule.detail}</div>`
+      }
+    }
+    html += '</div>'
+  }
+  html += '</div>'
+  return html
+}
+
+function priceWindow(highs, lows, start, end) {
+  let hi = -Infinity
+  let lo = Infinity
+  for (let index = start; index <= end; index += 1) {
+    const high = Number(highs[index])
+    const low = Number(lows[index])
+    if (Number.isFinite(high)) hi = Math.max(hi, high)
+    if (Number.isFinite(low)) lo = Math.min(lo, low)
+  }
+  if (!Number.isFinite(hi) || !Number.isFinite(lo)) return { min: null, max: null, hi: null, lo: null }
+  const span = hi - lo || Math.abs(hi) * 0.02 || 1
+  const pad = span * 0.08
+  return { min: lo - pad, max: hi + pad, hi, lo }
+}
+
+function zoomIndexes(zoom, categories) {
+  const last = Math.max(0, categories.length - 1)
+  let start = 0
+  let end = last
+  if (zoom?.startValue != null) {
+    const index = categories.indexOf(zoom.startValue)
+    if (index >= 0) start = index
+  } else if (typeof zoom?.start === 'number') {
+    start = Math.round((zoom.start / 100) * last)
+  }
+  if (zoom?.endValue != null) {
+    const index = categories.indexOf(zoom.endValue)
+    if (index >= 0) end = index
+  } else if (typeof zoom?.end === 'number') {
+    end = Math.round((zoom.end / 100) * last)
+  }
+  return [Math.max(0, Math.min(start, end)), Math.min(last, Math.max(start, end))]
+}
+
+function placePriceTags(chart, hi, lo, text, color) {
+  const highPixel = chart.convertToPixel({ yAxisIndex: 0 }, hi)
+  const lowPixel = chart.convertToPixel({ yAxisIndex: 0 }, lo)
+  const highY = Array.isArray(highPixel) ? highPixel[1] : highPixel
+  const lowY = Array.isArray(lowPixel) ? lowPixel[1] : lowPixel
+  if (!Number.isFinite(highY) || !Number.isFinite(lowY)) return
+  const tag = (id, value, top) => ({
+    id,
+    type: 'text',
+    silent: true,
+    z: 30,
+    left: 2,
+    top,
+    style: { text: text(value), fill: color, fontSize: 11 },
+  })
+  chart.setOption({
+    graphic: [tag('k-high', hi, highY - 14), tag('k-low', lo, lowY + 2)],
+  })
+}
+
+let trendTagging = false
+
+function syncTrendPriceTags() {
+  if (!trendChart || trendTagging) return
+  const rows = trendBook.value?.points || []
+  if (!rows.length) return
+  const option = trendChart.getOption()
+  const categories = option.xAxis?.[0]?.data || rows.map((point) => point.date)
+  const [start, end] = zoomIndexes(option.dataZoom?.[0], categories)
+  const span = priceWindow(
+    rows.map((point) => point.high),
+    rows.map((point) => point.low),
+    start,
+    end,
+  )
+  if (span.hi == null) return
+  trendTagging = true
+  trendChart.setOption({ yAxis: [{ min: span.min, max: span.max }] })
+  trendTagging = false
+  requestAnimationFrame(() => {
+    if (!trendChart) return
+    placePriceTags(trendChart, span.hi, span.lo, (value) => adviceNum(value), trendPalette().axis)
+  })
+}
+
 function renderTrendChart({ keepRange = false } = {}) {
   const points = trendBook.value?.points || []
-  if (!trendChartRef.value || !points.length) return
+  if (!trendChartRef.value) return
+  if (!points.length) {
+    // No data for this symbol: never leave the previous symbol's candles on screen.
+    if (trendChart) trendChart.clear()
+    return
+  }
   if (!trendChart) trendChart = echarts.init(trendChartRef.value)
   const previousDates = trendChart.getOption()?.xAxis?.[0]?.data || []
   const kept = keepRange ? captureTrendRange(previousDates) : null
@@ -2277,6 +2509,7 @@ function renderTrendChart({ keepRange = false } = {}) {
     const high = point.high ?? Math.max(open ?? close, close)
     return [open, close, low, high]
   })
+  const tone = trendPalette()
   const marks = []
   points.forEach((point, index) => {
     if (point.signal === 'squeeze') {
@@ -2299,17 +2532,63 @@ function renderTrendChart({ keepRange = false } = {}) {
       })
     }
   })
+  const adviceMarks = trendAdviceMarks(points)
+  const renderAdviceMark = (params, api) => {
+    const mark = adviceMarks[params.dataIndex]
+    if (!mark) return null
+    const buy = mark.side === 'B'
+    const color = buy ? TREND_BUY : TREND_SELL
+    const center = api.coord([api.value(0), api.value(1)])
+    const half = Math.max(api.size([1, 0])[0] / 2, 4)
+    const cx = center[0]
+    const cy = center[1]
+    return {
+      type: 'group',
+      silent: true,
+      children: [
+        {
+          type: 'line',
+          shape: { x1: cx - half * 0.94, y1: cy, x2: cx + half * 0.94, y2: cy },
+          style: { stroke: color, lineWidth: 2, lineCap: 'round', lineDash: buy ? undefined : [5, 3], opacity: 0.95 },
+        },
+        {
+          type: 'circle',
+          shape: { cx, cy, r: 6.5 },
+          style: { fill: color, stroke: tone.paper, lineWidth: 2 },
+        },
+        {
+          type: 'text',
+          style: {
+            text: mark.side,
+            x: cx,
+            y: cy,
+            fill: '#fff',
+            fontSize: 9,
+            fontWeight: 700,
+            align: 'center',
+            verticalAlign: 'middle',
+          },
+        },
+      ],
+    }
+  }
   const mom = points[points.length - 1]?.mom
   const wash = mom > 0 ? 'rgba(8,153,129,0.08)' : mom < 0 ? 'rgba(230,167,0,0.10)' : 'transparent'
-  const tone = trendPalette()
   const zoomEnd = dates[dates.length - 1]
   const zoomStart = kept?.startValue && dates.includes(kept.startValue)
     ? kept.startValue
     : dates[Math.max(0, dates.length - TREND_PAGE)]
   const zoomStop = kept?.endValue && dates.includes(kept.endValue) ? kept.endValue : zoomEnd
+  const priceSpan = priceWindow(
+    points.map((point) => point.high),
+    points.map((point) => point.low),
+    Math.max(0, dates.indexOf(zoomStart)),
+    Math.max(0, dates.indexOf(zoomStop)),
+  )
   trendZoomGuard = { start: zoomStart, end: zoomStop }
   const zoomStamp = ++trendZoomStamp
   trendZoomLive = false
+  let lastTrendTip = ''
   trendChart.setOption(
     {
       animationDuration: 280,
@@ -2320,9 +2599,54 @@ function renderTrendChart({ keepRange = false } = {}) {
       legend: { show: false },
       tooltip: {
         show: true,
-        showContent: false,
         trigger: 'axis',
+        // Fixed band: top sits on the Bollinger caption (just under the candles
+        // and volume) and the bottom stops above the zoom slider. ECharts rewrites
+        // the tooltip style on every move, so the size is applied again each time.
+        confine: false,
+        enterable: true,
+        hideDelay: 400,
+        transitionDuration: 0,
+        position(_point, _params, dom, _rect, size) {
+          const [viewWidth, viewHeight] = size.viewSize
+          const top = Math.round(viewHeight * 0.49)
+          const height = Math.max(80, viewHeight - top - 24)
+          const width = Math.min(Math.round(viewWidth * 0.7), viewWidth)
+          if (dom) {
+            const style = dom.style
+            style.boxSizing = 'border-box'
+            style.width = `${width}px`
+            style.height = `${height}px`
+            style.minHeight = `${height}px`
+            style.maxHeight = `${height}px`
+            style.maxWidth = '70vw'
+            style.overflowX = 'hidden'
+            style.overflowY = 'auto'
+            style.whiteSpace = 'normal'
+            style.pointerEvents = 'auto'
+          }
+          return [0, top]
+        },
+        backgroundColor: tone.paper,
+        borderColor: tone.line,
+        borderWidth: 1,
+        padding: [8, 12],
+        textStyle: { color: tone.ink, fontSize: 12 },
+        extraCssText: 'box-shadow:0 8px 24px rgba(20,30,55,.12);border-radius:10px;overflow-wrap:anywhere;',
         axisPointer: { type: 'cross', lineStyle: { color: tone.line, type: 'dashed', width: 1 } },
+        formatter: (params) => {
+          const list = Array.isArray(params) ? params : [params]
+          const hit = list.find((item) => Number.isInteger(item?.dataIndex))
+          let index = hit?.dataIndex
+          if (!Number.isInteger(index)) {
+            const date = list[0]?.axisValue ?? list[0]?.name
+            index = typeof date === 'number' ? date : points.findIndex((item) => item.date === date)
+          }
+          if (!points[index]) return lastTrendTip
+          const dayMarks = adviceMarks.filter((mark) => mark.index === index)
+          lastTrendTip = trendTooltip(points[index], index > 0 ? points[index - 1].close : null, dayMarks)
+          return lastTrendTip
+        },
       },
       dataZoom: [
         {
@@ -2337,18 +2661,18 @@ function renderTrendChart({ keepRange = false } = {}) {
         },
         chartSlider(dates, {
           xAxisIndex: [0, 1, 2, 3, 4],
-          left: 28,
-          right: 4,
+          left: 0,
+          right: 0,
           startValue: zoomStart,
           endValue: zoomStop,
         }),
       ],
       grid: [
-        { left: 36, right: 8, top: 8, bottom: '58%' },
-        { left: 36, right: 8, top: '43%', height: '5.5%' },
-        { left: 36, right: 8, top: '53%', height: '11%' },
-        { left: 36, right: 8, top: '69%', height: '12%' },
-        { left: 36, right: 8, top: '84.5%', height: '5.5%' },
+        { left: 0, right: 0, top: 8, bottom: '58%' },
+        { left: 0, right: 0, top: '43%', height: '5.5%' },
+        { left: 0, right: 0, top: '53%', height: '11%' },
+        { left: 0, right: 0, top: '69%', height: '12%' },
+        { left: 0, right: 0, top: '84.5%', height: '5.5%' },
       ],
       graphic: trendStudyGraphics(points.find((point) => point.date === trendCursor.value?.date) || points[points.length - 1]),
       xAxis: [0, 1, 2, 3, 4].map((gridIndex) => ({
@@ -2373,10 +2697,13 @@ function renderTrendChart({ keepRange = false } = {}) {
       yAxis: [
         {
           scale: true,
+          min: priceSpan.min,
+          max: priceSpan.max,
           axisLine: { show: false },
           axisTick: { show: false },
+          axisLabel: { show: false },
+          axisPointer: { label: { show: false } },
           splitLine: { lineStyle: { color: tone.split } },
-          axisLabel: { color: tone.axis, fontSize: 11, margin: 4, align: 'right' },
         },
         { gridIndex: 1, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
         { gridIndex: 2, scale: true, axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
@@ -2394,12 +2721,29 @@ function renderTrendChart({ keepRange = false } = {}) {
             borderColor: upColor,
             borderColor0: downColor,
           },
-          markPoint: { symbolSize: 10, data: marks },
+          markPoint: {
+            symbolSize: 10,
+            data: marks,
+            tooltip: { show: false },
+          },
           markArea: {
             silent: true,
             itemStyle: { color: wash },
             data: [[{ xAxis: dates[0] }, { xAxis: dates[dates.length - 1] }]],
           },
+        },
+        {
+          name: '建议买卖',
+          type: 'custom',
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          coordinateSystem: 'cartesian2d',
+          renderItem: renderAdviceMark,
+          data: adviceMarks.map((mark) => [mark.index, points[mark.index].close]),
+          silent: true,
+          clip: true,
+          z: 12,
+          tooltip: { show: false },
         },
         {
           name: 'MA5',
@@ -2573,6 +2917,7 @@ function renderTrendChart({ keepRange = false } = {}) {
   })
   trendChart.off('datazoom')
   trendChart.on('datazoom', () => {
+    syncTrendPriceTags()
     if (!trendZoomLive || trendPaging) return
     const dates = (trendBook.value?.points || []).map((point) => point.date)
     const range = captureTrendRange(dates)
@@ -2583,6 +2928,7 @@ function renderTrendChart({ keepRange = false } = {}) {
   })
   bindTrendSlider(trendChartRef.value)
   trendChart.resize()
+  requestAnimationFrame(() => syncTrendPriceTags())
   setTimeout(() => {
     if (zoomStamp === trendZoomStamp) trendZoomLive = true
   }, 80)
@@ -3108,6 +3454,7 @@ const imagePriceCell = (v, pct) => {
 
 const positionImageCells = {
   symbol: imageSymbol,
+  signals: (r) => imageSignals(r),
   trade_count: (r) => String(r.trade_count ?? 0),
   allocation: (r) => formatPct(r.allocation).replace('+', ''),
   quantity: (r) => formatQty(r.quantity),
@@ -3152,6 +3499,7 @@ const cumulativeImageCells = {
 
 const priceImageCells = {
   symbol: imageSymbol,
+  signals: (r) => imageSignals(r),
   last_price: (r) => imagePrice(r.last_price),
   day_change: (r) => (r.day_change == null ? '—' : imagePnl(r.day_change)),
   day_change_percent: (r) => ({
@@ -3254,6 +3602,7 @@ watch(
   },
 )
 
+watch([isPricePage, () => store.market], loadCnFlow, { immediate: true })
 watch(subTab, () => {
   if (isPricePage.value) return
   sortState.field = null
@@ -3278,6 +3627,13 @@ watch(trendSymbol, () => {
 })
 watch(() => store.quoteTick, () => {
   autoRefreshQuotes()
+  // Session-bar signals move intraday, but the advice call is expensive; refresh it
+  // on a slower cadence than the 10s quote tick so it cannot starve other requests.
+  const now = Date.now()
+  if (isMarketOpen(store.market) && now - lastIndicatorPoll >= INDICATOR_POLL_MS) {
+    lastIndicatorPoll = now
+    loadIndicators({ silent: true })
+  }
   if (isPricePage.value || subTab.value === 'price') loadSentiment({ silent: true })
 })
 onMounted(() => {
@@ -3791,6 +4147,25 @@ onUnmounted(() => {
           @flow="onCnFlow"
         />
       </section>
+      <section v-if="isPricePage && store.market === 'cn' && cnFlow" class="price-tape">
+        <div class="price-tape-row">
+          <article>
+            <p>融资余额<small v-if="cnFlow.margin_date">截至 {{ cnFlow.margin_date }}</small></p>
+            <strong>{{ cnFlow.margin_balance == null ? '—' : `${Number(cnFlow.margin_balance).toFixed(2)} 万亿` }}</strong>
+            <span>
+              占流通市值 {{ cnFlow.margin_ratio == null ? '—' : `${Number(cnFlow.margin_ratio).toFixed(2)}%` }}
+              · 近 20 个交易日 {{ cnFlow.margin_change_pct == null ? '—' : formatPct(cnFlow.margin_change_pct) }}
+              · 近一年位置 {{ cnFlow.margin_rank == null ? '—' : `${Number(cnFlow.margin_rank).toFixed(0)}%` }}
+            </span>
+          </article>
+          <article v-for="item in cnFlow.etfs" :key="item.code">
+            <p>{{ item.name }}<small>份额 4 周</small></p>
+            <strong :class="pnlClass(item.change_pct)">{{ item.change_pct == null ? '—' : formatPct(item.change_pct) }}</strong>
+            <span>{{ item.shares == null ? '—' : `${Number(item.shares).toFixed(0)} 亿份` }}<template v-if="cnFlow.etf_base_date"> · 对比 {{ cnFlow.etf_base_date }}</template></span>
+          </article>
+        </div>
+        <p class="sentiment-note">{{ cnFlow.note }}</p>
+      </section>
       <section v-if="isPricePage && sentiment && (sentiment.vix || sentiment.indexes?.length)" class="price-tape">
         <div class="price-tape-row">
           <article v-if="sentiment.vix">
@@ -3895,6 +4270,13 @@ onUnmounted(() => {
               @pick="openStockAdvice(record)"
             />
             <SymbolCell v-else :symbol="record.symbol" :name="record.name" :logo-url="record.logo_url" />
+          </template>
+          <template v-else-if="column.key === 'signals'">
+            <span v-if="!signalListOf(record)" class="signal-cell is-wait">{{ adviceLoading ? '…' : '—' }}</span>
+            <span v-else-if="!signalListOf(record).length" class="signal-cell is-none">未触发</span>
+            <span v-else class="signal-cell is-fired" :title="signalTitle(record)">
+              <b v-for="item in signalListOf(record)" :key="item.id" class="signal-tag">{{ item.name }}</b>
+            </span>
           </template>
           <template v-else-if="column.key === 'main_flow'">
             <span :class="pnlClass(cnFlowBySymbol[record.symbol]?.main)">{{ flowYi(cnFlowBySymbol[record.symbol]?.main) }}</span>
@@ -4294,21 +4676,6 @@ onUnmounted(() => {
       <p v-if="trendCursor?.drawdown_pct != null && trendCursor?.rebound_pct != null" class="trend-swing">
         近 22 日从 {{ trendCursor.swing_high_date }} 高点回撤 {{ Number(trendCursor.drawdown_pct).toFixed(1) }}%，从 {{ trendCursor.swing_low_date }} 低点反弹 {{ Number(trendCursor.rebound_pct).toFixed(1) }}%
       </p>
-      <div v-if="trendReadyStrategies.length" class="trend-strategies">
-        <article
-          v-for="item in trendReadyStrategies"
-          :key="item.id"
-          class="trend-strategy is-ready"
-          :title="item.detail"
-        >
-          <header>
-            <em>{{ item.name }}</em>
-            <b>买入{{ item.ready ? '满足' : '未满足' }}</b>
-          </header>
-          <p>卖出 {{ item.exit }}</p>
-          <p v-if="item.exit_now" class="is-exit">{{ item.exit_now }}</p>
-        </article>
-      </div>
       <div ref="trendChartRef" class="trend-chart"></div>
       <a-table
         class="trend-table"
@@ -4629,7 +4996,7 @@ onUnmounted(() => {
             @click="goEditTrade(t)"
           >
             <template #title>
-              <a class="trade-step-link" @click.prevent="goEditTrade(t)">{{ tradeStepTitle(t) }}</a>
+              <a class="trade-step-link" @click.prevent="goEditTrade(t)" v-html="tradeStepTitle(t)"></a>
             </template>
             <template #description>
               <span class="trade-step-desc" @click="goEditTrade(t)">{{ tradeStepDesc(t) }}</span>
@@ -4713,6 +5080,7 @@ onUnmounted(() => {
 .trade-step-desc {
   cursor: pointer;
 }
+
 
 .holdings-summary-row :deep(td) {
   font-weight: 600;
@@ -6442,13 +6810,6 @@ onUnmounted(() => {
   font-weight: 650;
 }
 
-.trend-strategies {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
-  margin: 0 10px 6px;
-}
-
 .trend-swing {
   margin: 0 0 10px;
   color: var(--text);
@@ -6456,39 +6817,10 @@ onUnmounted(() => {
   line-height: 1.5;
 }
 
-.trend-strategy {
-  padding: 6px 8px;
-  border-radius: 8px;
-  background: var(--chip);
-  color: #667085;
-  font-size: 12px;
-}
-
-.trend-strategy header {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.trend-strategy em,
-.trend-strategy b {
-  font-style: normal;
-  font-weight: 650;
-}
-
-.trend-strategy p {
-  margin: 4px 0 0;
-  color: var(--text);
-  line-height: 1.4;
-}
-
-.trend-strategy .is-exit {
-  color: #b52f27;
-}
-
-.trend-strategy.is-ready header b {
-  color: #067a5a;
-}
+.signal-cell { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 11px; }
+.signal-cell.is-none, .signal-cell.is-wait { color: var(--muted); }
+.signal-tag { padding: 2px 6px; border-radius: 5px; background: #e6f6f1; color: #12866f; font-size: 10px; font-weight: 650; white-space: nowrap; }
+.signal-cell.is-fired { cursor: help; }
 
 .trend-chart {
   width: 100%;
@@ -6626,10 +6958,6 @@ onUnmounted(() => {
   }
 
   .trend-brief-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .trend-strategies {
     grid-template-columns: 1fr;
   }
 
@@ -6836,9 +7164,7 @@ onUnmounted(() => {
   border-color: var(--border);
 }
 
-:global(html[data-theme='dark'] .trend-strategy) {
-  color: var(--muted);
-}
+:global(html[data-theme='dark'] .signal-tag) { background: #1b322c; color: #4fd1b5; }
 
 :global(html[data-theme='dark'] .trend-brief-grid article) {
   background: #262b36;

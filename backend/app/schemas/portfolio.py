@@ -1,18 +1,8 @@
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, Field
-
-
-class SummaryCard(BaseModel):
-    label: str
-    value: Decimal
-    currency: str = "USD"
-    percent: Decimal | None = None
-    secondary_label: str | None = None
-    secondary_value: Decimal | None = None
-    secondary_percent: Decimal | None = None
-    secondary_currency: str | None = None
 
 
 class PortfolioSummary(BaseModel):
@@ -45,7 +35,7 @@ class HoldingRow(BaseModel):
     # (last_price - avg_price) * quantity == total_pnl
     avg_price: Decimal
     last_price: Decimal | None = None
-    # Strategy stop levels for the open lot: trailing high-water -8% and cost -12%.
+    # Strategy stop levels for the open lot: ATR chandelier and cost minus 2x entry-day ATR.
     suggested_stop_price: Decimal | None = None
     mandatory_stop_price: Decimal | None = None
     # User-set stop on the holdings page; quantity is how many shares to sell.
@@ -131,6 +121,16 @@ class PositionLimitUpdate(BaseModel):
     symbol: str
     target_qty: Decimal | None = None
     max_buy_amount: Decimal | None = None
+
+
+class PositionSleeveUpdate(BaseModel):
+    symbol: str
+    sleeve: Literal["core", "satellite"]
+
+
+class PositionSleeveOut(BaseModel):
+    symbol: str
+    sleeve: str
 
 
 class PositionStopOut(BaseModel):
@@ -322,15 +322,6 @@ class DailyHoldingsPnlResponse(BaseModel):
     items: list[DailyHoldingPnlRow] = Field(default_factory=list)
 
 
-class PerformanceItem(BaseModel):
-    symbol: str
-    name: str | None = None
-    logo_url: str | None = None
-    value: Decimal
-    percent: Decimal
-    closed: bool = False
-
-
 class QuoteOut(BaseModel):
     symbol: str
     price: Decimal | None = None
@@ -482,6 +473,16 @@ class ReentryCandidate(BaseModel):
     status_note: str = ""
 
 
+class AdviceSignal(BaseModel):
+    """A buy rule whose checks all pass on the current session bar."""
+
+    id: str
+    name: str
+    detail: str = ""
+    exit: str = ""
+    exit_now: str = ""
+
+
 class AdviceMetrics(BaseModel):
     illiq: float | None = None
     illiq_date: str | None = None
@@ -501,6 +502,7 @@ class AdviceMetrics(BaseModel):
     rp_weight: float | None = None
     pe: float | None = None
     erp: float | None = None
+    signals: list[AdviceSignal] = Field(default_factory=list)
 
 
 class TrendSection(BaseModel):
@@ -538,6 +540,11 @@ class HoldingsAdvice(BaseModel):
     items: list[AdviceItem] = Field(default_factory=list)
 
 
+class SignalCheck(BaseModel):
+    label: str
+    ok: bool = False
+
+
 class StrategySignal(BaseModel):
     id: str
     name: str
@@ -545,6 +552,18 @@ class StrategySignal(BaseModel):
     detail: str = ""
     exit: str = ""
     exit_now: str = ""
+    need: int = 0
+    opt_hits: int = 0
+    core: list[SignalCheck] = Field(default_factory=list)
+    optional: list[SignalCheck] = Field(default_factory=list)
+
+
+class AdviceMark(BaseModel):
+    side: str
+    # "position": the walked position's buy or exit. "rule": a sell rule turned ready.
+    kind: str = "position"
+    rule: str = ""
+    reason: str = ""
 
 
 class IndicatorPoint(BaseModel):
@@ -581,6 +600,8 @@ class IndicatorPoint(BaseModel):
     swing_high_date: str | None = None
     swing_low_date: str | None = None
     strategies: list[StrategySignal] = Field(default_factory=list)
+    sells: list[StrategySignal] = Field(default_factory=list)
+    advice: list[AdviceMark] = Field(default_factory=list)
 
 
 class TrendBrief(BaseModel):
@@ -720,6 +741,27 @@ class CnNorthbound(BaseModel):
     index_change: float | None = None
 
 
+class CnFlowEtf(BaseModel):
+    code: str
+    name: str
+    shares: float | None = None
+    change_pct: float | None = None
+
+
+class CnFlowSnapshot(BaseModel):
+    """A-share margin balance and broad-ETF share changes. Descriptive only."""
+
+    margin_date: str | None = None
+    margin_balance: float | None = None
+    margin_ratio: float | None = None
+    margin_change_pct: float | None = None
+    margin_rank: float | None = None
+    etf_date: str | None = None
+    etf_base_date: str | None = None
+    etfs: list[CnFlowEtf] = Field(default_factory=list)
+    note: str = ""
+
+
 class CnMarketDesk(BaseModel):
     activity: CnActivity = Field(default_factory=CnActivity)
     sse: CnSseDeal = Field(default_factory=CnSseDeal)
@@ -754,6 +796,7 @@ class AllocationName(BaseModel):
     symbol: str
     ticker: str
     sleeve: str
+    sleeve_key: str = "satellite"
     market_value: Decimal = Decimal("0")
     weight: float = 0
     room: Decimal = Decimal("0")
@@ -764,11 +807,31 @@ class StrategyAllocation(BaseModel):
     cash: Decimal = Decimal("0")
     holdings_value: Decimal = Decimal("0")
     single_cap: Decimal = Decimal("0")
+    core_single_cap: Decimal = Decimal("0")
+    core_count: int = 0
+    satellite_count: int = 0
+    core_max: int = 3
+    satellite_max: int = 5
     tranche: Decimal = Decimal("0")
-    loss_cap: Decimal = Decimal("0")
     sleeves: list[AllocationSleeve] = Field(default_factory=list)
     names: list[AllocationName] = Field(default_factory=list)
     note: str = ""
+
+
+class StrategyRule(BaseModel):
+    id: str
+    name: str
+    kind: str = "trend"
+    sizing: str = ""
+    core: list[str] = Field(default_factory=list)
+    optional: list[str] = Field(default_factory=list)
+    need: int = 0
+    stop_atr: float = 0
+    exit_steps: list[str] = Field(default_factory=list)
+
+
+class StrategyEngineResponse(BaseModel):
+    engine_code: str = ""
 
 
 class StrategyResponse(ReviewResponse):
@@ -776,13 +839,37 @@ class StrategyResponse(ReviewResponse):
     reentry_candidates: list[ReentryCandidate] = Field(default_factory=list)
     reentry_screened: int = 0
     allocation: StrategyAllocation | None = None
+    rules: list[StrategyRule] = Field(default_factory=list)
+
+
+class BacktestSignalCondition(BaseModel):
+    label: str
+    ok: bool = False
+
+
+class BacktestSignalRule(BaseModel):
+    name: str
+    ready: bool = False
+    need: int = 0
+    opt_hits: int = 0
+    core: list[BacktestSignalCondition] = Field(default_factory=list)
+    optional: list[BacktestSignalCondition] = Field(default_factory=list)
 
 
 class BacktestTrade(BaseModel):
     symbol: str
     entry: str
+    exit: str = ""
+    entry_at: str = ""
+    exit_at: str = ""
+    entry_price: float | None = None
+    exit_price: float | None = None
+    qty: float | None = None
+    commission: float | None = None
+    pnl: float | None = None
     signal: str = ""
     rule: str = ""
+    exit_rule: str = ""
     return_pct: float | None = None
     held: int = 0
     rsi: float | None = None
@@ -793,6 +880,7 @@ class BacktestTrade(BaseModel):
     above_ma20: float | None = None
     advancers: int | None = None
     decliners: int | None = None
+    signal_rules: list[BacktestSignalRule] = Field(default_factory=list)
 
 
 class BacktestSymbol(BaseModel):
@@ -804,17 +892,107 @@ class BacktestSymbol(BaseModel):
     closed_trades: int = 0
     win_rate: float | None = None
     end_value: float | None = None
+    cash: float = 0
+    sleeve: str = ""
+    pnl: float | None = None
     rule: str = ""
     error: str = ""
     trades: list[BacktestTrade] = Field(default_factory=list)
+
+
+class BacktestRuleCheck(BaseModel):
+    """One rule's verdict on a single bar. Labels come from the rule catalog, in order."""
+
+    ready: bool = False
+    core: list[bool] = Field(default_factory=list)
+    opt: list[bool] = Field(default_factory=list)
+
+
+class BacktestCandle(BaseModel):
+    d: str
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float = 0
+    checks: list[BacktestRuleCheck] = Field(default_factory=list)
+    sells: list[BacktestSignalRule] = Field(default_factory=list)
+
+
+class BacktestCandlesResponse(BaseModel):
+    symbol: str
+    name: str | None = None
+    candles: list[BacktestCandle] = Field(default_factory=list)
+
+
+class BacktestCompareRow(BaseModel):
+    """The strategy or a buy-and-hold line. Sharpe takes the risk-free rate as 0."""
+
+    label: str
+    note: str = ""
+    end_value: float | None = None
+    pnl: float | None = None
+    return_pct: float | None = None
+    annual_pct: float | None = None
+    sharpe: float | None = None
+    max_drawdown_pct: float | None = None
+    calmar: float | None = None
+
+
+class BacktestRuleStat(BaseModel):
+    """Closed rounds led by one rule. expect_r averages every closed lot's result in units of 1R."""
+
+    rule: str
+    cycles: int = 0
+    lots: int = 0
+    win_rate: float | None = None
+    payoff: float | None = None
+    expect_r: float | None = None
+    held: float | None = None
+    gross: float = 0
+    commission: float = 0
+    net: float = 0
+
+
+class BacktestExcursion(BaseModel):
+    """How far price moved against (MAE) and for (MFE) the first entry, in units of 1R."""
+
+    rule: str
+    stop_atr: float | None = None
+    cycles: int = 0
+    wins: int = 0
+    win_mae_p50: float | None = None
+    win_mae_p75: float | None = None
+    win_mae_max: float | None = None
+    loss_mfe_p50: float | None = None
+    touched: int = 0
+    touched_won: int = 0
+    reach_15: float | None = None
+    reach_25: float | None = None
+
+
+class BacktestCost(BaseModel):
+    trades: int = 0
+    gross: float = 0
+    commission: float = 0
+    net: float = 0
+    share_pct: float | None = None
 
 
 class BacktestResponse(BaseModel):
     engine: str = "AKQuant"
     market: str
     profile: str = ""
-    cash: float = 100000
+    cash: float = 30000
+    idle_cash: float = 0
+    end_value: float | None = None
+    pnl: float | None = None
+    return_pct: float | None = None
     start: date | None = None
     end: date | None = None
     note: str = ""
+    compare: list[BacktestCompareRow] = Field(default_factory=list)
+    rule_stats: list[BacktestRuleStat] = Field(default_factory=list)
+    excursions: list[BacktestExcursion] = Field(default_factory=list)
+    cost: BacktestCost | None = None
     items: list[BacktestSymbol] = Field(default_factory=list)

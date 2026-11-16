@@ -361,7 +361,8 @@ def _request_text(
     headers = {"User-Agent": _USER_AGENT}
     if referer:
         headers["Referer"] = referer
-    response = requests.get(url, params=params, headers=headers, timeout=timeout)
+    proxies = {"http": None, "https": None} if any(host in url for host in ("eastmoney.com", "sina.com", "sina.cn", "gtimg.cn")) else None
+    response = requests.get(url, params=params, headers=headers, timeout=timeout, proxies=proxies)
     response.raise_for_status()
     response.encoding = encoding
     return response.text

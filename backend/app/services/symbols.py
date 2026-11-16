@@ -33,11 +33,6 @@ def to_market_symbol(symbol: str | None) -> str | None:
     return ticker
 
 
-def to_yahoo_symbol(symbol: str | None) -> str | None:
-    """Backward-compatible alias for the legacy database field name."""
-    return to_market_symbol(symbol)
-
-
 def exchange_of(symbol: str | None) -> str | None:
     exchange, _ = split_symbol(symbol)
     return exchange

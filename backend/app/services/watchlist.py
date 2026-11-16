@@ -13,7 +13,7 @@ CN_SYMBOLS = (
     "SZSE:159871",
     "SSE:512480",
     "SSE:600362",
-    "SZSE:159912",
+    "SZSE:159952",
 )
 
 HK_SYMBOLS = (

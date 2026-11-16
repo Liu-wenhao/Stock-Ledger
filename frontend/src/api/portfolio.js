@@ -9,8 +9,6 @@ export const fetchDailyHoldings = (date) =>
   http.get('/api/portfolio/daily-holdings', { params: { date } }).then((r) => r.data)
 export const fetchPeriodHoldings = (startDate, endDate) =>
   http.get('/api/portfolio/period-holdings', { params: { start_date: startDate, end_date: endDate } }).then((r) => r.data)
-export const fetchTotalMovers = (params) =>
-  http.get('/api/portfolio/total-movers', { params }).then((r) => r.data)
 export const fetchPeriodPerformance = (params) =>
   http.get('/api/portfolio/period-performance', { params }).then((r) => r.data)
 export const fetchHoldings = (params) => http.get('/api/holdings', { params }).then((r) => r.data)
@@ -19,6 +17,7 @@ export const fetchIndicatorHistory = (symbol, params = {}) =>
   http.get('/api/holdings/indicator-history', { params: { symbol, limit: 40, ...params } }).then((r) => r.data)
 export const fetchMarketSentiment = () => http.get('/api/market/sentiment').then((r) => r.data)
 export const fetchCnDesk = () => http.get('/api/market/cn-desk').then((r) => r.data)
+export const fetchCnFlow = () => http.get('/api/market/cn-flow', { timeout: 30000 }).then((r) => r.data)
 export const fetchCnStockFlow = (symbols) =>
   http.get('/api/market/cn-stock-flow', { params: { symbols: symbols.join(',') }, timeout: 120000 }).then((r) => r.data)
 export const fetchBreadthHistory = (book = '') =>
@@ -27,6 +26,8 @@ export const updateHoldingStop = (data) =>
   http.put('/api/holdings/stop', data).then((r) => r.data)
 export const updateHoldingLimit = (data) =>
   http.put('/api/holdings/limit', data).then((r) => r.data)
+export const updateHoldingSleeve = (data) =>
+  http.put('/api/holdings/sleeve', data).then((r) => r.data)
 export const fetchMonthlyReturns = (params) =>
   http.get('/api/analysis/monthly-returns', { params }).then((r) => r.data)
 export const fetchProfitSeries = (params) =>
@@ -35,8 +36,12 @@ export const fetchTradingReview = (params) =>
   http.get('/api/analysis/review', { params }).then((r) => r.data)
 export const fetchTradingStrategy = (params) =>
   http.get('/api/analysis/strategy', { params }).then((r) => r.data)
+export const fetchStrategyEngine = () =>
+  http.get('/api/analysis/strategy/engine').then((r) => r.data)
 export const fetchBacktest = (params) =>
   http.get('/api/analysis/backtest', { params, timeout: 180000 }).then((r) => r.data)
+export const fetchBacktestCandles = (symbol, params) =>
+  http.get('/api/analysis/backtest/candles', { params: { symbol, ...params }, timeout: 120000 }).then((r) => r.data)
 export const fetchTrades = (params) => http.get('/api/trades', { params }).then((r) => r.data)
 export const createTrade = (data) => http.post('/api/trades', data).then((r) => r.data)
 export const updateTrade = (id, data) => http.put(`/api/trades/${id}`, data).then((r) => r.data)

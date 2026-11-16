@@ -100,74 +100,338 @@ def _rsi(closes: list[float], period: int = 14) -> float | None:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def _stop_candle(bars: list[dict]) -> str | None:
-    """AlphaEvo has_stop_signal: hammer-like lower shadow, else bullish engulfing."""
+_CN_ETF_PREFIXES = ("159", "510", "511", "512", "513", "515", "516", "517", "518", "560", "561", "562", "563", "588")
+
+
+def is_etf(symbol: str) -> bool:
+    """Low-volatility parameter set. A-share ETF codes and tickers ending in ETF."""
+    ticker = str(symbol or "").split(":")[-1].upper()
+    code = ticker.split(".")[0]
+    if code.isdigit() and len(code) == 6 and code.startswith(_CN_ETF_PREFIXES):
+        return True
+    return ticker.endswith("ETF")
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    ordered = sorted(value for value in values if value == value)
+    if not ordered:
+        return None
+    pos = (len(ordered) - 1) * q
+    low = int(pos)
+    high = min(low + 1, len(ordered) - 1)
+    weight = pos - low
+    return ordered[low] * (1 - weight) + ordered[high] * weight
+
+
+def _bandwidths(closes: list[float]) -> list[float | None]:
+    """(upper − lower) / MA20. Same 20-day sample deviation the chart uses."""
+    out: list[float | None] = []
+    for index in range(len(closes)):
+        if index < 19:
+            out.append(None)
+            continue
+        window = closes[index - 19 : index + 1]
+        mid = mean(window)
+        out.append((4 * stdev(window) / mid) if mid else None)
+    return out
+
+
+def wilder_atr(bars: list[dict], period: int = 14) -> list[float]:
+    """Wilder ATR: 前 period 根采用简单均值种子对齐 TradingView/同花顺，并加最小正数兜底防除零。"""
+    if not bars:
+        return []
+    trs: list[float] = []
+    for i, bar in enumerate(bars):
+        high = float(bar["h"])
+        low = float(bar["l"])
+        close = float(bar["c"])
+        if i == 0:
+            tr = high - low
+        else:
+            prev_close = float(bars[i - 1]["c"])
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        # 防止一字板或停牌导致 TR=0 引发下游 (close - ma20) / atr 除零
+        trs.append(max(tr, close * 1e-4))
+
+    values: list[float] = []
+    running_sum = 0.0
+    for i, tr in enumerate(trs):
+        running_sum += tr
+        if i < period - 1:
+            values.append(running_sum / (i + 1))
+        elif i == period - 1:
+            values.append(running_sum / period)
+        else:
+            values.append((values[-1] * (period - 1) + tr) / period)
+    return values
+
+
+def _bullish_pattern(bars: list[dict]) -> str | None:
+    """识别底部锤子线 (含探底T字线) 与看涨吞没，过滤高位吊颈线与十字星假吞没。"""
     if len(bars) < 2:
         return None
     row = bars[-1]
-    opened = row.get("o", row["c"])
-    close = row["c"]
+    opened = float(row.get("o", row["c"]))
+    close = float(row["c"])
+    high = float(row["h"])
+    low = float(row["l"])
+    span = high - low
+    if span <= 1e-6:
+        return None
+
     body = abs(close - opened)
-    lower_shadow = min(opened, close) - row["l"]
-    if body > 0 and lower_shadow >= 2 * body:
+    lower_shadow = min(opened, close) - low
+    upper_shadow = high - max(opened, close)
+
+    # 位置过滤：当日最低价必须处于近5日均价下方或附近，防止把连续大涨后的高位吊颈线当成底部锤子线
+    if len(bars) >= 5:
+        ma5_close = mean(float(b["c"]) for b in bars[-5:])
+        if low > ma5_close * 1.01:
+            return None
+
+    # 1. 锤子线（用 max(body, span*0.08) 兼容底部探底 T 字线，且要求收盘在振幅上半区）
+    effective_body = max(body, span * 0.08)
+    if lower_shadow >= 2.0 * effective_body and upper_shadow <= 0.15 * span and (close - low) / span >= 0.55:
         return "锤子线"
+
+    # 2. 看涨吞没（要求昨日阴线实体至少占昨日振幅 20%，防止吞没一根十字星）
     prev = bars[-2]
-    prev_open = prev.get("o", prev["c"])
-    prev_close = prev["c"]
-    if prev_close < prev_open and close > opened and close > prev_open and opened < prev_close:
+    prev_open = float(prev.get("o", prev["c"]))
+    prev_close = float(prev["c"])
+    prev_span = float(prev["h"]) - float(prev["l"])
+    prev_body = abs(prev_close - prev_open)
+    is_valid_prev_yin = (prev_close < prev_open) and (prev_span > 1e-6) and (prev_body / prev_span >= 0.20)
+
+    if is_valid_prev_yin and close > opened and opened <= prev_close and close >= prev_open and body >= prev_body:
         return "看涨吞没"
     return None
 
 
-def _alpha_strategies(bars: list[dict], rsi: float | None, stop_candle: str | None) -> list[dict]:
-    """OHLCV strategies from AlphaEvo. News, sector flow, and benchmark strength are omitted."""
+def _stop_candle(bars: list[dict]) -> str | None:
+    """图表标签与 _bullish_pattern 保持一致。"""
+    return _bullish_pattern(bars)
+
+
+# The four buy rules in words. `_alpha_strategies` pairs these labels with its own
+# live checks, so the strategy summary can never drift from what the engine trades.
+ALPHA_RULE_CATALOG: tuple[dict, ...] = (
+    {
+        "id": "ma_crossover_v1",
+        "name": "均线交叉",
+        "kind": "trend",
+        "sizing": "分三批：先买 1/3；之后收盘高于均价、且比上一批买价再高出至少 0.25 倍初始 ATR，当天按收盘价再买一批。",
+        "core": (
+            "MA5 不低于 MA10，允许差 0.08 倍 ATR",
+            "近 5 日涨幅在 1.2 到 3.5 倍当日 ATR% 之间",
+            "收盘在 MA20 上，但不超过 2.5 倍 ATR",
+        ),
+        "optional": (
+            "5 日量比不低于 1.2",
+            "RSI 在 50 和 72 之间",
+            "MA20 比昨天高",
+        ),
+        "need": 2,
+        "stop_atr": 2.0,
+        "exit_steps": (
+            "ATR 止损锚定首笔入场价：收盘 ≤ 首笔价 − 2 倍初始 ATR，整笔清仓。",
+            "持有满 3 日后收盘跌破 MA20 下方 0.3 倍当日 ATR，整笔清仓。",
+            "吊灯止盈：浮盈到过 2.5 倍初始 ATR 后，收盘从最高价回落 2.2 倍当日 ATR 即清仓，全天候生效、不必先分批。",
+            "趋势分批：+1.5R 减 1/3，+2.5R 再减 1/3；尾仓跟随上面的吊灯止盈。",
+            "时间止损：满 15 日且浮盈不到 1.5 倍初始 ATR 则离场，浮盈达标自动豁免。",
+            "卖出规则：收缩跌破、均线死叉、RSI超买、超涨回落任一条当天刚成立（前一天还不成立），整笔清仓。",
+            "全局失效：持仓满 40 日且四条规则都不成立，清掉。",
+        ),
+    },
+    {
+        "id": "rsi_reversion_v1",
+        "name": "RSI超卖",
+        "kind": "reversion",
+        "sizing": "一次买入，不分批、不加仓。股数按「打到 ATR 止损时亏损不超过总本金的 1%」反推，且不超过计划仓位。",
+        "core": (
+            "收盘在 MA10 下",
+            "RSI(6) 低于 25，或 RSI(14) 低于 35",
+            "出现锤子线或看涨吞没",
+        ),
+        "optional": (
+            "5 日量比高于 1.3",
+            "收盘比 MA20 低 1 到 3 倍 ATR",
+        ),
+        "need": 1,
+        "stop_atr": 1.8,
+        "exit_steps": (
+            "ATR 止损锚定首笔入场价：收盘 ≤ 首笔价 − 1.8 倍初始 ATR，整笔清仓。",
+            "止盈：收盘 ≥ 首笔价 + 3 倍初始 ATR，或当日最高价触及 MA20，整笔清仓，全天候生效。",
+            "反转规则不做 +1.5R / +2.5R 分批减仓，一次买入、一次清掉。",
+            "时间止损：持有满 10 日无条件离场。",
+            "卖出规则：收缩跌破、均线死叉、RSI超买、超涨回落任一条当天刚成立（前一天还不成立），整笔清仓。",
+            "全局失效：持仓满 40 日且四条规则都不成立，清掉。",
+        ),
+    },
+    {
+        "id": "volatility_compression_breakout_v1",
+        "name": "收缩突破",
+        "kind": "trend",
+        "sizing": "分三批：先买 1/3；之后收盘高于均价、且比上一批买价再高出至少 0.25 倍初始 ATR，当天按收盘价再买一批。",
+        "core": (
+            "收盘突破前 20 日高点",
+            "前 3 日有一天带宽不超过 3.8 倍 ATR%，或处于近 120 日最低两成",
+        ),
+        "optional": (
+            "20 日量比不低于 1.2",
+            "阳线实体占振幅至少 45%",
+            "MA20 比 5 日前高",
+            "处在近 120 日高低区间的 65% 以上",
+        ),
+        # 突破前 20 日高点时收盘必然在 MA20 上，那一项不再单列；4 项中 3 项与原来 5 项中 4 项等价。
+        "need": 3,
+        "stop_atr": 1.8,
+        "exit_steps": (
+            "ATR 止损锚定首笔入场价：收盘 ≤ 首笔价 − 1.8 倍初始 ATR，整笔清仓。",
+            "收盘跌破 MA20 下方 0.3 倍当日 ATR，整笔清仓（不设持有天数门槛）。",
+            "吊灯止盈：浮盈到过 2 倍初始 ATR 后，收盘从最高价回落 2 倍当日 ATR 即清仓，全天候生效、不必先分批。",
+            "趋势分批：+1.5R 减 1/3，+2.5R 再减 1/3；尾仓跟随上面的吊灯止盈。",
+            "时间止损：满 20 日且浮盈不到 1.5 倍初始 ATR 则离场，浮盈达标自动豁免。",
+            "卖出规则：收缩跌破、均线死叉、RSI超买、超涨回落任一条当天刚成立（前一天还不成立），整笔清仓。",
+            "全局失效：持仓满 40 日且四条规则都不成立，清掉。",
+        ),
+    },
+    {
+        "id": "mean_reversion_oversold_v1",
+        "name": "超跌反弹",
+        "kind": "reversion",
+        "sizing": "一次买入，不分批、不加仓。股数按「打到 ATR 止损时亏损不超过总本金的 1%」反推，且不超过计划仓位。",
+        "core": (
+            "收盘比 MA20 低至少 2.5 倍 ATR",
+            "RSI(14) 低于 30，或 RSI(6) 低于 20",
+        ),
+        "optional": (
+            "出现锤子线或看涨吞没",
+            "前 5 日均量低于前 10 日的 85%，当天量比昨天多 15%",
+        ),
+        "need": 1,
+        "stop_atr": 2.2,
+        "exit_steps": (
+            "ATR 止损锚定首笔入场价：收盘 ≤ 首笔价 − 2.2 倍初始 ATR，整笔清仓。",
+            "止盈：当日最高价触及 MA20，或浮盈到过 1.5 倍初始 ATR 后收盘从最高价回落 1.2 倍当日 ATR，整笔清仓，全天候生效。",
+            "反转规则不做 +1.5R / +2.5R 分批减仓，一次买入、一次清掉。",
+            "时间止损：持有满 8 日无条件离场。",
+            "卖出规则：收缩跌破、均线死叉、RSI超买、超涨回落任一条当天刚成立（前一天还不成立），整笔清仓。",
+            "全局失效：持仓满 40 日且四条规则都不成立，清掉。",
+        ),
+    },
+)
+
+
+def rule_catalog() -> list[dict]:
+    """The buy rules as the strategy page shows them: hard checks, optional checks, sizing, exit."""
+    return [
+        {
+            "id": rule["id"],
+            "name": rule["name"],
+            "kind": rule["kind"],
+            "sizing": rule["sizing"],
+            "core": list(rule["core"]),
+            "optional": list(rule["optional"]),
+            "need": rule["need"],
+            "stop_atr": rule["stop_atr"],
+            "exit_steps": list(rule["exit_steps"]),
+        }
+        for rule in ALPHA_RULE_CATALOG
+    ]
+
+
+def _alpha_strategies(
+    bars: list[dict],
+    rsi: float | None,
+    stop_candle: str | None,
+    is_etf: bool = False,
+    with_conditions: bool = False,
+) -> list[dict]:
+    """Four buy rules. Core checks must all pass. Optional checks may miss one.
+
+    Distances and the five-day rise are measured in 14-day ATR, so a quiet ETF
+    and a volatile stock do not share one fixed percent. Volume ratios use the
+    previous sessions' average. `stop_candle` is the chart label and is not a buy check.
+    """
+    del stop_candle, is_etf
     closes = [bar["c"] for bar in bars]
     highs = [bar["h"] for bar in bars]
+    lows = [bar["l"] for bar in bars]
     volumes = [bar["v"] for bar in bars]
     last = bars[-1]
     opened = last.get("o", last["c"])
     close = last["c"]
-    ma5 = mean(closes[-5:])
-    ma10 = mean(closes[-10:])
-    ma20 = mean(closes[-20:])
-    prev_ma5 = mean(closes[-6:-1])
-    prev_ma10 = mean(closes[-11:-1])
-    ma_stack = ma5 >= ma10 or (prev_ma5 < prev_ma10 and ma5 >= ma10 * 0.998)
-    above_ma20 = close > ma20
-    below_ma10 = close < ma10
-    avg5 = mean(volumes[-6:-1])
-    vol_ratio_5 = (volumes[-1] / avg5) if avg5 else 1.0
-    dist_ma20 = abs(close - ma20) / ma20 if ma20 else 1.0
-    deviation = (close - ma20) / ma20 if ma20 else 0.0
+    ma5 = mean(closes[-5:]) if len(closes) >= 5 else None
+    ma10 = mean(closes[-10:]) if len(closes) >= 10 else None
+    ma20 = mean(closes[-20:]) if len(closes) >= 20 else None
+    ma20_prev = mean(closes[-21:-1]) if len(closes) >= 21 else None
+    ma20_5ago = mean(closes[-25:-5]) if len(closes) >= 25 else None
+    above_ma20 = ma20 is not None and close > ma20
+    below_ma10 = ma10 is not None and close < ma10
+    atrs = wilder_atr(bars)
+    atr = atrs[-1] if atrs else None
+    atr_pct = (atr / close * 100) if atr and close else None
+    atr_dist = ((close - ma20) / atr) if atr and ma20 is not None else None
+    ma_near = ma5 is not None and ma10 is not None and atr is not None and ma5 >= ma10 - 0.08 * atr
+    avg5 = mean(volumes[-6:-1]) if len(volumes) >= 6 else 0.0
+    vol_ratio_5 = (volumes[-1] / avg5) if avg5 else 0.0
+    avg20 = mean(volumes[-21:-1]) if len(volumes) >= 21 else 0.0
+    vol_ratio_20 = (volumes[-1] / avg20) if avg20 else 0.0
     prior_high = max(highs[-21:-1]) if len(highs) >= 21 else None
     breakout = prior_high is not None and close > prior_high
-    avg20 = mean(volumes[-21:-1]) if len(volumes) >= 21 else 0.0
-    vol_ratio_20 = (volumes[-1] / avg20) if avg20 else 1.0
     span = last["h"] - last["l"]
-    body_ratio = abs(close - opened) / span if span else 0.0
-    ma20_prev = mean(closes[-25:-5]) if len(closes) >= 25 else None
-    slope = ((ma20 - ma20_prev) / ma20_prev) if ma20_prev else 0.0
-    window = closes[-120:]
-    low_close, high_close = min(window), max(window)
-    position = 0.5 if high_close == low_close else (close - low_close) / (high_close - low_close)
-    width = (4 * stdev(closes[-20:]) / ma20) if ma20 else None
-    shrink_rise = (
-        len(volumes) >= 4
-        and volumes[-4] > volumes[-3] > volumes[-2]
-        and volumes[-1] > volumes[-2]
+    yang_body = ((close - opened) / span) if span else 0.0
+    rise_5 = ((closes[-1] / closes[-6] - 1) * 100) if len(closes) >= 6 and closes[-6] else None
+    momentum_ok = (
+        atr_pct is not None
+        and rise_5 is not None
+        and rise_5 >= 1.2 * atr_pct
+        and rise_5 <= 3.5 * atr_pct
     )
-
-    touched_ma20 = last["h"] >= ma20
+    above_band = atr_dist is not None and 0 < atr_dist <= 2.5
+    rsi14 = rsi if rsi is not None else _rsi(closes, 14)
+    rsi6 = _rsi(closes, 6)
+    pattern = _bullish_pattern(bars)
+    widths = _bandwidths(closes)
+    prior_widths = [value for value in widths[-4:-1] if value is not None]
+    prior_width = min(prior_widths) if prior_widths else None
+    width_floor = _percentile([value for value in widths[-120:] if value is not None], 0.20)
+    prior_pct = prior_width * 100 if prior_width is not None else None
+    floor_pct = width_floor * 100 if width_floor is not None else None
+    squeezed = prior_pct is not None and atr_pct is not None and (
+        prior_pct <= 3.8 * atr_pct or (floor_pct is not None and prior_pct <= floor_pct)
+    )
+    window = min(120, len(highs))
+    low_120 = min(lows[-window:]) if window else None
+    high_120 = max(highs[-window:]) if window else None
+    if low_120 is None or high_120 is None or high_120 == low_120 or window < 30:
+        position = None
+    else:
+        position = (close - low_120) / (high_120 - low_120)
+    avg10_prev = mean(volumes[-11:-1]) if len(volumes) >= 11 else 0.0
+    shrink_then_expand = (
+        bool(avg5 and avg10_prev)
+        and avg5 < avg10_prev * 0.85
+        and len(volumes) >= 2
+        and volumes[-1] > volumes[-2] * 1.15
+    )
+    touched_ma20 = ma20 is not None and last["h"] >= ma20
 
     def pack(
         strategy_id: str,
         name: str,
-        checks: list[tuple[str, bool]],
+        core: list[tuple[str, bool]],
+        optional: list[tuple[str, bool]],
+        need: int,
         exit_rule: str,
         exit_now: str = "",
     ) -> dict:
-        missed = [label for label, ok in checks if not ok]
-        return {
+        core_miss = [label for label, ok in core if not ok]
+        opt_hits = sum(1 for _, ok in optional if ok)
+        missed = list(core_miss)
+        if opt_hits < need:
+            missed.extend(label for label, ok in optional if not ok)
+        result = {
             "id": strategy_id,
             "name": name,
             "ready": not missed,
@@ -176,60 +440,289 @@ def _alpha_strategies(bars: list[dict], rsi: float | None, stop_candle: str | No
             "exit": exit_rule,
             "exit_now": exit_now,
         }
+        if with_conditions:
+            result["need"] = need
+            result["opt_hits"] = opt_hits
+            result["core"] = [{"label": label, "ok": bool(ok)} for label, ok in core]
+            result["optional"] = [{"label": label, "ok": bool(ok)} for label, ok in optional]
+        return result
+
+    trend_rule, reversion_rule, breakout_rule, oversold_rule = ALPHA_RULE_CATALOG
+
+    def checks(rule: dict, core_ok: list[bool], optional_ok: list[bool]):
+        """Catalog labels paired with this bar's live checks, in catalog order."""
+        return (
+            list(zip(rule["core"], core_ok)),
+            list(zip(rule["optional"], optional_ok)),
+            rule["need"],
+            " ".join(rule["exit_steps"]),
+        )
 
     return [
         pack(
-            "ma_crossover_v1",
-            "均线交叉",
-            [
-                ("MA5 不低于 MA10", ma_stack),
-                ("收盘在 MA20 上", above_ma20),
-                ("5 日量比不低于 1.2", vol_ratio_5 >= 1.2),
-                ("RSI 低于 70", rsi is not None and rsi < 70),
-                ("没有止损K线", stop_candle is None),
-            ],
-            "买入价下跌 4% 止损，盈利达到 3 倍风险止盈。持有满 2 日后收盘跌破 20 日线也卖，持有满 15 天卖出",
+            trend_rule["id"],
+            trend_rule["name"],
+            *checks(
+                trend_rule,
+                [ma_near, momentum_ok, above_band],
+                [
+                    vol_ratio_5 >= 1.2,
+                    rsi14 is not None and 50 < rsi14 < 72,
+                    ma20_prev is not None and ma20 is not None and ma20 > ma20_prev,
+                ],
+            ),
         ),
         pack(
-            "rsi_reversion_v1",
-            "RSI超卖",
-            [
-                ("RSI 低于 30", rsi is not None and rsi < 30),
-                ("收盘离 MA20 不超过 6%", dist_ma20 <= 0.06),
-                ("5 日量比高于 1.3", vol_ratio_5 > 1.3),
-                ("出现止损K线", stop_candle is not None),
-                ("收盘在 MA10 下", below_ma10),
-            ],
-            "买入价下跌 5% 止损，盈利达到 2 倍风险止盈，持有满 10 天卖出",
+            reversion_rule["id"],
+            reversion_rule["name"],
+            *checks(
+                reversion_rule,
+                [
+                    below_ma10,
+                    (rsi6 is not None and rsi6 < 25) or (rsi14 is not None and rsi14 < 35),
+                    pattern is not None,
+                ],
+                [
+                    vol_ratio_5 > 1.3,
+                    atr_dist is not None and -3 <= atr_dist <= -1,
+                ],
+            ),
+            "当天最高已触及 MA20" if touched_ma20 else "",
         ),
         pack(
-            "volatility_compression_breakout_v1",
-            "收缩突破",
-            [
-                ("收盘突破前 20 日高点", breakout),
-                ("20 日量比不低于 1.2", vol_ratio_20 >= 1.2),
-                ("实体占振幅至少 45%", body_ratio >= 0.45),
-                ("收盘在 MA20 上", above_ma20),
-                ("MA20 向上", slope > 0),
-                ("处在近 120 日区间上沿", position >= 0.65),
-                ("布林带宽不超过 14%", width is not None and width <= 0.14),
-            ],
-            "收盘跌破 MA20 卖出；买入价下跌 5% 也止损。浮盈达到 8% 后，从最高价回撤 4% 止盈。持有满 20 天卖出",
+            breakout_rule["id"],
+            breakout_rule["name"],
+            *checks(
+                breakout_rule,
+                [breakout, squeezed],
+                [
+                    vol_ratio_20 >= 1.2,
+                    yang_body >= 0.45,
+                    ma20 is not None and ma20_5ago is not None and ma20 > ma20_5ago,
+                    position is not None and position >= 0.65,
+                ],
+            ),
             "当天收盘在 MA20 下" if not above_ma20 else "",
         ),
         pack(
-            "mean_reversion_oversold_v1",
-            "超跌反弹",
-            [
-                ("RSI 低于 30", rsi is not None and rsi < 30),
-                ("收盘高于 MA20 至少 8%", deviation > 0.08),
-                ("出现止损K线", stop_candle is not None),
-                ("缩量后再放量", shrink_rise),
-            ],
-            "从买入后的最高价回撤 3% 止损，最高价触及 MA20 止盈，持有满 8 天卖出",
+            oversold_rule["id"],
+            oversold_rule["name"],
+            *checks(
+                oversold_rule,
+                [
+                    atr_dist is not None and atr_dist <= -2.5,
+                    (rsi14 is not None and rsi14 < 30) or (rsi6 is not None and rsi6 < 20),
+                ],
+                [pattern is not None, shrink_then_expand],
+            ),
             "当天最高已触及 MA20" if touched_ma20 else "",
         ),
     ]
+
+
+def _bearish_pattern(bars: list[dict]) -> str | None:
+    """Shooting star or bearish engulfing: `_bullish_pattern` turned upside down."""
+    if len(bars) < 2:
+        return None
+    row = bars[-1]
+    opened = float(row.get("o", row["c"]))
+    close = float(row["c"])
+    high = float(row["h"])
+    low = float(row["l"])
+    span = high - low
+    if span <= 1e-6:
+        return None
+    body = abs(close - opened)
+    lower_shadow = min(opened, close) - low
+    upper_shadow = high - max(opened, close)
+    # The high has to sit at or above the five-day average, so a long upper shadow
+    # after a slide is not read as a top.
+    if len(bars) >= 5 and high < mean(float(b["c"]) for b in bars[-5:]) * 0.99:
+        return None
+    effective_body = max(body, span * 0.08)
+    if upper_shadow >= 2.0 * effective_body and lower_shadow <= 0.15 * span and (high - close) / span >= 0.55:
+        return "流星线"
+    prev = bars[-2]
+    prev_open = float(prev.get("o", prev["c"]))
+    prev_close = float(prev["c"])
+    prev_span = float(prev["h"]) - float(prev["l"])
+    prev_body = abs(prev_close - prev_open)
+    prev_yang = prev_close > prev_open and prev_span > 1e-6 and prev_body / prev_span >= 0.20
+    if prev_yang and close < opened and opened >= prev_close and close <= prev_open and body >= prev_body:
+        return "看跌吞没"
+    return None
+
+
+# Four sell rules, each the mirror image of one buy rule with the same numbers. They
+# look only at the bars, so they read the same whether or not anything is held. The
+# backtest engine closes a position on the day one of them turns ready.
+SELL_RULE_CATALOG: tuple[dict, ...] = (
+    {
+        "id": "breakdown_sell_v1",
+        "name": "收缩跌破",
+        "core": (
+            "收盘跌破前 20 日低点",
+            "前 3 日有一天带宽不超过 3.8 倍 ATR%，或处于近 120 日最低两成",
+        ),
+        "optional": (
+            "20 日量比不低于 1.2",
+            "阴线实体占振幅至少 45%",
+            "MA20 比 5 日前低",
+            "处在近 120 日高低区间的 35% 以下",
+        ),
+        "need": 3,
+    },
+    {
+        "id": "ma_crossunder_sell_v1",
+        "name": "均线死叉",
+        "core": (
+            "MA5 不高于 MA10，允许差 0.08 倍 ATR",
+            "近 5 日跌幅在 1.2 到 3.5 倍当日 ATR% 之间",
+            "收盘在 MA20 下，但不超过 2.5 倍 ATR",
+        ),
+        "optional": (
+            "5 日量比不低于 1.2",
+            "RSI 在 28 和 50 之间",
+            "MA20 比昨天低",
+        ),
+        "need": 2,
+    },
+    {
+        "id": "rsi_overbought_sell_v1",
+        "name": "RSI超买",
+        "core": (
+            "收盘在 MA10 上",
+            "RSI(6) 高于 75，或 RSI(14) 高于 65",
+            "出现流星线或看跌吞没",
+        ),
+        "optional": (
+            "5 日量比高于 1.3",
+            "收盘比 MA20 高 1 到 3 倍 ATR",
+        ),
+        "need": 1,
+    },
+    {
+        "id": "overextended_sell_v1",
+        "name": "超涨回落",
+        "core": (
+            "收盘比 MA20 高至少 2.5 倍 ATR",
+            "RSI(14) 高于 70，或 RSI(6) 高于 80",
+        ),
+        "optional": (
+            "出现流星线或看跌吞没",
+            "前 5 日均量低于前 10 日的 85%，当天量比昨天多 15%",
+        ),
+        "need": 1,
+    },
+)
+
+
+def _sell_strategies(bars: list[dict]) -> list[dict]:
+    """Four sell rules judged on the bars alone. Core checks must all pass and at least
+    `need` optional checks."""
+    closes = [bar["c"] for bar in bars]
+    highs = [bar["h"] for bar in bars]
+    lows = [bar["l"] for bar in bars]
+    volumes = [bar["v"] for bar in bars]
+    last = bars[-1]
+    opened = last.get("o", last["c"])
+    close = last["c"]
+    ma5 = mean(closes[-5:]) if len(closes) >= 5 else None
+    ma10 = mean(closes[-10:]) if len(closes) >= 10 else None
+    ma20 = mean(closes[-20:]) if len(closes) >= 20 else None
+    ma20_prev = mean(closes[-21:-1]) if len(closes) >= 21 else None
+    ma20_5ago = mean(closes[-25:-5]) if len(closes) >= 25 else None
+    atrs = wilder_atr(bars)
+    atr = atrs[-1] if atrs else None
+    atr_pct = (atr / close * 100) if atr and close else None
+    atr_dist = ((close - ma20) / atr) if atr and ma20 is not None else None
+    avg5 = mean(volumes[-6:-1]) if len(volumes) >= 6 else 0.0
+    vol_ratio_5 = (volumes[-1] / avg5) if avg5 else 0.0
+    avg20 = mean(volumes[-21:-1]) if len(volumes) >= 21 else 0.0
+    vol_ratio_20 = (volumes[-1] / avg20) if avg20 else 0.0
+    prior_low = min(lows[-21:-1]) if len(lows) >= 21 else None
+    span = last["h"] - last["l"]
+    yin_body = ((opened - close) / span) if span else 0.0
+    fall_5 = ((1 - closes[-1] / closes[-6]) * 100) if len(closes) >= 6 and closes[-6] else None
+    rsi14 = _rsi(closes, 14)
+    rsi6 = _rsi(closes, 6)
+    pattern = _bearish_pattern(bars)
+    widths = _bandwidths(closes)
+    prior_widths = [value for value in widths[-4:-1] if value is not None]
+    prior_pct = min(prior_widths) * 100 if prior_widths else None
+    width_floor = _percentile([value for value in widths[-120:] if value is not None], 0.20)
+    floor_pct = width_floor * 100 if width_floor is not None else None
+    squeezed = prior_pct is not None and atr_pct is not None and (
+        prior_pct <= 3.8 * atr_pct or (floor_pct is not None and prior_pct <= floor_pct)
+    )
+    window = min(120, len(highs))
+    low_120 = min(lows[-window:]) if window else None
+    high_120 = max(highs[-window:]) if window else None
+    if low_120 is None or high_120 is None or high_120 == low_120 or window < 30:
+        position = None
+    else:
+        position = (close - low_120) / (high_120 - low_120)
+    avg10_prev = mean(volumes[-11:-1]) if len(volumes) >= 11 else 0.0
+    shrink_then_expand = (
+        bool(avg5 and avg10_prev)
+        and avg5 < avg10_prev * 0.85
+        and len(volumes) >= 2
+        and volumes[-1] > volumes[-2] * 1.15
+    )
+    live = {
+        "breakdown_sell_v1": (
+            [prior_low is not None and close < prior_low, squeezed],
+            [
+                vol_ratio_20 >= 1.2,
+                yin_body >= 0.45,
+                ma20 is not None and ma20_5ago is not None and ma20 < ma20_5ago,
+                position is not None and position <= 0.35,
+            ],
+        ),
+        "ma_crossunder_sell_v1": (
+            [
+                ma5 is not None and ma10 is not None and atr is not None and ma5 <= ma10 + 0.08 * atr,
+                atr_pct is not None and fall_5 is not None and 1.2 * atr_pct <= fall_5 <= 3.5 * atr_pct,
+                atr_dist is not None and -2.5 <= atr_dist < 0,
+            ],
+            [
+                vol_ratio_5 >= 1.2,
+                rsi14 is not None and 28 < rsi14 < 50,
+                ma20 is not None and ma20_prev is not None and ma20 < ma20_prev,
+            ],
+        ),
+        "rsi_overbought_sell_v1": (
+            [
+                ma10 is not None and close > ma10,
+                (rsi6 is not None and rsi6 > 75) or (rsi14 is not None and rsi14 > 65),
+                pattern is not None,
+            ],
+            [vol_ratio_5 > 1.3, atr_dist is not None and 1 <= atr_dist <= 3],
+        ),
+        "overextended_sell_v1": (
+            [
+                atr_dist is not None and atr_dist >= 2.5,
+                (rsi14 is not None and rsi14 > 70) or (rsi6 is not None and rsi6 > 80),
+            ],
+            [pattern is not None, shrink_then_expand],
+        ),
+    }
+    packs = []
+    for rule in SELL_RULE_CATALOG:
+        core_ok, optional_ok = live[rule["id"]]
+        opt_hits = sum(1 for ok in optional_ok if ok)
+        packs.append(
+            {
+                "id": rule["id"],
+                "name": rule["name"],
+                "ready": all(core_ok) and opt_hits >= rule["need"],
+                "need": rule["need"],
+                "opt_hits": opt_hits,
+                "core": [{"label": label, "ok": bool(ok)} for label, ok in zip(rule["core"], core_ok)],
+                "optional": [{"label": label, "ok": bool(ok)} for label, ok in zip(rule["optional"], optional_ok)],
+            }
+        )
+    return packs
 
 
 def _dollar_chip(day_ret: float | None, dollar: float | None, avg_dollar: float | None) -> str | None:
@@ -280,7 +773,9 @@ def _macd_last(closes: list[float]) -> tuple[float | None, float | None, float |
     return dif, dea, 2 * (dif - dea)
 
 
-def _measure(bars: list[dict], live: float | None) -> dict | None:
+def _measure(
+    bars: list[dict], live: float | None, symbol: str | None = None, with_conditions: bool = False
+) -> dict | None:
     if len(bars) < 21:
         return None
     closes = [bar["c"] for bar in bars]
@@ -378,7 +873,9 @@ def _measure(bars: list[dict], live: float | None) -> dict | None:
         "signal": signal,
         "rsi": rsi,
         "stop_candle": stop_candle,
-        "strategies": _alpha_strategies(bars, rsi, stop_candle),
+        "strategies": _alpha_strategies(
+            bars, rsi, stop_candle, is_etf(symbol or ""), with_conditions=with_conditions
+        ),
         "flow": _flow(rets, amounts),
         "day_ret": rets[-1] if rets else None,
         "oct_low": low_bar["l"] if low_bar else None,
@@ -861,6 +1358,7 @@ def _metrics(stats: dict | None, row: dict, pe: float | None, us10y: float | Non
         "rp_weight": None,
         "pe": None,
         "erp": None,
+        "signals": [],
     }
     if not stats:
         return empty
@@ -886,6 +1384,18 @@ def _metrics(stats: dict | None, row: dict, pe: float | None, us10y: float | Non
         "rp_weight": None if row.get("rp_weight") is None else round(row["rp_weight"] * 100, 1),
         "pe": None if pe is None else round(pe, 2),
         "erp": None if erp is None else round(erp, 2),
+        # Only the rules whose hard checks all pass and whose optional gate is met.
+        "signals": [
+            {
+                "id": pack["id"],
+                "name": pack["name"],
+                "detail": pack.get("detail") or "",
+                "exit": pack.get("exit") or "",
+                "exit_now": pack.get("exit_now") or "",
+            }
+            for pack in (stats.get("strategies") or [])
+            if pack.get("ready")
+        ],
     }
 
 
@@ -961,13 +1471,34 @@ def build_holdings_advice(db: Session, portfolio_id: int = 1) -> dict:
             for symbol, bars in zip(symbols, pool.map(_load_bars, symbols)):
                 bars_by_symbol[symbol] = bars
 
+    # Rules read the bar series, not the `live` scalar, so today's session bar has to be
+    # in the series for an intraday trigger to show up. Fetch US prints in ONE batched
+    # call — a per-symbol fetch here means N network round-trips on every advice poll.
+    from app.services.bars import append_open_bar, bar_key, chart_session_bar, open_session_bars
+    from app.services.ledger import us_equity_session_date
+    from app.services.market_scope import market_of
+
+    session = us_equity_session_date().isoformat()
+    us_pending = [
+        symbol
+        for symbol in symbols
+        if market_of(symbol) == "us"
+        and (not bars_by_symbol.get(symbol) or bars_by_symbol[symbol][-1]["d"] < session)
+    ]
+    session_bars = open_session_bars(sorted(set(us_pending)), when_closed=True) if us_pending else {}
+
     prepared = []
     for item in open_rows:
         ticker = item["symbol"].split(":")[-1]
         mv = _f(item.get("market_value")) or 0.0
         stop = stops.get(item["symbol"])
         live = _f(item.get("last_price"))
-        stats = _measure(bars_by_symbol.get(item["symbol"]) or [], live)
+        series = bars_by_symbol.get(item["symbol"]) or []
+        if market_of(item["symbol"]) == "us":
+            series = append_open_bar(series, session_bars.get(bar_key(item["symbol"])))
+        else:
+            series = append_open_bar(series, chart_session_bar(item["symbol"], series))
+        stats = _measure(series, live, item["symbol"])
         vol = stats["vol"] if stats else None
         prepared.append(
             {
@@ -1625,9 +2156,29 @@ def build_indicator_history(symbol: str, before: str | None = None, limit: int =
     page = eligible[-limit:]
     points = []
     for index in page:
-        stats = _measure(bars[: index + 1], None)
+        stats = _measure(bars[: index + 1], None, symbol, with_conditions=True)
         if stats:
             points.append(_history_point(stats))
+    # Imported here because ak_backtest imports this module.
+    from app.services.ak_backtest import advice_marks
+
+    advice = advice_marks(symbol, bars, since)
+    day_index = {str(bar["d"])[:10]: index for index, bar in enumerate(bars)}
+
+    def sells_at(index: int) -> list[dict]:
+        return _sell_strategies(bars[max(0, index - 139) : index + 1]) if index >= 24 else []
+
+    for point in points:
+        index = day_index.get(point["date"])
+        sells = sells_at(index) if index is not None else []
+        before_ready = {pack["id"] for pack in sells_at(index - 1) if pack["ready"]} if index else set()
+        # A sell rule is marked on the day it turns ready. The day before is read from the
+        # stored bars, so the mark is the same on every page.
+        fresh = [pack["name"] for pack in sells if pack["ready"] and pack["id"] not in before_ready]
+        point["sells"] = sells
+        point["advice"] = list(advice.get(point["date"], []))
+        if fresh:
+            point["advice"].append({"side": "S", "kind": "rule", "rule": "、".join(fresh), "reason": "卖出规则成立"})
     ticker = symbol.split(":")[-1]
     recent = points[-30:]
     return {
