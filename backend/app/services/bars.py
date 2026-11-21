@@ -49,10 +49,7 @@ def chart_since(today: date | None = None) -> date:
 
 
 def frozen_through(now: datetime | None = None) -> date:
-    session = us_equity_session_date(now)
-    if cash_session_closed(now):
-        return session
-    return previous_us_session_date(session)
+    return _completed_session("us", "America/New_York", now)
 
 
 def _local_now(tz_name: str, now: datetime | None) -> datetime:
@@ -121,12 +118,21 @@ def session_closed(symbol: str, now: datetime | None = None) -> bool:
 
 def cn_frozen(now: datetime | None = None) -> date:
     """Last completed Shanghai/Shenzhen cash session. Lunch does not freeze the bar."""
-    return _local_frozen("Asia/Shanghai", 9 * 60 + 30, 15 * 60, now)
+    return _completed_session("cn", "Asia/Shanghai", now)
 
 
 def hk_frozen(now: datetime | None = None) -> date:
     """Last completed Hong Kong cash session."""
-    return _local_frozen("Asia/Shanghai", 9 * 60 + 30, 16 * 60, now)
+    return _completed_session("hk", "Asia/Hong_Kong", now)
+
+
+def _completed_session(market: str, zone: str, now: datetime | None) -> date:
+    from app.services.trading_sessions import completed_session
+
+    through = completed_session(market, _local_now(zone, now))
+    if through is None:
+        raise ValueError(f"无法确认 {market} 市场的已收盘交易日，暂不冻结日线")
+    return through
 
 
 def _num(value: float | None, digits: str = "0.000001") -> Decimal | None:
@@ -187,11 +193,17 @@ def _save_frozen(db: Session, symbol: str, bars: list[dict], frozen: date) -> No
         )
     if not fresh:
         return
-    from sqlalchemy.dialects.mysql import insert as mysql_insert
+    if db.get_bind().dialect.name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-    # Another request can insert the same symbol and date between the read and
-    # this write. IGNORE keeps the row already stored and writes the rest.
-    stmt = mysql_insert(DailyBar).prefix_with("IGNORE").values(
+        stmt = sqlite_insert(DailyBar).on_conflict_do_nothing(index_elements=["symbol", "bar_date"])
+    else:
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+        # Another request can insert the same symbol and date between the read and
+        # this write. IGNORE keeps the row already stored and writes the rest.
+        stmt = mysql_insert(DailyBar).prefix_with("IGNORE")
+    stmt = stmt.values(
         [
             {
                 "symbol": row.symbol,
@@ -281,13 +293,14 @@ def load_sina_bars(db: Session, symbol: str) -> list[dict]:
     return load_bars(db, key, fetch)
 
 
-def load_symbol_bars(db: Session, symbol: str) -> list[dict]:
+def load_symbol_bars(db: Session, symbol: str, *, frozen: date | None = None) -> list[dict]:
     """US bars from YFinance. A-share and Hong Kong bars from AkShare, then the fallbacks."""
     from app.services.data_sources import fetch_daily_bars
     from app.services.market_scope import market_of
 
     kind = market_of(symbol)
-    frozen = cn_frozen() if kind == "cn" else hk_frozen() if kind == "hk" else None
+    if frozen is None:
+        frozen = cn_frozen() if kind == "cn" else hk_frozen() if kind == "hk" else None
     return load_bars(db, symbol, lambda: fetch_daily_bars(symbol), frozen=frozen)
 
 
@@ -297,7 +310,7 @@ def _quote_code(symbol: str) -> str:
 
 
 def open_session_bars(symbols: list[str], *, when_closed: bool = False) -> dict[str, dict]:
-    """Today's US bar from the live quote. YFinance first, Sina if that quote is empty. Not stored.
+    """Today's US bar from the live quote. Sina and Tencent first. Not stored.
 
     Closed sessions return nothing unless the caller still needs a bar the daily series missed.
     """
@@ -384,6 +397,29 @@ def open_session_bars(symbols: list[str], *, when_closed: bool = False) -> dict[
     return found
 
 
+def cn_session_bars(symbols: list[str]) -> dict[str, dict]:
+    """Today's A-share bars from one Tencent quote request. Not stored."""
+    from app.services.market import _TENCENT_QUOTE_URL, _request_text
+    from app.services.symbols import quote_code
+
+    local = _local_now("Asia/Shanghai", None)
+    session = _local_session(local, 9 * 60 + 30)
+    codes = {quote_code(symbol): symbol for symbol in symbols}
+    codes = {code: symbol for code, symbol in codes.items() if code}
+    if not codes:
+        return {}
+    try:
+        text = _request_text(_TENCENT_QUOTE_URL.format(symbols=",".join(codes)))
+    except Exception:
+        return {}
+    found: dict[str, dict] = {}
+    for code, symbol in codes.items():
+        bar = _cn_bar_from_quote(text, code, session)
+        if bar:
+            found[bar_key(symbol)] = bar
+    return found
+
+
 def chart_session_bar(symbol: str, bars: list[dict]) -> dict | None:
     """Today's bar for the indicator chart when the stored series stops before that session. Not stored."""
     from app.services.market_scope import market_of
@@ -401,7 +437,7 @@ def chart_session_bar(symbol: str, bars: list[dict]) -> dict | None:
 
 def _cn_chart_bar(symbol: str, bars: list[dict]) -> dict | None:
     """A-share print for the current Shanghai session, including lunch. Not stored."""
-    from app.services.market import _TENCENT_QUOTE_URL, _parse_as_of, _request_text
+    from app.services.market import _TENCENT_QUOTE_URL, _request_text
     from app.services.symbols import quote_code
 
     local = _local_now("Asia/Shanghai", None)
@@ -415,6 +451,12 @@ def _cn_chart_bar(symbol: str, bars: list[dict]) -> dict | None:
         text = _request_text(_TENCENT_QUOTE_URL.format(symbols=code))
     except Exception:
         return None
+    return _cn_bar_from_quote(text, code, session)
+
+
+def _cn_bar_from_quote(text: str, code: str, session: date) -> dict | None:
+    from app.services.market import _parse_as_of
+
     match = re.search(rf'v_{re.escape(code)}="([^"]*)"', text, flags=re.IGNORECASE)
     if not match:
         return None

@@ -13,8 +13,11 @@ import pandas as pd
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.models.entities import BreadthDay, SymbolMeta, Trade
+from app.models.entities import BreadthDay, SymbolMeta
+from app.services.market_bars import data_version
 from app.services.market_scope import market_of
+from app.services.position_scope import position_symbols
+from app.services.price_history import load_history_bars, uses_market_store
 from app.services.signals import (
     ALPHA_RULE_CATALOG,
     _alpha_strategies,
@@ -25,7 +28,6 @@ from app.services.signals import (
     is_etf,
     wilder_atr,
 )
-from app.services.watchlist import watch_symbols
 
 logger = logging.getLogger(__name__)
 logging.getLogger("akquant").setLevel(logging.WARNING)
@@ -36,7 +38,6 @@ _cache: dict[str, tuple[float, dict]] = {}
 CASH = 30_000.0
 # The A-share book is in yuan and trades in lots of 100, so it needs a larger total.
 _MARKET_CASH = {"cn": 300_000.0}
-# When the run is filled from the watchlist there are no sleeves: every name shares this much.
 _EVEN_SHARE = 0.8
 
 # After any full exit, wait five sessions before the next buy on that name.
@@ -503,31 +504,8 @@ def advice_marks(symbol: str, bars: list[dict], since: str) -> dict[str, list[di
     return _advice_cache[key]
 
 
-def _symbols(db: Session, market: str) -> tuple[list[str], bool]:
-    """Names to run, and whether the watchlist had to fill in for too few holdings."""
-    portfolio_id = get_settings().default_portfolio_id
-    qty: dict[str, float] = defaultdict(float)
-    rows = (
-        db.query(Trade.symbol, Trade.side, Trade.qty)
-        .filter(Trade.portfolio_id == portfolio_id, Trade.symbol.isnot(None))
-        .all()
-    )
-    for symbol, side, amount in rows:
-        key = str(symbol).upper()
-        if market_of(key) != market:
-            continue
-        if side == "Buy":
-            qty[key] += float(amount or 0)
-        elif side == "Sell":
-            qty[key] -= float(amount or 0)
-    # Every held name runs. With fewer than four held, the whole watchlist joins them.
-    chosen = [symbol for symbol, amount in qty.items() if amount > 1e-8]
-    filled = len(chosen) < 4
-    if filled:
-        for symbol in watch_symbols(market):
-            if symbol not in chosen:
-                chosen.append(symbol)
-    return chosen, filled
+def _symbols(db: Session, market: str) -> list[str]:
+    return position_symbols(db, get_settings().default_portfolio_id, market)
 
 
 def _frame(symbol: str, bars: list[dict]) -> pd.DataFrame:
@@ -563,6 +541,14 @@ def _in_window(frame: pd.DataFrame, start: date | None, end: date | None) -> pd.
     return frame.loc[mask]
 
 
+def _uses_market_store(symbol: str) -> bool:
+    return uses_market_store(symbol)
+
+
+def _backtest_bars(db: Session, symbol: str, *, end: date | None = None) -> list[dict]:
+    return load_history_bars(db, symbol, end=end)
+
+
 def backtest_candles(
     db: Session,
     symbol: str,
@@ -572,12 +558,10 @@ def backtest_candles(
     pad_after: int = 10,
 ) -> dict:
     """Daily bars around one backtest cycle, padded so the B/S marks have context."""
-    from app.services.bars import load_symbol_bars
-
     key = str(symbol or "").strip().upper()
     meta = db.query(SymbolMeta).filter(SymbolMeta.symbol == key).first()
     payload = {"symbol": key, "name": meta.name if meta else None, "candles": []}
-    bars = load_symbol_bars(db, key)
+    bars = _backtest_bars(db, key)
     rows = [bar for bar in bars if bar.get("c")]
     dates = [str(bar["d"])[:10] for bar in rows]
     lo = bisect.bisect_left(dates, start.isoformat()) if start else 0
@@ -698,6 +682,7 @@ def _stakes(sleeves: list[str], total: float = CASH) -> list[float]:
 
 
 def _one(
+    db: Session,
     symbol: str,
     name: str | None,
     market: str,
@@ -707,9 +692,6 @@ def _one(
     mood: dict | None = None,
     risk_base: float | None = None,
 ) -> dict:
-    from app.core.database import SessionLocal
-    from app.services.bars import load_symbol_bars
-
     item = {
         "symbol": symbol,
         "name": name,
@@ -729,18 +711,18 @@ def _one(
         "closes": {},
         "cycles": [],
     }
-    db = SessionLocal()
     try:
-        bars = load_symbol_bars(db, symbol)
+        bars = _backtest_bars(db, symbol, end=end)
+    except ValueError as exc:
+        item["error"] = str(exc)
+        return item
     except Exception as exc:
         logger.warning("回测日线失败 %s: %s", symbol, exc)
         item["error"] = "日线没有取到"
         return item
-    finally:
-        db.close()
     frame = _frame(symbol, bars)
     if frame.empty or "date" not in frame.columns:
-        item["error"] = "日线不足，没有重跑"
+        item["error"] = "全市场数据库中没有该标的日线，请先回填数据" if _uses_market_store(symbol) else "日线不足，没有重跑"
         return item
     window = _in_window(frame, start, end)
     item["bars"] = len(window)
@@ -1173,14 +1155,15 @@ def run_book_backtest(
     from app.services.review import SLEEVE_LABEL, SLEEVE_PCT, sleeve_choices, sleeve_of
 
     now = time.time()
-    symbols, filled = _symbols(db, market)
+    symbols = _symbols(db, market)
+    even_split = len(symbols) < 4
     chosen = sleeve_choices(db, get_settings().default_portfolio_id)
-    # 用观察名单补足时不分核心卫星，全部标的平分 80%。
-    sleeves = ["even"] * len(symbols) if filled else [sleeve_of(symbol, chosen) for symbol in symbols]
+    sleeves = ["even"] * len(symbols) if even_split else [sleeve_of(symbol, chosen) for symbol in symbols]
     total = _MARKET_CASH.get(market, CASH)
     key = (
         f"{market}|{total}|{start.isoformat() if start else ''}|{end.isoformat() if end else ''}"
         f"|{','.join(f'{symbol}={sleeve}' for symbol, sleeve in zip(symbols, sleeves))}"
+        f"|{data_version(db, market, [symbol for symbol in symbols if _uses_market_store(symbol)])}"
     )
     cached = _cache.get(key)
     if cached and now - cached[0] < _CACHE_SECONDS:
@@ -1194,23 +1177,23 @@ def run_book_backtest(
         if market == "cn"
         else f"佣金 0.05%，每笔成交滑点 {_US_SLIPPAGE * 100:.2f}%，没有印花税，可以当日买卖"
     )
-    mood = _mood(db, market, start, end)
-    if filled:
+    mood = _mood(db, market, start, end) if symbols else {}
+    if even_split:
         each = int(total * _EVEN_SHARE * 100) // max(len(symbols), 1) / 100
         stakes = [each] * len(symbols)
     else:
         stakes = _stakes(sleeves, total)
     items = []
     for symbol, sleeve, stake in zip(symbols, sleeves, stakes):
-        item = _one(symbol, names.get(symbol), market, start, end, stake, mood, risk_base=total)
-        item["sleeve"] = "平分" if filled else SLEEVE_LABEL[sleeve]
+        item = _one(db, symbol, names.get(symbol), market, start, end, stake, mood, risk_base=total)
+        item["sleeve"] = "平分" if even_split else SLEEVE_LABEL[sleeve]
         items.append(item)
     # 不分给任何标的的那部分（至少 20%）全程是现金，不赚不亏。
     idle = round(total - sum(stakes), 2)
     counts = {name: sleeves.count(name) for name in SLEEVE_PCT}
-    if filled:
+    if even_split:
         split = (
-            f"持仓不足 4 只，加上观察名单共 {len(symbols)} 只，不分核心卫星，"
+            f"持仓与清仓共 {len(symbols)} 只，不足 4 只时不分核心卫星，"
             f"平分 {_EVEN_SHARE * 100:.0f}%，每只 {stakes[0]:,.0f}" if symbols else "没有可跑的标的"
         )
     else:
@@ -1241,13 +1224,11 @@ def run_book_backtest(
     closes = [item.pop("closes") for item in items]
     cycles = [cycle for item in items for cycle in item.pop("cycles")]
     index_closes: dict[str, float] = {}
-    if market == "us":
+    if market == "us" and symbols:
         try:
-            from app.services.bars import load_symbol_bars
-
             index_closes = {
                 str(bar["d"])[:10]: float(bar["c"])
-                for bar in load_symbol_bars(db, _US_INDEX)
+                for bar in _backtest_bars(db, _US_INDEX)
                 if bar.get("c")
                 and (start is None or str(bar["d"])[:10] >= start.isoformat())
                 and (end is None or str(bar["d"])[:10] <= end.isoformat())
@@ -1311,7 +1292,7 @@ def run_book_backtest(
         "start": start,
         "end": end,
         "note": (
-            f"{span}。总资金 {total:,.0f}。{split}；剩下 {idle:,.0f} 留作现金不动"
+            f"{span}。仅回测持仓与已清仓标的，不加入观察名单。普通股票日线直接读取全市场数据库，ETF 沿用原日线数据源。总资金 {total:,.0f}。{split}；剩下 {idle:,.0f} 留作现金不动"
             + (f"，{len(items) - len(ran)} 只没有跑成，那部分本金按没动计算" if items and len(ran) < len(items) else "")
             + "。硬条件必须全中，辅助条件按各自门槛。同日共振按「收缩突破 > 均线交叉 > RSI超卖 > 超跌反弹」取主导规则。收盘满足信号，当天按收盘价买入或卖出。1R 是该规则的 ATR 止损距离，止损锚定首笔入场价。均线交叉和收缩突破分三批买，收盘高于均价且比上一批再高 0.25 倍 ATR 就加一批；另外两套一次买入，股数按「打到止损时亏损不超过总本金 1%」封顶。吊灯止盈与反转触及 MA20 全天候生效；只有趋势规则做 +1.5R / +2.5R 各减 1/3，尾仓交给 ATR 吊灯。时间止损 15/20 日（浮盈达 1.5 倍 ATR 豁免）与 10/8 日无条件。清仓后暂停 5 个交易日。这列数字不进累计盈亏。"
         ),

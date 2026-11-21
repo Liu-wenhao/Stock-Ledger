@@ -18,10 +18,51 @@ import { fetchTradingStrategy, fetchStrategyEngine, fetchBacktest, fetchBacktest
 import { useTheme } from '@/composables/useTheme'
 import { formatMoney, formatPct, formatQty, pnlClass, tickerOf } from '@/utils/format'
 
+const props = defineProps({
+  section: { type: String, default: 'strategy' },
+  embedded: Boolean,
+  reviewRange: { type: Array, default: null },
+})
+const planningMode = computed(() => props.section === 'strategy')
+const sectionHeading = computed(() => ({
+  strategy: {
+    title: '交易策略',
+    description: '把复盘里的发现，转化成每次下单前都能执行的规则。',
+  },
+  positions: {
+    title: '持仓处理',
+    description: '复核当前持仓的信号、风险与止损动作，执行仍需人工确认。',
+  },
+  reentry: {
+    title: '清仓再买入',
+    description: '复核已清仓标的的冷却期与再入场条件，不自动买入。',
+  },
+  backtest: {
+    title: '历史回测',
+    description: '用持仓与已清仓标的的历史日线验证规则，不计入账本盈亏。',
+  },
+}[props.section] || {}))
+
 const data = ref(null)
 const loading = ref(true)
 const error = ref('')
-const range = ref([dayjs().subtract(1, 'month'), dayjs()])
+const localRange = ref([dayjs().subtract(1, 'month'), dayjs()])
+const range = computed({
+  get: () => props.embedded ? props.reviewRange : localRange.value,
+  set: (value) => { localRange.value = value },
+})
+const compactLayout = ref(window.innerWidth <= 560)
+const planningTab = ref('digest')
+const planningTabs = [
+  { key: 'digest', label: '策略汇总' },
+  { key: 'allocation', label: '资金配置' },
+  { key: 'rules', label: '交易纪律' },
+  { key: 'checklist', label: '下单清单' },
+]
+function selectPlanningTab(key) {
+  planningTab.value = key
+  if (!compactLayout.value) nextTick(() => document.getElementById(`strategy-${key}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }))
+}
 const rangePresets = [
   { label: '近1个月', value: [dayjs().subtract(1, 'month'), dayjs()] },
   { label: '近3个月', value: [dayjs().subtract(3, 'month'), dayjs()] },
@@ -31,13 +72,9 @@ const candidateFilter = ref('ready')
 const backtest = ref(null)
 const backtestLoading = ref(false)
 const backtestError = ref('')
-// 回测默认跑近一年，不跟随页面顶部的复盘日期。
-const backtestRange = ref([dayjs().subtract(1, 'year'), dayjs()])
-const backtestPresets = [
-  { label: '近1年', value: [dayjs().subtract(1, 'year'), dayjs()] },
-  { label: '近6个月', value: [dayjs().subtract(6, 'month'), dayjs()] },
-  ...rangePresets,
-]
+const panelBusy = computed(() => loading.value || backtestLoading.value)
+let loadToken = 0
+let backtestToken = 0
 
 const capital = computed(() => data.value?.capital || {})
 const allocation = computed(() => data.value?.allocation || null)
@@ -136,7 +173,7 @@ const digestActions = computed(() => {
       count: exitPositions.value.length,
       title: '触发止损，今天清仓',
       detail: exitPositions.value.map((p) => tickerOf(p.symbol)).join('、'),
-      anchor: '#strategy-positions',
+      anchor: '/review?tab=positions',
       cta: '看持仓动作',
     })
   }
@@ -147,7 +184,7 @@ const digestActions = computed(() => {
       count: timeStopPositions.value.length,
       title: '持有满 40 天，复核逻辑',
       detail: timeStopPositions.value.map((p) => tickerOf(p.symbol)).join('、'),
-      anchor: '#strategy-positions',
+      anchor: '/review?tab=positions',
       cta: '看持仓动作',
     })
   }
@@ -169,7 +206,7 @@ const digestActions = computed(() => {
       count: readyCandidates.value.length,
       title: '冷却已满且技术条件满足',
       detail: `${readyCandidates.value.map((c) => tickerOf(c.symbol)).join('、')} · 写下理由后只做 1/3 试仓`,
-      anchor: '#strategy-reentry',
+      anchor: '/review?tab=reentry',
       cta: '看再买入',
     })
   }
@@ -182,7 +219,7 @@ const digestActions = computed(() => {
       detail: coolingCandidates.value
         .map((c) => `${tickerOf(c.symbol)} 还差 ${c.cooldown_remaining} 日`)
         .join('、'),
-      anchor: '#strategy-reentry',
+      anchor: '/review?tab=reentry',
       cta: '看再买入',
     })
   }
@@ -436,19 +473,21 @@ function sellTradeRoute(position) {
 }
 
 async function load() {
+  const token = ++loadToken
   loading.value = true
   error.value = ''
   try {
     const result = await fetchTradingStrategy(rangeParams())
+    if (token !== loadToken) return
     data.value = result
     digestStamp.value = dayjs().format('YYYY-MM-DD HH:mm')
-    if (candidateFilter.value === 'ready' && !result.reentry_candidates?.some((c) => c.status === 'ready')) {
+    if (candidateFilter.value === 'ready' && !result.reentry_candidates?.some((candidate) => candidate.status === 'ready')) {
       candidateFilter.value = 'all'
     }
-  } catch (e) {
-    error.value = e?.message || '加载失败'
+  } catch (exception) {
+    if (token === loadToken) error.value = exception?.message || '加载失败'
   } finally {
-    loading.value = false
+    if (token === loadToken) loading.value = false
   }
 }
 
@@ -473,22 +512,24 @@ async function changeSleeve(item, sleeve) {
 }
 
 async function runBacktest() {
+  const token = ++backtestToken
   backtestLoading.value = true
   backtestError.value = ''
   try {
-    const [start, end] = backtestRange.value || []
-    const params = {}
-    if (start && end) {
-      params.start = start.format('YYYY-MM-DD')
-      params.end = end.format('YYYY-MM-DD')
-    }
-    backtest.value = await fetchBacktest(params)
-  } catch (e) {
-    backtestError.value = e?.message || '回测没有跑完'
+    const result = await fetchBacktest(rangeParams())
+    if (token === backtestToken) backtest.value = result
+  } catch (exception) {
+    if (token === backtestToken) backtestError.value = exception?.message || '回测没有跑完'
   } finally {
-    backtestLoading.value = false
+    if (token === backtestToken) backtestLoading.value = false
   }
 }
+
+function refreshSection() {
+  return props.section === 'backtest' ? runBacktest() : load()
+}
+
+defineExpose({ refresh: refreshSection, busy: panelBusy })
 
 function signedMoney(value) {
   if (value == null || Number.isNaN(Number(value))) return '—'
@@ -804,6 +845,7 @@ function disposeKlineChart() {
 }
 
 function onKlineResize() {
+  compactLayout.value = window.innerWidth <= 560
   if (klineChart) klineChart.resize()
 }
 
@@ -1413,11 +1455,23 @@ watch(isDark, () => {
   if (klineOpen.value && klineChart) renderKlineChart()
 })
 
+watch(() => props.reviewRange, () => {
+  if (!props.embedded) return
+  backtestToken += 1
+  backtestLoading.value = false
+  backtest.value = null
+  backtestError.value = ''
+  klineOpen.value = false
+  load()
+})
+
 onMounted(() => {
   load()
   window.addEventListener('resize', onKlineResize)
 })
 onUnmounted(() => {
+  loadToken += 1
+  backtestToken += 1
   window.removeEventListener('resize', onKlineResize)
   disposeKlineChart()
 })
@@ -1425,14 +1479,14 @@ onUnmounted(() => {
 
 <template>
   <div class="strategy-page">
-    <header class="page-header">
+    <header v-if="!props.embedded" class="page-header">
       <div>
-        <p class="page-eyebrow">决策系统 / 交易策略</p>
-        <h1>交易策略<span class="title-dot"></span></h1>
-        <p class="page-description">把复盘里的发现，转化成每次下单前都能执行的规则。</p>
+        <p class="page-eyebrow">{{ planningMode ? '决策系统 / 交易策略' : '交易复盘 / ' + sectionHeading.title }}</p>
+        <h1>{{ sectionHeading.title }}<span class="title-dot"></span></h1>
+        <p class="page-description">{{ sectionHeading.description }}</p>
       </div>
       <div class="header-actions">
-        <router-link class="review-link" to="/review">查看复盘 <span>→</span></router-link>
+        <router-link v-if="planningMode" class="review-link" to="/review">查看复盘 <span>→</span></router-link>
         <a-range-picker
           v-model:value="range"
           class="period-range"
@@ -1443,10 +1497,24 @@ onUnmounted(() => {
         />
         <a-button class="refresh-button" :loading="loading" @click="load">
           <template #icon><ReloadOutlined /></template>
-          刷新策略
+          {{ planningMode ? '刷新策略' : '刷新数据' }}
         </a-button>
       </div>
     </header>
+
+    <nav v-if="planningMode" class="strategy-nav" role="tablist" aria-label="策略内容导航">
+      <span class="nav-label">执行手册</span>
+      <button
+        v-for="item in planningTabs"
+        :key="item.key"
+        type="button"
+        role="tab"
+        :class="{ active: planningTab === item.key }"
+        :aria-selected="planningTab === item.key"
+        :aria-controls="`strategy-${item.key}`"
+        @click="selectPlanningTab(item.key)"
+      >{{ item.label }}</button>
+    </nav>
 
     <a-spin :spinning="loading">
       <a-alert v-if="error" type="error" :message="error" show-icon class="err" />
@@ -1455,6 +1523,8 @@ onUnmounted(() => {
       </div>
 
       <template v-if="data">
+        <template v-if="planningMode">
+        <div v-show="!compactLayout || planningTab === 'digest'" class="planning-pane">
         <section class="strategy-hero">
           <div class="hero-copy">
             <p class="eyebrow"><span class="eyebrow-dot"></span>当前执行框架</p>
@@ -1490,17 +1560,7 @@ onUnmounted(() => {
           </div>
         </section>
 
-        <nav class="strategy-nav" aria-label="策略内容导航">
-          <span class="nav-label">执行手册</span>
-          <a href="#strategy-digest">策略汇总</a>
-          <a href="#strategy-allocation">资金配置</a>
-          <a href="#strategy-rules">交易纪律</a>
-          <a href="#strategy-positions">持仓动作</a>
-          <a href="#strategy-reentry">再买入观察</a>
-          <a href="#strategy-checklist">下单清单</a>
-          <a href="#strategy-backtest">历史回测</a>
-          <router-link to="/review" class="nav-next">回看交易数据 <span>→</span></router-link>
-        </nav>
+
 
         <section id="strategy-digest" class="digest" aria-label="当前交易策略汇总">
           <div class="digest-top">
@@ -1583,7 +1643,8 @@ onUnmounted(() => {
                     <b>{{ action.title }}</b>
                     <span>{{ action.detail }}</span>
                   </div>
-                  <a :href="action.anchor" class="daction-go">{{ action.cta }} <ArrowRightOutlined /></a>
+                  <router-link v-if="action.anchor.startsWith('/')" :to="action.anchor" class="daction-go">{{ action.cta }} <ArrowRightOutlined /></router-link>
+                  <a v-else :href="action.anchor" class="daction-go">{{ action.cta }} <ArrowRightOutlined /></a>
                 </li>
               </ul>
             </div>
@@ -1689,6 +1750,9 @@ onUnmounted(() => {
           </div>
         </a-modal>
 
+        </div>
+
+        <div v-show="!compactLayout || planningTab === 'allocation'" class="planning-pane">
         <h2 id="strategy-allocation" class="section-title"><span class="section-number">01</span>资金配置<span class="section-badge">按当前权益</span></h2>
         <p class="section-sub">核心最多 50%，卫星最多 30%，现金不低于 20%。下面用持仓市值加现金，看每一层离界限还有多远。</p>
 
@@ -1750,6 +1814,9 @@ onUnmounted(() => {
           </div>
         </div>
 
+        </div>
+
+        <div v-show="!compactLayout || planningTab === 'rules'" class="planning-pane">
         <h2 id="strategy-rules" class="section-title"><span class="section-number">02</span>交易纪律<span class="section-badge">A–F 六条规则</span></h2>
         <p class="section-sub">每条规则都对应复盘中的具体问题，执行优先于解释。</p>
 
@@ -1893,7 +1960,11 @@ onUnmounted(() => {
           </article>
         </div>
 
-        <h2 id="strategy-positions" class="section-title"><span class="section-number">03</span>当前持仓怎么处理<span class="section-badge">{{ openPositions.length }} 个持仓</span></h2>
+        </div>
+        </template>
+
+        <template v-if="props.section === 'positions'">
+        <h2 id="strategy-positions" class="section-title"><span class="section-number">01</span>当前持仓怎么处理<span class="section-badge">{{ openPositions.length }} 个持仓</span></h2>
         <p class="section-sub">行情和止损位由当前周期的收盘价计算；盈亏与持仓页一致，包含本周期分批卖出的已实现部分。红色动作为规则已触发，需要人工确认并记录卖出。</p>
 
         <div class="execution-overview">
@@ -2017,7 +2088,10 @@ onUnmounted(() => {
           <div><b>当前没有持仓</b><p>下一笔买入仍要经过理由、止损和仓位检查。</p></div>
         </div>
 
-        <h2 id="strategy-reentry" class="section-title"><span class="section-number">04</span>清仓后再买入<span class="section-badge">{{ readyCandidates.length }} 只条件满足</span></h2>
+        </template>
+
+        <template v-if="props.section === 'reentry'">
+        <h2 id="strategy-reentry" class="section-title"><span class="section-number">01</span>清仓后再买入<span class="section-badge">{{ readyCandidates.length }} 只条件满足</span></h2>
         <p class="section-sub">筛选所选区间里已经清仓、现在没有持仓的标的，优先显示满足企稳或突破条件的股票。这是待复核观察名单，不是自动买入。当前持仓的处理不随日期改变。</p>
 
         <div class="reentry-callout" :class="{ positive: readyCandidates.length }">
@@ -2118,7 +2192,11 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <h2 id="strategy-checklist" class="section-title"><span class="section-number">05</span>每次下单前过一遍<span class="section-badge">检查清单</span></h2>
+        </template>
+
+        <template v-if="planningMode">
+        <div v-show="!compactLayout || planningTab === 'checklist'" class="planning-pane">
+        <h2 id="strategy-checklist" class="section-title"><span class="section-number">03</span>每次下单前过一遍<span class="section-badge">检查清单</span></h2>
         <p class="section-sub">五秒钟能回答完，再打开交易软件。</p>
         <ol class="checklist">
           <li><span>这笔买入的理由能写成一句话吗？<b>写不出来就不买。</b></span></li>
@@ -2128,18 +2206,13 @@ onUnmounted(() => {
           <li><span>今天下了几笔？现在是不是 22:30–23:10 之外？</span></li>
         </ol>
 
-        <h2 id="strategy-backtest" class="section-title"><span class="section-number">06</span>历史回测<span class="section-badge">AKQuant</span></h2>
-        <p class="section-sub">在选定的日期之间重跑，默认是近一年。清空日期则用全部已有日线。跑的是全部当前持仓，不限只数；持仓不足 4 只时，把观察名单里的标的全部加进来一起跑。总资金美股 3 万美元、A 股 30 万人民币：核心的标的平分 50%，卫星的标的平分 30%，其余留作现金；用观察名单补足时不分核心卫星，全部标的平分 80%。数字不进累计盈亏。</p>
-        <div class="backtest-bar">
-          <a-range-picker
-            v-model:value="backtestRange"
-            class="period-range backtest-range"
-            format="YYYY.MM.DD"
-            :presets="backtestPresets"
-            :placeholder="['开始日期', '结束日期']"
-          />
-          <a-button class="refresh-button backtest-run" :loading="backtestLoading" @click="runBacktest">重跑一遍</a-button>
         </div>
+        </template>
+
+        <template v-if="props.section === 'backtest'">
+        <h2 id="strategy-backtest" class="section-title"><span class="section-number">01</span>历史回测<span class="section-badge">AKQuant</span></h2>
+        <p class="section-sub">使用复盘顶部的日期范围，点击“刷新数据”重跑。清空日期则用全部已有日线。仅回测持仓与已清仓标的，不限只数，不加入观察名单。普通股票直接读取全市场数据库中的已收盘日线，ETF 沿用原日线数据源。总资金美股 3 万美元、A 股 30 万人民币：核心的标的平分 50%，卫星的标的平分 30%，其余留作现金；符合条件的标的不足 4 只时不分核心卫星，平分 80%。数字不进累计盈亏。</p>
+
         <a-alert v-if="backtestError" type="error" :message="backtestError" show-icon class="err" />
         <p v-if="backtest" class="section-sub">{{ backtest.profile }}。{{ backtest.note }}</p>
         <div v-if="backtest" class="bt-grid bt-result">
@@ -2543,6 +2616,8 @@ onUnmounted(() => {
           </div>
         </section>
 
+        </template>
+
         <p class="disclaimer">策略根据当前账户与复盘数据制定。仓位数字对应本金与现有规则；执行前仍需核对实际可用资金与持仓。</p>
       </template>
     </a-spin>
@@ -2598,16 +2673,14 @@ h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 27px; 
 .hero-metric > div > span { display: block; margin-top: 6px; font-size: 9px; line-height: 1.5; color: #929baa; }
 .strategy-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 24px 0 4px; padding: 9px 12px; border: 1px solid #edf0f6; border-radius: 10px; background: var(--chip); font-size: 12px; }
 .nav-label { margin: 0 12px 0 4px; color: #97a0b0; }
-.strategy-nav a { padding: 6px 10px; border-radius: 6px; color: #65728a; transition: background .15s, color .15s; }
-.strategy-nav a:hover { color: #2d7564; background: #eaf6f2; }
-.strategy-nav .nav-next { margin-left: auto; color: #4863b6; font-weight: 600; }
-.strategy-nav .nav-next span { margin-left: 4px; }
+.strategy-nav button { padding: 6px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font: inherit; cursor: pointer; transition: background .15s, color .15s; }
+.strategy-nav button.active { color: var(--blue); background: var(--panel); }
+.strategy-nav button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.strategy-nav button:hover { color: #2d7564; background: #eaf6f2; }
 .section-title { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 34px 0 8px; font-size: 19px; font-weight: 650; letter-spacing: -.025em; scroll-margin-top: 200px; }
 .section-number { padding: 5px 6px; border-radius: 5px; background: #eaf5f1; color: #3c8a77; font-size: 11px; font-weight: 600; letter-spacing: 0; font-variant-numeric: tabular-nums; }
 .section-badge { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 5px; background: var(--chip); color: var(--muted); font-size: 11px; font-weight: 400; letter-spacing: 0; }
 .section-sub { margin: 0 0 18px; font-size: 12px; line-height: 1.7; color: var(--muted); }
-.backtest-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: -6px 0 16px; }
-.backtest-run { margin: 0; }
 .bt-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 8px; }
 .bt-result { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 12px; }
 .bt-cycles { margin: 14px 0 8px; }
@@ -3546,10 +3619,9 @@ tbody tr:hover { background: #fafcfb; }
   .hero-metric p { font-size: 9px; }
   .hero-metric strong { font-size: 17px; }
   .hero-metric > div > span { font-size: 8px; }
-  .strategy-nav { margin-top: 18px; gap: 4px; padding: 8px; font-size: 11px; }
+  .strategy-nav { flex-wrap: nowrap; margin-top: 0; gap: 4px; padding: 8px; font-size: 11px; }
   .nav-label { display: none; }
-  .strategy-nav a { flex: 1; padding: 6px 4px; text-align: center; white-space: nowrap; }
-  .strategy-nav .nav-next { display: none; }
+  .strategy-nav button { flex: 1; padding: 6px 4px; text-align: center; white-space: nowrap; }
   .section-title { margin-top: 28px; gap: 8px; font-size: 17px; }
   .section-sub { font-size: 11px; }
   .alloc-card { padding: 18px 16px; border-radius: 13px; }
@@ -3733,7 +3805,7 @@ tbody tr:hover { background: #fafcfb; }
 }
 :global(html[data-theme='dark'] .seg.cash) { background: #363a45; color: var(--muted); }
 :global(html[data-theme='dark'] .position-numbers) { background: var(--border); border-color: var(--border); }
-:global(html[data-theme='dark'] .strategy-nav a:hover),
+:global(html[data-theme='dark'] .strategy-nav button:hover),
 :global(html[data-theme='dark'] .strategy-page tbody tr:hover),
 :global(html[data-theme='dark'] .candidate-filter button.active) {
   background: #262b36;
@@ -3780,8 +3852,7 @@ tbody tr:hover { background: #fafcfb; }
 :global(html[data-theme='dark'] .hero-description),
 :global(html[data-theme='dark'] .hero-meta span),
 :global(html[data-theme='dark'] .nav-label),
-:global(html[data-theme='dark'] .strategy-nav a),
-:global(html[data-theme='dark'] .strategy-nav .nav-next),
+:global(html[data-theme='dark'] .strategy-nav button),
 :global(html[data-theme='dark'] .strategy-page td),
 :global(html[data-theme='dark'] .strategy-page th),
 :global(html[data-theme='dark'] .disclaimer),

@@ -12,3 +12,4 @@ __pycache__/
 frontend/dist/
 backend/.venv/
 backend/data/
+.tools/

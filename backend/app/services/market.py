@@ -408,7 +408,7 @@ def _parse_sina_quote(text: str, ticker: str) -> dict[str, Any]:
     fields = match.group(1).split(",")
     if len(fields) < 30:
         return {}
-    return _quote_payload(
+    payload = _quote_payload(
         price=fields[1],
         prev_close=fields[26],
         open_price=fields[5],
@@ -416,6 +416,11 @@ def _parse_sina_quote(text: str, ticker: str) -> dict[str, Any]:
         low=fields[7],
         timestamp=fields[3],
     )
+    if payload and len(fields) > 10:
+        volume = _positive_d(fields[10])
+        if volume:
+            payload["volume"] = volume
+    return payload
 
 
 def _parse_tencent_quote(text: str, code: str) -> dict[str, Any]:
@@ -437,6 +442,10 @@ def _parse_tencent_quote(text: str, code: str) -> dict[str, Any]:
     name = fields[1].strip() if len(fields) > 1 else ""
     if payload and name:
         payload["name"] = name
+    if payload and code.lower().startswith("us") and len(fields) > 6:
+        volume = _positive_d(fields[6])
+        if volume:
+            payload["volume"] = volume
     return payload
 
 
@@ -498,7 +507,7 @@ def _fetch_us_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
 def _fetch_global_stock_data_batch(
     symbols: list[str],
 ) -> dict[str, dict[str, Any]]:
-    """US quotes try Yahoo first, then Sina and Tencent. Open A-share and Hong Kong sessions use Tencent."""
+    """US quotes try Sina and Tencent before Yahoo. Open A-share and Hong Kong sessions use Tencent."""
     from app.services.bars import cn_session_closed, hk_session_closed
     from app.services.data_sources import fetch_quotes
 

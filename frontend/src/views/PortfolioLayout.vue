@@ -1,6 +1,6 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import SummaryCards from '@/components/SummaryCards.vue'
 import { usePortfolioStore } from '@/stores/portfolio'
 import { useTheme } from '@/composables/useTheme'
@@ -8,9 +8,9 @@ import { refreshMarket } from '@/api/portfolio'
 import { isCnLunch, isMarketOpen } from '@/utils/marketHours'
 
 const store = usePortfolioStore()
-const { isDark } = useTheme()
+const { isDark, toggleTheme } = useTheme()
 const route = useRoute()
-const router = useRouter()
+const menuRef = ref(null)
 const refreshVersion = ref(0)
 const QUOTE_REFRESH_MS = 10_000
 let quoteTimer
@@ -35,15 +35,26 @@ async function pollQuotes() {
 }
 
 const markets = [
-  { id: 'us', label: '美股' },
-  { id: 'cn', label: 'A股' },
-  { id: 'hk', label: '港股' },
+  { id: 'us', label: '美股', short: '美' },
+  { id: 'cn', label: 'A股', short: 'A' },
+  { id: 'hk', label: '港股', short: '港' },
 ]
 
-const activeKey = computed({
-  get: () => route.name,
-  set: (name) => router.push({ name }),
-})
+const menuItems = [
+  { id: 'overview', label: '概览' },
+  { id: 'stats', label: '统计' },
+  { id: 'holdings', label: '持股' },
+  { id: 'review', label: '复盘' },
+  { id: 'strategy', label: '策略' },
+  { id: 'trades', label: '交易' },
+  { id: 'analysis', label: '分析' },
+]
+
+function revealActiveMenu() {
+  nextTick(() => menuRef.value?.querySelector('.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }))
+}
+
+watch(() => route.name, revealActiveMenu)
 
 async function switchMarket(id) {
   if (id === store.market) return
@@ -67,6 +78,7 @@ async function refreshQuotes() {
 }
 
 onMounted(() => {
+  revealActiveMenu()
   if (isMarketOpen(store.market)) refreshQuotes()
   else store.loadSummary()
   quoteTimer = window.setInterval(pollQuotes, QUOTE_REFRESH_MS)
@@ -82,24 +94,39 @@ onUnmounted(() => {
   <div class="page">
     <div class="sticky-top">
       <div class="top-bar">
-        <div class="market-switch" role="tablist" aria-label="市场">
+        <nav ref="menuRef" class="top-menu" aria-label="主菜单">
+          <router-link
+            v-for="item in menuItems"
+            :key="item.id"
+            :to="{ name: item.id }"
+            class="menu-link"
+            :class="{ active: route.name === item.id }"
+            :aria-current="route.name === item.id ? 'page' : undefined"
+          >{{ item.label }}</router-link>
+        </nav>
+        <div class="top-controls">
+          <div class="market-switch" role="tablist" aria-label="市场">
           <button
             v-for="item in markets"
             :key="item.id"
             type="button"
             role="tab"
+            :aria-label="item.label"
             :aria-selected="store.market === item.id"
             :class="{ active: store.market === item.id }"
             @click="switchMarket(item.id)"
           >
-            {{ item.label }}
+            <span class="market-label">{{ item.label }}</span>
+            <span class="market-short" aria-hidden="true">{{ item.short }}</span>
           </button>
-        </div>
-        <span
+          </div>
+        <button
+          type="button"
           class="theme-toggle"
-          role="img"
-          :aria-label="isDark ? '深色模式，20:00 至 08:00' : '浅色模式，08:00 至 20:00'"
-          :title="isDark ? '20:00–08:00 深色' : '08:00–20:00 浅色'"
+          :aria-pressed="isDark"
+          :aria-label="isDark ? '切换浅色主题' : '切换深色主题'"
+          :title="isDark ? '切换浅色主题' : '切换深色主题'"
+          @click="toggleTheme"
         >
           <svg v-if="isDark" viewBox="0 0 24 24" aria-hidden="true">
             <circle cx="12" cy="12" r="4" />
@@ -108,20 +135,12 @@ onUnmounted(() => {
           <svg v-else viewBox="0 0 24 24" aria-hidden="true">
             <path d="M16.5 13.2A6.2 6.2 0 0 1 10.8 5 6.4 6.4 0 1 0 16.5 13.2z" />
           </svg>
-        </span>
+        </button>
+        </div>
       </div>
-      <SummaryCards :summary="store.summary" :loading="store.loading" />
-      <a-tabs v-model:activeKey="activeKey" class="portfolio-tabs">
-        <a-tab-pane key="overview" tab="概览" />
-        <a-tab-pane key="stats" tab="统计" />
-        <a-tab-pane key="holdings" tab="持股" />
-        <a-tab-pane key="prices" tab="价格" />
-        <a-tab-pane key="review" tab="复盘" />
-        <a-tab-pane key="strategy" tab="策略" />
-        <a-tab-pane key="trades" tab="交易" />
-        <a-tab-pane key="analysis" tab="分析" />
-      </a-tabs>
     </div>
+
+    <SummaryCards v-if="route.name === 'overview'" :summary="store.summary" :loading="store.loading" />
 
     <div class="main-panel">
       <router-view :key="`${store.market}-${refreshVersion}`" @changed="store.loadSummary()" />
@@ -145,7 +164,55 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin: 2px 0 12px;
+  min-height: 56px;
+  padding-block: 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+
+.top-menu {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.top-menu::-webkit-scrollbar {
+  display: none;
+}
+
+.menu-link {
+  flex: none;
+  padding: 9px 14px;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.menu-link:hover,
+.menu-link.active {
+  background: var(--chip);
+  color: var(--text);
+}
+
+.menu-link.active {
+  color: var(--blue);
+}
+
+.top-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+.market-short {
+  display: none;
 }
 
 .market-switch {
@@ -160,9 +227,9 @@ onUnmounted(() => {
 }
 
 .market-switch button {
-  min-width: 72px;
+  min-width: 54px;
   height: 32px;
-  padding: 0 16px;
+  padding: 0 12px;
   border: 0;
   border-radius: 9px;
   background: transparent;
@@ -189,6 +256,7 @@ onUnmounted(() => {
   border-radius: 12px;
   background: var(--chip);
   color: var(--text);
+  cursor: pointer;
 }
 
 .theme-toggle svg {
@@ -199,14 +267,6 @@ onUnmounted(() => {
   stroke-width: 1.6;
   stroke-linecap: round;
   stroke-linejoin: round;
-}
-
-.sticky-top :deep(.portfolio-tabs .ant-tabs-content-holder) {
-  display: none;
-}
-
-.sticky-top :deep(.ant-tabs-nav) {
-  margin-bottom: 12px !important;
 }
 
 .main-panel {
@@ -222,9 +282,6 @@ onUnmounted(() => {
   }
 
   .sticky-top {
-    position: static;
-    z-index: auto;
-    backdrop-filter: none;
     margin-inline: calc(-1 * max(16px, env(safe-area-inset-left)))
       calc(-1 * max(16px, env(safe-area-inset-right)));
     padding-inline: max(16px, env(safe-area-inset-left)) max(16px, env(safe-area-inset-right));
@@ -232,6 +289,43 @@ onUnmounted(() => {
 }
 
 @media (max-width: 560px) {
+  .top-bar {
+    gap: 8px;
+  }
+
+  .top-controls {
+    gap: 6px;
+  }
+
+  .menu-link {
+    padding: 9px 10px;
+    font-size: 13px;
+  }
+
+  .market-switch {
+    gap: 2px;
+    padding: 3px;
+  }
+
+  .market-switch button {
+    min-width: 28px;
+    padding: 0 7px;
+    font-size: 13px;
+  }
+
+  .market-label {
+    display: none;
+  }
+
+  .market-short {
+    display: inline;
+  }
+
+  .theme-toggle {
+    width: 32px;
+    height: 32px;
+  }
+
   .page-header {
     margin-bottom: 12px;
   }

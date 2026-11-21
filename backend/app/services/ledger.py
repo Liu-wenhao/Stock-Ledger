@@ -1184,14 +1184,16 @@ def nav_response(db: Session, range_key: str = "3M", mode: str = "value") -> dic
     return {"mode": mode, "points": points, "ranges": ranges}
 
 
-def monthly_returns(db: Session, range_key: str = "3M") -> dict:
-    rows = build_nav_series(db)
+def monthly_returns(db: Session, range_key: str = "3M", through: date | None = None) -> dict:
+    rows = [row for row in build_nav_series(db) if through is None or row.nav_date <= through]
     if not rows:
         return {"items": [], "benchmark": settings.benchmark_symbol}
 
     first = rows[0].nav_date
     start = range_start(range_key, first)
     filtered = [r for r in rows if r.nav_date >= start]
+    if not filtered:
+        return {"items": [], "benchmark": settings.benchmark_symbol}
 
     # Portfolio monthly return from month-end values
     by_month: dict[str, list[DailyNav]] = {}
@@ -1202,8 +1204,8 @@ def monthly_returns(db: Session, range_key: str = "3M") -> dict:
     # Benchmark history
     bench_hist = get_history_closes(
         [settings.benchmark_symbol],
-        datetime.combine(start, datetime.min.time()),
-        datetime.utcnow(),
+        datetime.combine(start - timedelta(days=10), datetime.min.time()),
+        datetime.combine(through, datetime.max.time()) if through is not None else datetime.utcnow(),
     ).get(settings.benchmark_symbol, {})
 
     items = []
@@ -1219,7 +1221,7 @@ def monthly_returns(db: Session, range_key: str = "3M") -> dict:
         port_pct = ((end_v - start_v) / abs(start_v) * Decimal("100")) if start_v != ZERO else ZERO
 
         # benchmark
-        m_start = mrows[0].nav_date
+        m_start = by_month[months[i - 1]][-1].nav_date if i > 0 else mrows[0].nav_date
         m_end = mrows[-1].nav_date
         b_start = bench_hist.get(m_start.isoformat())
         b_end = bench_hist.get(m_end.isoformat())
@@ -1237,14 +1239,17 @@ def monthly_returns(db: Session, range_key: str = "3M") -> dict:
         if b_start and b_end and b_start != 0:
             bench_pct = (_dec(b_end) - _dec(b_start)) / _dec(b_start) * Decimal("100")
         else:
-            bench_pct = ZERO
+            bench_pct = None
 
         label = f"{int(month.split('-')[1])}月"
         items.append(
             {
                 "month": label,
+                "month_key": month,
+                "start_date": m_start,
+                "end_date": m_end,
                 "portfolio_percent": port_pct.quantize(Decimal("0.01")),
-                "benchmark_percent": bench_pct.quantize(Decimal("0.01")),
+                "benchmark_percent": bench_pct.quantize(Decimal("0.01")) if bench_pct is not None else None,
             }
         )
 

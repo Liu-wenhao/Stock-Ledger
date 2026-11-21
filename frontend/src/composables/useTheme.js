@@ -1,6 +1,8 @@
 import { ref } from 'vue'
 
 const isDark = ref(false)
+const savedTheme = typeof localStorage === 'undefined' ? null : localStorage.getItem('ledger-theme')
+const themeChoice = ref(['light', 'dark'].includes(savedTheme) ? savedTheme : 'auto')
 let timer
 
 export function darkByClock(date = new Date()) {
@@ -14,7 +16,13 @@ function applyTheme(dark) {
 }
 
 function syncTheme() {
-  applyTheme(darkByClock())
+  applyTheme(themeChoice.value === 'auto' ? darkByClock() : themeChoice.value === 'dark')
+}
+
+function toggleTheme() {
+  themeChoice.value = isDark.value ? 'light' : 'dark'
+  localStorage.setItem('ledger-theme', themeChoice.value)
+  syncTheme()
 }
 
 function startThemeClock() {
@@ -29,5 +37,5 @@ function startThemeClock() {
 if (typeof document !== 'undefined') startThemeClock()
 
 export function useTheme() {
-  return { isDark }
+  return { isDark, toggleTheme }
 }

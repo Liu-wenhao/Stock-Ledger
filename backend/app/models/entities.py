@@ -1,7 +1,8 @@
-from datetime import date, datetime
+﻿from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Index, Numeric, PrimaryKeyConstraint, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Index, LargeBinary, Numeric, PrimaryKeyConstraint, String, Text, UniqueConstraint, func
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -49,6 +50,54 @@ class SymbolMeta(Base):
     exchange: Mapped[str | None] = mapped_column(String(64), nullable=True)
     currency: Mapped[str | None] = mapped_column(String(16), nullable=True)
     logo_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class StockNews(Base):
+    """One news article linked to one canonical ledger symbol."""
+
+    __tablename__ = "stock_news"
+    __table_args__ = (
+        UniqueConstraint("symbol", "dedup_key", name="uq_stock_news_symbol_dedup"),
+        Index("ix_stock_news_symbol_published", "symbol", "published_at"),
+        Index("ix_stock_news_symbol_session", "symbol", "session_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    session_date: Mapped[date] = mapped_column(Date, nullable=False)
+    category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sentiment: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class IndicatorTrendCache(Base):
+    """Latest precomputed indicator page and monitor state for one held symbol."""
+
+    __tablename__ = "indicator_trend_cache"
+
+    symbol: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload_blob: Mapped[bytes | None] = mapped_column(
+        LargeBinary().with_variant(MEDIUMBLOB(), "mysql"), nullable=True
+    )
+    session_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    snapshot_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    signal_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notified_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    error_notified: Mapped[int] = mapped_column(nullable=False, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
@@ -183,6 +232,44 @@ class MaAnchor(Base):
     symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
     through_date: Mapped[date] = mapped_column(Date, primary_key=True)
     close_sum: Mapped[Decimal] = mapped_column(Numeric(20, 4), nullable=False)
+
+
+class MarketSymbol(Base):
+    """One listed name in the full-market bar store, with how far its history has been read."""
+
+    __tablename__ = "market_symbol"
+    __table_args__ = (UniqueConstraint("market", "symbol", name="uq_market_symbol"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    market: Mapped[str] = mapped_column(String(8), nullable=False)
+    # Same key as the live list: sh601012 for A-shares, the ticker for US names.
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    venue: Mapped[int] = mapped_column(nullable=False, default=0)
+    # "" still to read, ok, empty when the source has no history, fail after a request error.
+    fetch_state: Mapped[str] = mapped_column(String(8), nullable=False, default="")
+    bars_from: Mapped[date | None] = mapped_column(Date, nullable=True)
+    bars_through: Mapped[date | None] = mapped_column(Date, nullable=True)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class MarketBar(Base):
+    """Forward-adjusted (qfq) OHLC, volume in shares, and turnover for one session."""
+
+    __tablename__ = "market_bar"
+    __table_args__ = (
+        PrimaryKeyConstraint("symbol_id", "bar_date"),
+        Index("ix_market_bar_date", "bar_date"),
+    )
+
+    symbol_id: Mapped[int] = mapped_column(nullable=False)
+    bar_date: Mapped[date] = mapped_column(Date, nullable=False)
+    open: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    high: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    low: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    close: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    volume: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # A-shares only. The US sources give no turnover.
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
 
 
 class DailyNav(Base):

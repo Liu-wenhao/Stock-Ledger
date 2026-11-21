@@ -31,8 +31,7 @@ const router = createRouter({
         },
         {
           path: 'prices',
-          name: 'prices',
-          component: () => import('@/views/HoldingsView.vue'),
+          redirect: '/holdings',
         },
         {
           path: 'analysis',

@@ -1,10 +1,12 @@
 """Quote and daily-bar routing.
 
-US history and live quotes use YFinance. A-shares and Hong Kong use AkShare.
+US live quotes use one Sina request, then Tencent. YFinance fills only the names
+those two missed, because a Yahoo download can sit for the full timeout.
+US history still uses YFinance. A-shares and Hong Kong use AkShare.
 A-share bars fall through to Tushare when a token is set, otherwise Baostock.
-Longbridge is created only when credentials exist, and only to fill a US quote
-YFinance left incomplete or a Hong Kong quote AkShare left incomplete.
-A-share requests never call Longbridge. Sina and Tencent remain the last resort.
+Longbridge is created only when credentials exist, and only to fill a US or
+Hong Kong quote the faster sources left incomplete.
+A-share requests never call Longbridge.
 """
 
 from __future__ import annotations
@@ -757,15 +759,27 @@ def _incomplete(quote: dict | None) -> bool:
 
 
 def fetch_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
-    """US from YFinance, HK/A-share from AkShare. Longbridge fills only US/HK gaps."""
+    """US live quotes from Sina then Tencent. YFinance only fills the misses."""
     out: dict[str, dict[str, Any]] = {symbol: {} for symbol in symbols}
     us = [symbol for symbol in symbols if market_of(symbol) == "us"]
     local = [symbol for symbol in symbols if market_of(symbol) in {"cn", "hk"}]
     if us:
         try:
-            out.update(_yf_quotes(us))
+            from app.services.market import _fetch_us_quotes
+
+            for symbol, quote in _fetch_us_quotes(us).items():
+                if not _incomplete(quote):
+                    out[symbol] = quote
         except Exception as exc:
-            logger.warning("YFinance 行情失败: %s", exc)
+            logger.warning("新浪/腾讯美股行情失败: %s", exc)
+        missing = [symbol for symbol in us if _incomplete(out.get(symbol))]
+        if missing:
+            try:
+                for symbol, quote in _yf_quotes(missing).items():
+                    if not _incomplete(quote):
+                        out[symbol] = quote
+            except Exception as exc:
+                logger.warning("YFinance 行情失败: %s", exc)
     for symbol in local:
         try:
             out[symbol] = _ak_quote(symbol)

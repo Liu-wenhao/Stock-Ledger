@@ -13,3 +13,4 @@ yfinance==0.2.66
 akshare==1.17.5
 baostock==0.8.9
 akquant==0.3.76
+exchange-calendars==4.13.2

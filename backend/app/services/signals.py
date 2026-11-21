@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from statistics import mean, stdev
 
@@ -19,6 +20,7 @@ from app.models.entities import PositionStop
 from app.services.ledger import compute_holdings
 
 TARGET_VOL = 0.20
+INDICATOR_COLUMNS_VERSION = 1
 
 # Known leveraged products. Sign is the equity beta multiple.
 LEVERAGE = {
@@ -63,15 +65,19 @@ def _ann_vol(rets: list[float]) -> float | None:
     return stdev(rets) * math.sqrt(252)
 
 
-def _load_bars(symbol: str) -> list[dict]:
+def _load_bars(symbol: str, *, full_market: bool = False, db: Session | None = None) -> list[dict]:
     from app.core.database import SessionLocal
     from app.services.bars import load_symbol_bars
+    from app.services.price_history import load_history_bars
 
-    db = SessionLocal()
+    loader = load_history_bars if full_market else load_symbol_bars
+    if db is not None:
+        return loader(db, symbol)
+    session = SessionLocal()
     try:
-        return load_symbol_bars(db, symbol)
+        return loader(session, symbol)
     finally:
-        db.close()
+        session.close()
 
 
 def _rsi(closes: list[float], period: int = 14) -> float | None:
@@ -124,7 +130,12 @@ def _percentile(values: list[float], q: float) -> float | None:
 
 
 def _bandwidths(closes: list[float]) -> list[float | None]:
-    """(upper − lower) / MA20. Same 20-day sample deviation the chart uses."""
+    """(upper − lower) / MA20. Same 20-day sample deviation the chart uses.
+
+    Only the last 140 closes are read. Callers look at the newest 120 widths at most,
+    and each width needs 20 closes, so a long history gives the same tail.
+    """
+    closes = closes[-140:]
     out: list[float | None] = []
     for index in range(len(closes)):
         if index < 19:
@@ -792,7 +803,8 @@ def _measure(
     sd20 = stdev(window)
     bandwidth = (4 * sd20 / ma20) if ma20 else None
     bandwidths = []
-    for i in range(19, len(closes)):
+    # Only the newest 120 widths are compared below.
+    for i in range(max(19, len(closes) - 120), len(closes)):
         chunk = closes[i - 19 : i + 1]
         mid = mean(chunk)
         bandwidths.append((4 * stdev(chunk) / mid) if mid else None)
@@ -850,6 +862,8 @@ def _measure(
         "high": highs[-1],
         "low": lows[-1],
         "close": closes[-1],
+        "prev_close": closes[-2] if closes[-2] > 0 else None,
+        "day_change": closes[-1] - closes[-2] if closes[-2] > 0 else None,
         "ma5": ma5,
         "ma10": ma10,
         "ma20": ma20,
@@ -1667,6 +1681,11 @@ def _history_point(stats: dict) -> dict:
         "high": rounded("high", 2),
         "low": rounded("low", 2),
         "close": rounded("close", 2),
+        "prev_close": rounded("prev_close", 2),
+        "day_change": rounded("day_change", 2),
+        "day_change_percent": round(stats["day_change"] / stats["prev_close"] * 100, 2)
+        if stats.get("prev_close") and stats.get("day_change") is not None
+        else None,
         "volume": None if stats.get("volume") is None else round(stats["volume"]),
         "turnover": None if stats.get("turnover") is None else round(stats["turnover"]),
         "illiq": rounded("illiq", 3),
@@ -1686,6 +1705,7 @@ def _history_point(stats: dict) -> dict:
         "bandwidth": None if stats.get("bandwidth") is None else round(stats["bandwidth"] * 100, 1),
         "vol": None if stats.get("vol") is None else round(stats["vol"] * 100, 1),
         "mom": rounded("mom", 2),
+        "vol_cap": round(TARGET_VOL / stats["vol"] * 100, 1) if stats.get("vol") else None,
         "signal": stats.get("signal"),
         "vol_squeeze": stats.get("squeeze") == "120日新低",
         "rsi": rounded("rsi", 1),
@@ -2112,6 +2132,9 @@ def _trend_brief(bars: list[dict], points: list[dict], ticker: str, pe: float | 
     }
 
 
+_symbol_pe_cache: dict[str, tuple[float, float | None]] = {}
+
+
 def _symbol_pe(symbol: str) -> float | None:
     from app.services.market_scope import market_of
     from app.services.symbols import quote_code
@@ -2119,6 +2142,9 @@ def _symbol_pe(symbol: str) -> float | None:
     ticker = (symbol or "").split(":")[-1]
     if not ticker:
         return None
+    cached = _symbol_pe_cache.get(symbol)
+    if cached and time.time() - cached[0] < 6 * 60 * 60:
+        return cached[1]
     try:
         if market_of(symbol) == "us":
             found = _fetch_pe([ticker])
@@ -2127,27 +2153,50 @@ def _symbol_pe(symbol: str) -> float | None:
             found = _fetch_listed_pe([(ticker, code)]) if code else {}
     except Exception:
         return None
-    return found.get(ticker.upper())
+    value = found.get(ticker.upper())
+    _symbol_pe_cache[symbol] = (time.time(), value)
+    return value
 
 
-def build_indicator_history(symbol: str, before: str | None = None, limit: int = 40) -> dict:
+def build_indicator_history(
+    symbol: str,
+    before: str | None = None,
+    limit: int = 40,
+    *,
+    session_bar: dict | None = None,
+    fetch_session_bar: bool = True,
+) -> dict:
     """One page of daily indicators from stored bars, newest page first.
 
     The window starts on 1 April of the current year. Callers walk backward
     with `before` (exclusive) so a long history is not built in one response.
-    Today's session bar is attached on the newest page when stored bars stop
-    before that session, and that print is not written.
+    Ordinary shares read completed history from market_bar. The unfinished
+    session bar is attached only on the newest page and is not written.
     """
+    from app.core.database import SessionLocal
     from app.services.bars import append_open_bar, chart_session_bar, chart_since
+    from app.services.price_history import history_version, unfinished_session, uses_market_store
 
     limit = max(20, min(int(limit or 40), 80))
     since = chart_since().isoformat()
     cutoff = str(before)[:10] if before else ""
     newest = not cutoff
 
-    bars = _load_bars(symbol)
-    if newest:
-        bars = append_open_bar(bars, chart_session_bar(symbol, bars))
+    market_history = uses_market_store(symbol)
+    db = SessionLocal()
+    try:
+        source_version = history_version(db, symbol) if market_history else None
+        bars = _load_bars(symbol, full_market=True, db=db)
+        if not market_history:
+            source_version = history_version(db, symbol)
+    finally:
+        db.close()
+    live_day = unfinished_session(symbol) if market_history else None
+    if newest and (not market_history or live_day is not None):
+        live_bar = chart_session_bar(symbol, bars) if fetch_session_bar else session_bar
+        if market_history and (not live_bar or str(live_bar.get("d") or "")[:10] != live_day.isoformat()):
+            live_bar = None
+        bars = append_open_bar(bars, live_bar)
     eligible = [
         index
         for index, bar in enumerate(bars)
@@ -2156,7 +2205,9 @@ def build_indicator_history(symbol: str, before: str | None = None, limit: int =
     page = eligible[-limit:]
     points = []
     for index in page:
-        stats = _measure(bars[: index + 1], None, symbol, with_conditions=True)
+        # 300 bars are enough: the longest lookback is 120 days, and MACD, RSI and ATR
+        # settle to the same four decimals. The whole history cost a minute on old names.
+        stats = _measure(bars[max(0, index - 299) : index + 1], None, symbol, with_conditions=True)
         if stats:
             points.append(_history_point(stats))
     # Imported here because ak_backtest imports this module.
@@ -2184,6 +2235,8 @@ def build_indicator_history(symbol: str, before: str | None = None, limit: int =
     return {
         "symbol": symbol,
         "ticker": ticker,
+        "_history_source_version": source_version,
+        "_indicator_columns_version": INDICATOR_COLUMNS_VERSION,
         "since": since,
         "before": points[0]["date"] if points else None,
         "has_more": len(eligible) > len(page),

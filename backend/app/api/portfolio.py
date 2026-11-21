@@ -9,6 +9,7 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.models.entities import PositionStop
 from app.schemas.portfolio import (
+    BenchmarkComparisonResponse,
     ClosedHoldingRow,
     ClosedHoldingsResponse,
     CumulativeCycleRow,
@@ -37,9 +38,10 @@ from app.schemas.portfolio import (
     BacktestCandlesResponse,
     BacktestResponse,
 )
-from app.services import ledger, review
+from app.services import benchmarks, ledger, review
 from app.services.ak_backtest import backtest_candles, engine_source, run_book_backtest
 from app.services.market_scope import current_market
+from app.services.position_scope import position_symbols
 from app.services.signals import build_holdings_advice, build_indicator_history
 
 router = APIRouter(prefix="/api", tags=["portfolio"])
@@ -458,25 +460,57 @@ def holdings_advice(db: Session = Depends(get_db)):
     return build_holdings_advice(db, settings.default_portfolio_id)
 
 
+def _analysis_symbol(db: Session, symbol: str) -> str:
+    symbol = symbol.strip().upper()
+    if symbol not in position_symbols(db, settings.default_portfolio_id, current_market()):
+        raise HTTPException(status_code=403, detail="仅持仓或已清仓标的可以回测和查看指标趋势")
+    return symbol
+
+
 @router.get("/holdings/indicator-history", response_model=IndicatorHistory)
 def holdings_indicator_history(
     symbol: str = Query(...),
     before: str | None = Query(None),
     limit: int = Query(40, ge=20, le=80),
+    db: Session = Depends(get_db),
 ):
-    """One page of daily indicators, walking back from the newest stored bar toward April."""
-    return build_indicator_history(symbol, before=before, limit=limit)
+    """Held latest pages use the monitor; closed positions and old pages load on-demand."""
+    symbol = _analysis_symbol(db, symbol)
+    try:
+        if not before and limit == 40 and symbol in position_symbols(
+            db, settings.default_portfolio_id, current_market(), include_closed=False
+        ):
+            from app.services.indicator_monitor import cached_indicator_history
+
+            cached = cached_indicator_history(db, symbol)
+            if cached is not None:
+                return cached
+        return build_indicator_history(symbol, before=before, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/analysis/monthly-returns", response_model=MonthlyReturnsResponse)
-def monthly_returns(range: str = Query("3M"), db: Session = Depends(get_db)):
-    return ledger.monthly_returns(db, range_key=range)
+def monthly_returns(range: str = Query("3M"), end: date | None = Query(None), db: Session = Depends(get_db)):
+    return ledger.monthly_returns(db, range_key=range, through=end)
 
 
 @router.get("/analysis/profit-series", response_model=ProfitSeriesResponse)
 def profit_series(range: str = Query("3M"), db: Session = Depends(get_db)):
     data = ledger.nav_response(db, range_key=range, mode="profit")
     return {"points": data["points"], "ranges": data["ranges"]}
+
+
+@router.get("/analysis/benchmarks", response_model=BenchmarkComparisonResponse)
+def analysis_benchmarks(
+    start: date = Query(...),
+    end: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    try:
+        return benchmarks.build_benchmarks(db, start, end)
+    except ValueError as exception:
+        raise HTTPException(status_code=422, detail=str(exception)) from exception
 
 
 @router.get("/analysis/review", response_model=ReviewResponse)
@@ -527,7 +561,10 @@ def analysis_backtest_candles(
     """Daily bars around one backtest cycle for the B/S candlestick chart."""
     if start and end and start > end:
         raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+    symbol = _analysis_symbol(db, symbol)
     try:
         return backtest_candles(db, symbol, start, end)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail="日线没有取到") from exc

@@ -252,8 +252,11 @@ class PeriodPerformanceResponse(BaseModel):
 
 class MonthlyReturnPoint(BaseModel):
     month: str
+    month_key: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
     portfolio_percent: Decimal
-    benchmark_percent: Decimal
+    benchmark_percent: Decimal | None = None
 
 
 class MonthlyReturnsResponse(BaseModel):
@@ -264,6 +267,33 @@ class MonthlyReturnsResponse(BaseModel):
 class ProfitSeriesResponse(BaseModel):
     points: list[NavPoint]
     ranges: list[RangeStat]
+
+
+class BenchmarkReturnPoint(BaseModel):
+    date: date
+    return_percent: Decimal | None = None
+    quote_date: date | None = None
+
+
+class BenchmarkReturnSeries(BaseModel):
+    key: str
+    label: str
+    source: str
+    note: str
+    status: Literal["ok", "partial", "unavailable"]
+    as_of: date | None = None
+    return_percent: Decimal | None = None
+    annualized_yield: Decimal | None = None
+    points: list[BenchmarkReturnPoint] = Field(default_factory=list)
+
+
+class BenchmarkComparisonResponse(BaseModel):
+    start_date: date
+    end_date: date | None = None
+    currency: str = "USD"
+    dates: list[date] = Field(default_factory=list)
+    series: list[BenchmarkReturnSeries] = Field(default_factory=list)
+    note: str
 
 
 class DailyPnlItem(BaseModel):
@@ -572,6 +602,9 @@ class IndicatorPoint(BaseModel):
     high: float | None = None
     low: float | None = None
     close: float | None = None
+    prev_close: float | None = None
+    day_change: float | None = None
+    day_change_percent: float | None = None
     volume: float | None = None
     turnover: float | None = None
     illiq: float | None = None
@@ -590,6 +623,7 @@ class IndicatorPoint(BaseModel):
     vs_anchor: float | None = None
     bandwidth: float | None = None
     vol: float | None = None
+    vol_cap: float | None = None
     mom: float | None = None
     signal: str | None = None
     vol_squeeze: bool = False
@@ -640,6 +674,9 @@ class SentimentBreadth(BaseModel):
     ma_valid: int | None = None
     ma_total: int | None = None
     ma_pending: bool = False
+    # Full-A card carries CSI 300 here for the side-by-side Arms panel.
+    narrow_key: str = ""
+    narrow: "SentimentBreadth | None" = None
 
 
 class SentimentSeriesPoint(BaseModel):

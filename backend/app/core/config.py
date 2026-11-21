@@ -17,6 +17,14 @@ class Settings(BaseSettings):
     default_portfolio_id: int = 1
     default_portfolio_name: str = "我的投资组合"
     base_currency: str = "USD"
+    # Shared only with the Grok Bot that is allowed to write news.
+    news_ingest_token: str = ""
+    # Held-position intraday monitor. Empty DingTalk URL keeps collection enabled
+    # while notifications stay off.
+    indicator_monitor_enabled: bool = True
+    indicator_monitor_seconds: int = 60
+    dingtalk_webhook_url: str = ""
+    dingtalk_secret: str = ""
     # AkShare is the default A-share/HK source. US history and live quotes use YFinance.
     enable_eastmoney_patch: bool = False
     max_workers: int = 4

@@ -1,7 +1,9 @@
 from datetime import datetime
 from decimal import Decimal
 from unittest import TestCase
+from unittest.mock import patch
 
+from app.services.data_sources import fetch_quotes
 from app.services.market import _parse_sina_quote, _parse_tencent_quote
 
 
@@ -21,9 +23,10 @@ class GlobalStockDataParserTests(TestCase):
         fields[34] = "310.74"
         fields[35] = "USD"
         response = f'v_usAAPL="{"~".join(fields)}";'
-        quote = _parse_tencent_quote(response, "AAPL")
+        quote = _parse_tencent_quote(response, "usAAPL")
 
         self.assertEqual(quote["price"], Decimal("312.7"))
+        self.assertEqual(quote["volume"], Decimal("11849255"))
         self.assertEqual(quote["prev_close"], Decimal("312.41"))
         self.assertEqual(quote["open"], Decimal("311.45"))
         self.assertEqual(quote["high"], Decimal("314.81"))
@@ -40,7 +43,10 @@ class GlobalStockDataParserTests(TestCase):
             "311.45",
             "314.81",
             "310.74",
-            *("0" for _ in range(18)),
+            "0",
+            "0",
+            "4749062",
+            *("0" for _ in range(15)),
             "312.41",
             "0",
             "0",
@@ -52,3 +58,24 @@ class GlobalStockDataParserTests(TestCase):
         self.assertEqual(quote["price"], Decimal("312.7"))
         self.assertEqual(quote["prev_close"], Decimal("312.41"))
         self.assertEqual(quote["change"], Decimal("0.290000"))
+        self.assertEqual(quote["volume"], Decimal("4749062"))
+
+    def test_us_live_quotes_skip_yahoo_when_sina_hits(self) -> None:
+        calls: list[str] = []
+
+        def sina(symbols):
+            calls.append("sina")
+            return {"NASDAQ:RKLB": {"price": Decimal("52")}}
+
+        def yahoo(symbols):
+            calls.append("yahoo")
+            return {}
+
+        with (
+            patch("app.services.market._fetch_us_quotes", sina),
+            patch("app.services.data_sources._yf_quotes", yahoo),
+        ):
+            quotes = fetch_quotes(["NASDAQ:RKLB"])
+
+        self.assertEqual(calls, ["sina"])
+        self.assertEqual(quotes["NASDAQ:RKLB"]["price"], Decimal("52"))

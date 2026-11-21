@@ -1,5 +1,7 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import StrategyView from '@/views/StrategyView.vue'
 import dayjs from 'dayjs'
 import * as echarts from 'echarts'
 import { ReloadOutlined, AimOutlined, SwapOutlined, SafetyOutlined, PieChartOutlined } from '@ant-design/icons-vue'
@@ -12,14 +14,35 @@ import {
   noSplitLine,
 } from '@/utils/chart'
 
+const route = useRoute()
+const reviewTabs = [
+  { key: 'summary', label: '交易复盘' },
+  { key: 'positions', label: '持仓处理' },
+  { key: 'reentry', label: '清仓再买入' },
+  { key: 'backtest', label: '历史回测' },
+]
+const activeTab = computed(() =>
+  reviewTabs.some((item) => item.key === route.query.tab) ? route.query.tab : 'summary',
+)
+let loadToken = 0
+
+const sectionView = ref(null)
+const pageHeading = computed(() => ({
+  summary: { title: '交易复盘', description: '从交易结果到行为习惯，让下一次决策更有依据。' },
+  positions: { title: '持仓处理', description: '复核当前持仓的信号、风险与止损动作，执行仍需人工确认。' },
+  reentry: { title: '清仓再买入', description: '复核已清仓标的的冷却期与再入场条件，不自动买入。' },
+  backtest: { title: '历史回测', description: '用持仓与已清仓标的的历史日线验证规则；选择区间后点击刷新数据运行回测，不计入账本盈亏。' },
+}[activeTab.value]))
 const data = ref(null)
 const loading = ref(true)
 const error = ref('')
+const refreshing = computed(() => activeTab.value === 'summary' ? loading.value : (sectionView.value?.busy ?? true))
 const range = ref([dayjs().subtract(1, 'month'), dayjs()])
 const rangePresets = [
   { label: '近1个月', value: [dayjs().subtract(1, 'month'), dayjs()] },
   { label: '近3个月', value: [dayjs().subtract(3, 'month'), dayjs()] },
   { label: '今年', value: [dayjs().startOf('year'), dayjs()] },
+  { label: '近1年', value: [dayjs().subtract(1, 'year'), dayjs()] },
 ]
 const barRef = ref(null)
 const countRef = ref(null)
@@ -319,19 +342,27 @@ function renderSymbols() {
 }
 
 async function load() {
+  const token = ++loadToken
   loading.value = true
   error.value = ''
   try {
-    data.value = await fetchTradingReview(rangeParams())
+    const result = await fetchTradingReview(rangeParams())
+    if (token !== loadToken || activeTab.value !== 'summary') return
+    data.value = result
     await nextTick()
     renderBars()
     renderCounts()
     renderSymbols()
-  } catch (e) {
-    error.value = e?.message || '加载失败'
+  } catch (exception) {
+    if (token === loadToken) error.value = exception?.message || '加载失败'
   } finally {
-    loading.value = false
+    if (token === loadToken) loading.value = false
   }
+}
+
+function refreshCurrent() {
+  if (activeTab.value === 'summary') return load()
+  return sectionView.value?.refresh()
 }
 
 function onResize() {
@@ -343,18 +374,43 @@ function onResize() {
   renderSymbols()
 }
 
-onMounted(() => {
-  load()
-  window.addEventListener('resize', onResize)
-})
-onUnmounted(() => {
-  window.removeEventListener('resize', onResize)
+function disposeReviewCharts() {
   barChart?.dispose()
   countChart?.dispose()
   symbolChart?.dispose()
   barChart = null
   countChart = null
   symbolChart = null
+}
+
+watch(range, () => {
+  data.value = null
+  error.value = ''
+  if (activeTab.value === 'summary') load()
+})
+
+watch(activeTab, async (tab, previous) => {
+  if (previous === 'summary') {
+    loadToken += 1
+    loading.value = false
+    disposeReviewCharts()
+  }
+  if (tab !== 'summary') return
+  if (!data.value) return load()
+  await nextTick()
+  renderBars()
+  renderCounts()
+  renderSymbols()
+})
+
+onMounted(() => {
+  if (activeTab.value === 'summary') load()
+  window.addEventListener('resize', onResize)
+})
+onUnmounted(() => {
+  loadToken += 1
+  window.removeEventListener('resize', onResize)
+  disposeReviewCharts()
 })
 </script>
 
@@ -362,25 +418,37 @@ onUnmounted(() => {
   <div class="review">
     <header class="review-header">
       <div>
-        <p class="page-eyebrow">交易分析 / 交易复盘</p>
-        <h1>交易复盘<span class="title-dot"></span></h1>
-        <p class="page-description">从交易结果到行为习惯，让下一次决策更有依据。</p>
+        <p class="page-eyebrow">交易分析 / {{ pageHeading.title }}</p>
+        <h1>{{ pageHeading.title }}<span class="title-dot"></span></h1>
+        <p class="page-description">{{ pageHeading.description }}</p>
       </div>
+    </header>
+    <div class="review-toolbar">
+      <nav class="review-tabs" aria-label="复盘内容">
+        <router-link
+          v-for="item in reviewTabs"
+          :key="item.key"
+          :to="{ path: '/review', query: { ...route.query, tab: item.key === 'summary' ? undefined : item.key } }"
+          class="review-tab"
+          :class="{ active: activeTab === item.key }"
+          :aria-current="activeTab === item.key ? 'page' : undefined"
+        >{{ item.label }}</router-link>
+      </nav>
       <div class="header-actions">
         <a-range-picker
           v-model:value="range"
           class="review-range"
-          :allow-clear="false"
+          :allow-clear="true"
           format="YYYY.MM.DD"
           :presets="rangePresets"
-          @change="load"
         />
-        <a-button class="refresh-button" :loading="loading" @click="load">
+        <a-button class="refresh-button" :loading="refreshing" @click="refreshCurrent">
           <template #icon><ReloadOutlined /></template>
-          刷新复盘
+          刷新数据
         </a-button>
       </div>
-    </header>
+    </div>
+    <template v-if="activeTab === 'summary'">
     <a-spin :spinning="loading">
       <a-alert v-if="error" type="error" :message="error" show-icon class="err" />
       <div v-if="loading && !data" class="loading-panel">
@@ -498,10 +566,59 @@ onUnmounted(() => {
         </p>
       </template>
     </a-spin>
+    </template>
+    <StrategyView
+      v-else
+      ref="sectionView"
+      :key="activeTab"
+      :section="activeTab"
+      embedded
+      :review-range="range"
+    />
   </div>
 </template>
 
 <style scoped>
+.review-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.review-tabs {
+  display: flex;
+  min-width: 0;
+  gap: 6px;
+  overflow-x: auto;
+}
+
+.review-tab {
+  flex: none;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.review-tab:hover,
+.review-tab.active {
+  background: var(--chip);
+  color: var(--blue);
+}
+
+@media (max-width: 560px) {
+  .review-toolbar { gap: 10px; margin-bottom: 14px; }
+  .review-tabs { width: 100%; gap: 2px; }
+  .review-tab { padding: 8px; font-size: 12px; }
+}
+
 .review {
   --review-border: var(--border);
   --review-ink: var(--text);
@@ -518,9 +635,9 @@ onUnmounted(() => {
 h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 27px; font-weight: 700; letter-spacing: -.04em; line-height: 1.3; }
 .title-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--review-blue); }
 .page-description { margin: 8px 0 0; font-size: 13px; color: var(--review-muted); line-height: 1.6; }
-.header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 14px; }
-.review-range { width: 240px; height: 36px; border-radius: 9px; border-color: #dce3f4; }
-.refresh-button { height: 36px; border-radius: 9px; border-color: #dce3f4; color: #4662bf; background: var(--chip); font-size: 12px; box-shadow: none; }
+.header-actions { display: flex; min-width: 0; align-items: center; gap: 10px; }
+.review-range { width: 240px; min-width: 0; height: 36px; border-radius: 9px; border-color: var(--border); }
+.refresh-button { flex: none; height: 36px; border-radius: 9px; border-color: var(--border); color: var(--blue); background: var(--chip); font-size: 12px; box-shadow: none; }
 .err { margin-bottom: 16px; }
 .loading-panel { min-height: 300px; padding: 28px; border: 1px solid var(--review-border); border-radius: 18px; }
 .hero { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); align-items: center; gap: 32px; padding: 30px 34px; margin-bottom: 18px; background: linear-gradient(115deg, #f6f8ff 0%, #fafbff 52%, #f0f5fc 100%); border: 1px solid #e1e7f5; border-radius: 20px; }
@@ -724,8 +841,7 @@ tbody tr:hover { background: #fafbff; }
 @media (max-width: 800px) {
   .review { padding-top: 2px; }
   .review-header { align-items: flex-start; }
-  .header-actions { flex-direction: column; align-items: flex-end; gap: 10px; }
-  .review-range { width: 100%; max-width: 240px; }
+  .header-actions { gap: 10px; }
   .hero { grid-template-columns: 1fr; gap: 24px; }
   .hero-num { font-size: 44px; }
   .hero-side { padding: 20px; }
@@ -740,7 +856,8 @@ tbody tr:hover { background: #fafbff; }
   .review-header { flex-direction: column; gap: 16px; margin-bottom: 20px; }
   h1 { font-size: 24px; }
   .page-description { font-size: 12px; }
-  .header-actions { width: 100%; flex-direction: row; align-items: center; justify-content: space-between; }
+  .header-actions { width: 100%; }
+  .review-range { flex: 1; width: 0; }
   .hero { padding: 22px 18px; border-radius: 16px; gap: 20px; }
   .hero-num { font-size: clamp(30px, 8.7vw, 42px); }
   .hero-sub { gap: 8px; font-size: 11px; }

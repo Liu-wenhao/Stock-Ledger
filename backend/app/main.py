@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.api import market_api, portfolio, trades
+from app.api import market_api, news, portfolio, trades
 from app.core.config import get_settings
 from app.core.database import Base, SessionLocal, engine
 from app.models.entities import Portfolio
@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 def _ensure_schema() -> None:
     """Additive column patches for existing DBs (create_all does not ALTER)."""
+    from app.services.market_bars import ensure_ohlc_schema
+
+    ensure_ohlc_schema(engine)
     stmts = [
         "ALTER TABLE price_cache ADD COLUMN price_as_of DATETIME NULL",
         "ALTER TABLE price_cache MODIFY COLUMN price_as_of DATETIME NULL",
@@ -76,12 +79,18 @@ def init_db() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    from app.services.bar_archive import start_bar_archive, stop_bar_archive
+    from app.services.indicator_monitor import start_indicator_monitor, stop_indicator_monitor
     from app.services.sentiment import start_close_capture, stop_close_capture
 
+    start_bar_archive()
     start_close_capture()
+    start_indicator_monitor()
     try:
         yield
     finally:
+        stop_indicator_monitor()
+        stop_bar_archive()
         stop_close_capture()
 
 
@@ -117,6 +126,7 @@ app.add_middleware(
 app.include_router(trades.router)
 app.include_router(portfolio.router)
 app.include_router(market_api.router)
+app.include_router(news.router)
 
 
 @app.get("/api/health")

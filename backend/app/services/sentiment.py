@@ -19,6 +19,7 @@ from statistics import median, mean
 
 from app.services.bars import chart_since
 from app.services.market import _request_text
+from app.services.market_bars import _price
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ _lock = threading.Lock()
 _caches: dict[str, dict] = {}
 
 _VIX_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
-_INDEXES = (("标普 500", ".inx"), ("道琼斯", ".dji"), ("纳斯达克", ".ixic"))
+_INDEXES = (("标普 500", ".inx"), ("道琼斯", ".dji"), ("纳斯达克 100", ".ndx"))
 _ARMS_INDEX = {
     "us": ("纳斯达克 100", ".ndx"),
     "cn": ("中证全指", "SSE:000985"),
@@ -44,7 +45,45 @@ def build_market_sentiment(db=None, market: str = "us") -> dict:
     event = None
     with _lock:
         slot = _caches.setdefault(market, {"at": 0.0, "payload": None, "event": None})
+        # Drop a cache built before CSI 300 / STAR / ChiNext books shipped.
         cached = slot["payload"]
+        if (
+            market == "cn"
+            and cached
+            and not any(item.get("key") == "cn_star" for item in (cached.get("books") or []))
+        ):
+            slot["payload"] = None
+            cached = None
+        if (
+            market == "cn"
+            and cached
+            and any(
+                item.get("key") == "cn_all" and not item.get("narrow")
+                for item in (cached.get("books") or [])
+            )
+        ):
+            slot["payload"] = None
+            cached = None
+        # Drop caches still titled 沪深全A after the rename to 全市场.
+        if (
+            market == "cn"
+            and cached
+            and any(
+                item.get("key") == "cn_all"
+                and str(item.get("universe") or "").startswith("沪深全A")
+                for item in (cached.get("books") or [])
+            )
+        ):
+            slot["payload"] = None
+            cached = None
+        # Drop US caches still using 纳斯达克综合指数 (.ixic) instead of 纳指100.
+        if (
+            market == "us"
+            and cached
+            and any(item.get("name") == "纳斯达克" for item in (cached.get("indexes") or []))
+        ):
+            slot["payload"] = None
+            cached = None
         if cached is not None and now - slot["at"] < _CACHE_SECONDS:
             cached_hit = cached
         else:
@@ -380,10 +419,11 @@ def _overlay_listed_session(payload: dict | None, market: str) -> dict | None:
 
 
 _CN_INDEXES = (
+    ("沪深300", "SSE:000300"),
+    ("创业板指", "SZSE:399006"),
+    ("科创50", "SSE:000688"),
     ("上证指数", "SSE:000001"),
     ("深证成指", "SZSE:399001"),
-    ("创业板指", "SZSE:399006"),
-    ("科创板", "SSE:000688"),
 )
 _HK_INDEXES = (
     ("恒生指数", "HKEX:HSI"),
@@ -679,13 +719,91 @@ def _is_bse(code: str) -> bool:
     return code.startswith(("92", "8", "4"))
 
 
-def _quote_books(market: str, venue: int) -> list[str]:
+def _cn_code(symbol: str) -> str:
+    text = (symbol or "").strip().lower()
+    for prefix in ("sh", "sz", "bj"):
+        if text.startswith(prefix):
+            return text[len(prefix) :]
+    return text
+
+
+_hs300_cache: tuple[date, frozenset[str]] | None = None
+
+
+def _hs300_keys_from_frame(frame) -> set[str]:
+    keys: set[str] = set()
+    code_col = next((name for name in ("成分券代码", "品种代码", "code") if name in getattr(frame, "columns", [])), None)
+    if not code_col:
+        return keys
+    exchange_col = "交易所" if "交易所" in frame.columns else None
+    for _, row in frame.iterrows():
+        code = str(row.get(code_col) or "").strip().zfill(6)
+        if not code.isdigit():
+            continue
+        exchange = str(row.get(exchange_col) or "") if exchange_col else ""
+        if "深圳" in exchange or code.startswith(("0", "3")):
+            keys.add(f"sz{code}")
+        else:
+            keys.add(f"sh{code}")
+    return keys
+
+
+def load_hs300_symbols() -> frozenset[str]:
+    """CSI 300 members as store keys (sh600000 / sz000001). Cached for the calendar day."""
+    global _hs300_cache
+    today = date.today()
+    if _hs300_cache and _hs300_cache[0] == today:
+        return _hs300_cache[1]
+    keys: set[str] = set()
+    try:
+        import akshare as ak
+
+        try:
+            keys = _hs300_keys_from_frame(ak.index_stock_cons_csindex(symbol="000300"))
+        except Exception:
+            logger.exception("CSI 300 csindex list failed; trying Sina")
+            keys = _hs300_keys_from_frame(ak.index_stock_cons(symbol="000300"))
+    except Exception:
+        logger.exception("CSI 300 constituent list failed")
+        if _hs300_cache:
+            return _hs300_cache[1]
+        return frozenset()
+    if not keys:
+        logger.warning("CSI 300 constituent list returned no names")
+        if _hs300_cache:
+            return _hs300_cache[1]
+        return frozenset()
+    cached = frozenset(keys)
+    _hs300_cache = (today, cached)
+    return cached
+
+
+def _cn_store_key(symbol: str, venue: int = -1) -> str:
+    text = (symbol or "").strip().lower()
+    if text.startswith(("sh", "sz", "bj")):
+        return text
+    code = _cn_code(text)
+    if not code:
+        return ""
+    if venue == 1 or code.startswith(("6", "9")):
+        return f"sh{code}"
+    if venue == 2 or _is_bse(code):
+        return f"bj{code}"
+    return f"sz{code}"
+
+
+def _quote_books(market: str, venue: int, symbol: str = "") -> list[str]:
+    """Which Arms books a printed name belongs to."""
     if market == "cn":
         books = ["cn_all"]
-        if venue == 1:
-            books.append("sse")
-        elif venue == 0:
-            books.append("szse")
+        code = _cn_code(symbol)
+        if code.startswith(("688", "689")):
+            books.append("cn_star")
+        elif code.startswith(("300", "301")):
+            books.append("cn_cyb")
+        key = _cn_store_key(symbol, venue)
+        if key and key in load_hs300_symbols():
+            books.append("cn_hs300")
         return books
     books = ["us_all"]
     if venue == 105:
@@ -716,7 +834,7 @@ def _live_prices(market: str) -> list[dict]:
                     "invt": "2",
                     "fid": "f12",
                     "fs": fs,
-                    "fields": "f2,f5,f12,f13",
+                    "fields": "f2,f5,f6,f12,f13,f15,f16,f17,f18",
                 },
                 encoding="utf-8",
                 timeout=8,
@@ -768,12 +886,35 @@ def _live_prices(market: str) -> list[dict]:
         if market == "us" and venue not in {105, 106, 107}:
             continue
         seen.add(code)
+        try:
+            amount = float(row.get("f6") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        try:
+            prev_close = float(row.get("f18") or 0)
+        except (TypeError, ValueError):
+            prev_close = 0.0
         if market == "cn":
             prefix = "sh" if venue == 1 else "bj" if venue == 2 else "sz"
             symbol = f"{prefix}{code}"
+            # Eastmoney counts A-share volume in lots of 100 shares.
+            volume *= 100
         else:
             symbol = code
-        prices.append({"symbol": symbol, "code": code, "venue": venue, "price": price})
+        prices.append(
+            {
+                "symbol": symbol,
+                "code": code,
+                "venue": venue,
+                "price": price,
+                "open": _price(row.get("f17")),
+                "high": _price(row.get("f15")),
+                "low": _price(row.get("f16")),
+                "volume": volume,
+                "amount": amount if market == "cn" and amount > 0 else None,
+                "prev_close": prev_close if prev_close > 0 else None,
+            }
+        )
     if market == "cn" and len(prices) < 1000:
         return _cn_sina_prices()
     if market == "us" and len(prices) < 8000:
@@ -794,12 +935,22 @@ def _us_sina_prices() -> list[dict]:
             continue
         if price <= 0 or volume <= 0:
             continue
+        try:
+            prev_close = float(row.get("preclose") or 0)
+        except (TypeError, ValueError):
+            prev_close = 0.0
         prices.append(
             {
                 "symbol": item["code"],
                 "code": item["code"],
                 "venue": item["venue"],
                 "price": price,
+                "open": _price(row.get("open")),
+                "high": _price(row.get("high")),
+                "low": _price(row.get("low")),
+                "volume": volume,
+                "amount": None,
+                "prev_close": prev_close if prev_close > 0 else None,
             }
         )
     return prices
@@ -808,6 +959,7 @@ def _us_sina_prices() -> list[dict]:
 def _cn_sina_prices() -> list[dict]:
     """A-share prints when the Eastmoney list is short. Same shape as `_live_prices`.
     Sina's ticktime is only a clock, so the last trade is the current session's print.
+    `settlement` is the forward-adjusted previous close.
     """
     prices: list[dict] = []
     seen: set[str] = set()
@@ -832,7 +984,28 @@ def _cn_sina_prices() -> list[dict]:
         else:
             continue
         seen.add(code)
-        prices.append({"symbol": symbol, "code": code, "venue": venue, "price": price})
+        try:
+            amount = float(item.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        try:
+            prev_close = float(item.get("settlement") or 0)
+        except (TypeError, ValueError):
+            prev_close = 0.0
+        prices.append(
+            {
+                "symbol": symbol,
+                "code": code,
+                "venue": venue,
+                "price": price,
+                "open": _price(item.get("open")),
+                "high": _price(item.get("high")),
+                "low": _price(item.get("low")),
+                "volume": volume,
+                "amount": amount if amount > 0 else None,
+                "prev_close": prev_close if prev_close > 0 else None,
+            }
+        )
     return prices
 
 
@@ -882,6 +1055,42 @@ def _anchor_sum(code: str, through: date) -> float | None:
     return sum(closes[-19:])
 
 
+def _was_session(market: str, day: date) -> bool:
+    """A weekday holiday still shows the previous close, which must not be stored as a new bar."""
+    try:
+        import exchange_calendars as xcals
+
+        return bool(xcals.get_calendar({"us": "XNYS", "cn": "XSHG"}[market]).is_session(day.isoformat()))
+    except Exception:
+        return day.weekday() < 5
+
+
+def _bar_store_sums(db, market: str, day: date, phase: str, prices: list[dict]) -> dict[str, float] | None:
+    """19-close sums from the stored full-market bars, keyed like `prices`.
+
+    The close snapshot is added to the store first. None while the store covers
+    too few names, so the caller falls back to one request per name.
+    """
+    from app.services import market_bars
+
+    try:
+        if phase == "pm" and arms_due(market) == (day, phase) and _was_session(market, day):
+            market_bars.append_session(db, market, day, prices)
+        sums = market_bars.close_sums(db, market, day)
+    except Exception:
+        logger.exception("bar store read failed for %s %s", market, day.isoformat())
+        db.rollback()
+        return None
+    found: dict[str, float] = {}
+    for item in prices:
+        total = sums.get(market_bars.store_key(market, item["symbol"]))
+        if total is not None:
+            found[item["symbol"]] = total
+    if len(found) < len(prices) * _MA_COVERAGE:
+        return None
+    return found
+
+
 def _fill_above_ma20(market: str, day: date, phase: str) -> None:
     """Per-book share of names above their own MA20. Written only at 90% coverage."""
     from decimal import Decimal
@@ -898,12 +1107,18 @@ def _fill_above_ma20(market: str, day: date, phase: str) -> None:
         return
     db = SessionLocal()
     try:
-        db.query(MaAnchor).filter(MaAnchor.market == market, MaAnchor.through_date != through).delete()
-        stored = {
-            row.symbol: float(row.close_sum)
-            for row in db.query(MaAnchor).filter(MaAnchor.market == market, MaAnchor.through_date == through).all()
-        }
-        missing = [item for item in prices if item["symbol"] not in stored]
+        stored = _bar_store_sums(db, market, day, phase, prices)
+        from_store = stored is not None
+        if not from_store:
+            db.query(MaAnchor).filter(MaAnchor.market == market, MaAnchor.through_date != through).delete()
+            stored = {
+                row.symbol: float(row.close_sum)
+                for row in db.query(MaAnchor)
+                .filter(MaAnchor.market == market, MaAnchor.through_date == through)
+                .all()
+            }
+        # Stored bars already cover the market, so no name is requested one by one.
+        missing = [] if from_store else [item for item in prices if item["symbol"] not in stored]
 
         def anchor(item: dict) -> tuple[str, float | None]:
             if market == "cn":
@@ -941,13 +1156,15 @@ def _fill_above_ma20(market: str, day: date, phase: str) -> None:
                 fetch(missing)
         buckets = {
             key: {"above": 0, "valid": 0, "total": 0}
-            for key, _label, _pair in _BOOKS[market]
+            for key, _label, _pair in _compute_books(market)
         }
         for item in prices:
             total = stored.get(item["symbol"])
             above = total is not None and item["price"] > (total + item["price"]) / 20
-            for book in _quote_books(market, item["venue"]):
-                slot = buckets[book]
+            for book in _quote_books(market, item["venue"], item.get("symbol") or ""):
+                slot = buckets.get(book)
+                if slot is None:
+                    continue
                 slot["total"] += 1
                 if total is None:
                     continue
@@ -967,7 +1184,9 @@ def _fill_above_ma20(market: str, day: date, phase: str) -> None:
             )
             if row is None:
                 continue
-            covered = slot["total"] > 0 and slot["valid"] >= 50 and slot["valid"] >= slot["total"] * _MA_COVERAGE
+            # Smaller boards (STAR / ChiNext / CSI 300) only need half coverage.
+            floor = 30 if book in {"cn_star", "cn_cyb", "cn_hs300"} else 50
+            covered = slot["total"] > 0 and slot["valid"] >= floor and slot["valid"] >= slot["total"] * _MA_COVERAGE
             if not covered:
                 continue
             row.ma_valid = slot["valid"]
@@ -1005,16 +1224,26 @@ def _schedule_above_ma20(market: str, day: date, phase: str) -> None:
 
 _BOOKS = {
     "us": (
-        ("us_all", "美股全市场", ""),
+        ("us_all", "全市场", ""),
         ("nyse", "纽交所", "标普 500"),
-        ("nasdaq", "纳斯达克", "纳斯达克"),
+        ("nasdaq", "纳斯达克", "纳斯达克 100"),
     ),
     "cn": (
-        ("cn_all", "沪深全A", "中证全指"),
-        ("sse", "上证", "上证指数"),
-        ("szse", "深市", "深证成指"),
+        ("cn_all", "全市场", ""),
+        ("cn_star", "科创板", "科创50"),
+        ("cn_cyb", "创业板", "创业板指"),
     ),
 }
+# Computed with the heroes and attached on cn_all as `narrow`; not a price-page card.
+_CN_EXTRA_BOOKS = (("cn_hs300", "沪深300", "沪深300"),)
+_NARROW_OF = {"cn_all": "cn_hs300"}
+
+
+def _compute_books(market: str) -> tuple[tuple[str, str, str], ...]:
+    books = _BOOKS.get(market) or ()
+    if market == "cn":
+        return books + _CN_EXTRA_BOOKS
+    return books
 
 
 def _default_book(market: str) -> str:
@@ -1027,6 +1256,9 @@ def _book_meta(book: str) -> tuple[str, str]:
         for key, label, pair in books:
             if key == book:
                 return label, pair
+    for key, label, pair in _CN_EXTRA_BOOKS:
+        if key == book:
+            return label, pair
     return book, ""
 
 
@@ -1320,47 +1552,110 @@ def _scan_cn_groups() -> dict[str, list]:
     rows = _clist_rows(_CN_LIST, "f3,f5,f6,f12,f13")
     if len(rows) < 1000:
         rows = _scan_cn_sina()
-    groups = {"cn_all": [], "sse": [], "szse": []}
+    hs300 = load_hs300_symbols()
+    groups: dict[str, list] = {key: [] for key, _label, _pair in _compute_books("cn")}
     for row in rows:
-        groups["cn_all"].append(row)
-        code = str(row.get("f12") or row.get("code") or row.get("symbol") or "")
+        code = str(row.get("f12") or row.get("code") or "").strip()
+        symbol = str(row.get("symbol") or "").strip().lower()
+        if not code and symbol:
+            code = _cn_code(symbol)
         if _is_bse(code):
             continue
         raw_venue = row.get("f13")
-        venue = "" if raw_venue in (None, "") else str(raw_venue)
-        if venue in {"1", "1.0"} or code.startswith(("sh", "6")):
-            groups["sse"].append(row)
-        elif venue in {"0", "0.0"} or code.startswith(("sz", "0", "3")):
-            groups["szse"].append(row)
+        try:
+            venue = int(float(raw_venue)) if raw_venue not in (None, "") else -1
+        except (TypeError, ValueError):
+            venue = -1
+        if venue not in {0, 1}:
+            if code.startswith(("6", "9")) or symbol.startswith("sh"):
+                venue = 1
+            elif code.startswith(("0", "3")) or symbol.startswith("sz"):
+                venue = 0
+        store = _cn_store_key(symbol or code, venue)
+        groups["cn_all"].append(row)
+        if code.startswith(("688", "689")):
+            groups["cn_star"].append(row)
+        elif code.startswith(("300", "301")):
+            groups["cn_cyb"].append(row)
+        if store in hs300:
+            groups["cn_hs300"].append(row)
     return groups
 
 
 _book_cache: dict[str, tuple[float, list]] = {}
+_book_tallies: dict[str, dict[str, dict]] = {}
 _scan_threads: dict[str, threading.Thread] = {}
 _scan_lock = threading.Lock()
 
 
+def _decorate_book(payload: dict, key: str, label: str, pair: str) -> dict:
+    payload = dict(payload)
+    payload["book"] = key
+    payload["key"] = key
+    payload["pair"] = pair
+    payload["universe"] = f"{label} {payload['count']} 家"
+    return payload
+
+
 def _store_books(market: str, groups: dict[str, list]) -> list[dict]:
     amount = market == "cn"
-    books = []
-    for key, label, pair in _BOOKS[market]:
+    tallies: dict[str, dict] = {}
+    for key, label, pair in _compute_books(market):
         payload = _tally_rows(groups.get(key) or [], amount=amount, label=label)
         if not payload:
             continue
-        payload["book"] = key
-        payload["key"] = key
-        payload["pair"] = pair
-        payload["universe"] = f"{label} {payload['count']} 家"
-        books.append(payload)
+        tallies[key] = _decorate_book(payload, key, label, pair)
+    books = []
+    for key, label, pair in _BOOKS[market]:
+        payload = tallies.get(key)
+        if not payload:
+            continue
+        item = dict(payload)
+        narrow_key = _NARROW_OF.get(key)
+        if narrow_key and narrow_key in tallies:
+            item["narrow_key"] = narrow_key
+            item["narrow"] = dict(tallies[narrow_key])
+        books.append(item)
+    _book_tallies[market] = tallies
     if books:
         _book_cache[market] = (time.time(), books)
     return books
 
 
+def _all_book_payloads(market: str) -> list[dict]:
+    """Hero books plus extras (e.g. CSI 300), for writing Arms checkpoints."""
+    tallies = _book_tallies.get(market) or {}
+    if tallies:
+        return list(tallies.values())
+    return list(scan_market_books(market))
+
+
 def _fill_book_cache(market: str) -> None:
     try:
+        if market == "cn":
+            # Warm the CSI 300 set in this worker before the list scan uses it.
+            warmed = load_hs300_symbols()
+            logger.warning("breadth scan cn: CSI 300 names cached=%s", len(warmed))
         groups = _scan_us_groups() if market == "us" else _scan_cn_groups()
-        _store_books(market, groups)
+        if market == "cn":
+            logger.warning(
+                "breadth scan cn groups: %s",
+                {key: len(rows) for key, rows in groups.items()},
+            )
+        books = _store_books(market, groups)
+        if market == "cn":
+            logger.warning(
+                "breadth scan cn books: %s",
+                [
+                    (
+                        item.get("key"),
+                        item.get("count"),
+                        item.get("narrow_key"),
+                        (item.get("narrow") or {}).get("count"),
+                    )
+                    for item in books
+                ],
+            )
     finally:
         with _scan_lock:
             _scan_threads.pop(market, None)
@@ -1372,14 +1667,20 @@ def scan_market_books(market: str) -> list[dict]:
         return []
     now = time.time()
     cached = _book_cache.get(market)
-    if cached and now - cached[0] < _LIVE_BREADTH_SECONDS:
+    # Full-A without CSI 300 means the last scan missed the constituent list — refresh.
+    stale_narrow = (
+        market == "cn"
+        and cached
+        and any(item.get("key") == "cn_all" and not item.get("narrow") for item in cached[1])
+    )
+    if cached and now - cached[0] < _LIVE_BREADTH_SECONDS and not stale_narrow:
         return cached[1]
     with _scan_lock:
         if market not in _scan_threads:
             thread = threading.Thread(target=_fill_book_cache, args=(market,), daemon=True, name=f"breadth-{market}")
             _scan_threads[market] = thread
             thread.start()
-    return cached[1] if cached else []
+    return cached[1] if cached and not stale_narrow else (cached[1] if cached else [])
 
 
 def scan_pending(market: str) -> bool:
@@ -1414,7 +1715,7 @@ def ensure_arms_reading(market: str, now: datetime | None = None):
         rows = []
         if due:
             day, phase = due
-            wanted = {key for key, _label, _pair in _BOOKS.get(market, ())}
+            wanted = {key for key, _label, _pair in _compute_books(market)}
 
             def saved():
                 return (
@@ -1434,8 +1735,13 @@ def ensure_arms_reading(market: str, now: datetime | None = None):
                     rows = saved()
                     missing = wanted - {row.book for row in rows}
                     if missing:
-                        for fresh in scan_market_books(market):
-                            if fresh["book"] not in missing:
+                        payloads = _all_book_payloads(market)
+                        if missing - {item.get("book") for item in payloads}:
+                            groups = _scan_us_groups() if market == "us" else _scan_cn_groups()
+                            _store_books(market, groups)
+                            payloads = _all_book_payloads(market)
+                        for fresh in payloads:
+                            if fresh.get("book") not in missing:
                                 continue
                             row = _save_arms_reading(db, market, day, phase, fresh)
                             rows.append(row)
@@ -1476,13 +1782,24 @@ def ensure_arms_reading(market: str, now: datetime | None = None):
         )
         if pending:
             _schedule_above_ma20(market, due[0], due[1])
-        books = [_public_reading(row) for row in rows]
-        if pending:
-            for item in books:
-                if item.get("above_ma20") is None:
-                    item["ma_pending"] = True
+        by_key = {}
+        for row in rows:
+            item = _public_reading(row)
+            if pending and item.get("above_ma20") is None:
+                item["ma_pending"] = True
+            by_key[item["key"]] = item
+        books = []
+        for key, _label, _pair in _BOOKS.get(market, ()):
+            item = by_key.get(key)
+            if not item:
+                continue
+            narrow_key = _NARROW_OF.get(key)
+            if narrow_key and narrow_key in by_key:
+                item = {**item, "narrow_key": narrow_key, "narrow": by_key[narrow_key]}
+            books.append(item)
         books.sort(key=lambda item: _book_order(market, item.get("key")))
-        return _public_reading(primary), _arms_caption(primary.phase), books
+        primary_public = next((item for item in books if item.get("key") == _default_book(market)), books[0])
+        return primary_public, _arms_caption(primary.phase), books
     finally:
         db.close()
 
@@ -1497,11 +1814,11 @@ def _checkpoint_gaps(market: str, day: date, phase: str) -> tuple[bool, bool]:
     from app.core.database import SessionLocal
     from app.models.entities import ArmsReading
 
-    wanted = {key for key, _label, _pair in _BOOKS.get(market, ())}
+    wanted = {key for key, _label, _pair in _compute_books(market)}
     db = SessionLocal()
     try:
         rows = (
-            db.query(ArmsReading.book, ArmsReading.ma_total)
+            db.query(ArmsReading.book, ArmsReading.above_ma20)
             .filter(
                 ArmsReading.market == market,
                 ArmsReading.bar_date == day,

@@ -18,8 +18,6 @@ export const fetchIndicatorHistory = (symbol, params = {}) =>
 export const fetchMarketSentiment = () => http.get('/api/market/sentiment').then((r) => r.data)
 export const fetchCnDesk = () => http.get('/api/market/cn-desk').then((r) => r.data)
 export const fetchCnFlow = () => http.get('/api/market/cn-flow', { timeout: 30000 }).then((r) => r.data)
-export const fetchCnStockFlow = (symbols) =>
-  http.get('/api/market/cn-stock-flow', { params: { symbols: symbols.join(',') }, timeout: 120000 }).then((r) => r.data)
 export const fetchBreadthHistory = (book = '') =>
   http.get('/api/market/breadth-history', { params: book ? { book } : {} }).then((r) => r.data)
 export const updateHoldingStop = (data) =>
@@ -32,6 +30,8 @@ export const fetchMonthlyReturns = (params) =>
   http.get('/api/analysis/monthly-returns', { params }).then((r) => r.data)
 export const fetchProfitSeries = (params) =>
   http.get('/api/analysis/profit-series', { params }).then((r) => r.data)
+export const fetchBenchmarks = (params) =>
+  http.get('/api/analysis/benchmarks', { params }).then((r) => r.data)
 export const fetchTradingReview = (params) =>
   http.get('/api/analysis/review', { params }).then((r) => r.data)
 export const fetchTradingStrategy = (params) =>
